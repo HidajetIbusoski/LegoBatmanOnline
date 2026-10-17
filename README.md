@@ -23,7 +23,7 @@ Das funktioniert nur, wenn das Spiel bei gleichen Eingaben und gleichem Zeitschr
 
 ## Phasen
 
-- [ ] **Phase 0: Machbarkeit.** EXE analysieren (Imports, Kopierschutz, Input-API, Timing, Zufallszahlen). Determinismus-Test: Eingaben aufnehmen, abspielen und die Positionen vergleichen.
+- [ ] **Phase 0: Machbarkeit.** EXE analysieren (Imports, Kopierschutz, Input-API, Timing, Zufallszahlen). Determinismus-Test: Eingaben aufnehmen, abspielen und die Positionen vergleichen. Die statische Analyse ist fertig, siehe [docs/phase0-befunde.md](docs/phase0-befunde.md).
 - [ ] **Phase 1:** Proxy-DLL, die Eingaben lokal aufzeichnet und wieder abspielt.
 - [ ] **Phase 2:** Lockstep über LAN.
 - [ ] **Phase 3:** Internet (NAT-Traversal, Relay, Einladungscode).

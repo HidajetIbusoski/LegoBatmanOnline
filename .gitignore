@@ -8,3 +8,5 @@ game/
 runs/
 build/
 dist/
+app/**/bin/
+app/**/obj/

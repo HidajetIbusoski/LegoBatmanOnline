@@ -234,6 +234,26 @@ int online_prepare(ONLINE *o, char code_out[40])
     return 1;
 }
 
+// Fuer die App: Schluessel und Adressen kommen aus der verschluesselten Einladung statt aus Codes
+unsigned online_key_me(void) { return s_key_me; }
+void online_set_keys(unsigned me, unsigned peer) { s_key_me = me & 0xFFFF; s_key_peer = peer & 0xFFFF; }
+
+int online_parse_endpoint(const char *text, struct sockaddr_in *out)
+{
+    char host[64];
+    const char *colon = strrchr(text, ':');
+    size_t n;
+    if (!colon) return 0;
+    n = (size_t)(colon - text);
+    if (n == 0 || n >= sizeof host) return 0;
+    memcpy(host, text, n);
+    host[n] = 0;
+    memset(out, 0, sizeof *out);
+    out->sin_family = AF_INET;
+    out->sin_port = htons((u_short)atoi(colon + 1));
+    return inet_pton(AF_INET, host, &out->sin_addr) == 1;
+}
+
 // Direktverbindung ohne Code (VPN wie Radmin/Tailscale, LAN oder Portweiterleitung):
 // Der Host lauscht auf festem Port, der Gast gibt die IP des Hosts ein.
 int online_prepare_direct(ONLINE *o)

@@ -15,6 +15,9 @@ typedef struct {
 int online_sha256_file(const char *path, unsigned char out[32]);
 int online_prepare(ONLINE *o, char code_out[40]);       // Socket, STUN, eigener Code
 int online_set_peer_code(ONLINE *o, const char *code);  // 0 = Code ungueltig
+unsigned online_key_me(void);
+void online_set_keys(unsigned me, unsigned peer);
+int online_parse_endpoint(const char *text, struct sockaddr_in *out);  // "IP:Port"
 #define DIRECT_PORT 47100
 int online_prepare_direct(ONLINE *o);                   // Direktmodus: fester Port, kein Code
 int online_set_peer_ip(ONLINE *o, const char *text);    // "IP" oder "IP:Port"

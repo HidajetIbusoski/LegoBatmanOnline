@@ -136,14 +136,13 @@ static void press_enter(void)
     read_line(b, sizeof b);
 }
 
+static int run_session(ONLINE *o, const char *game, const char *dll, int autoload_slot);
+
 static int online_menu(void)
 {
-    char game[MAX_PATH], dll[MAX_PATH], line[128], code[40], appdata[MAX_PATH];
-    char save_dir[MAX_PATH], guest_saves[MAX_PATH], logdir[MAX_PATH], peer[64], buf[64];
+    char game[MAX_PATH], dll[MAX_PATH], line[128], code[40];
     unsigned char hash[32];
     ONLINE o;
-    SYSTEMTIME st;
-    int delay;
 
     setvbuf(stdout, NULL, _IONBF, 0);  // sofort anzeigen, auch wenn die Ausgabe umgeleitet ist
     SetConsoleOutputCP(CP_UTF8);
@@ -205,7 +204,23 @@ static int online_menu(void)
         press_enter();
         return 1;
     }
-    if (online_measure_ping(&o) < 0) { printf("Ping-Messung fehlgeschlagen.\n"); online_close(); press_enter(); return 1; }
+    {
+        int rc = run_session(&o, game, dll, -1);
+        press_enter();
+        return rc;
+    }
+}
+
+// Nach erfolgreichem Verbindungsaufbau: Ping, Spielstand, Bereit-Abgleich, Spiel starten.
+// autoload_slot >= 0: der Host laedt diesen Spielstand automatisch (Menue per Skript).
+static int run_session(ONLINE *o_, const char *game, const char *dll, int autoload_slot)
+{
+    char save_dir[MAX_PATH], guest_saves[MAX_PATH], logdir[MAX_PATH], peer[64], buf[64], appdata[MAX_PATH];
+    SYSTEMTIME st;
+    int delay;
+    ONLINE o = *o_;
+    printf("STATUS ping\n");
+    if (online_measure_ping(&o) < 0) { printf("ERROR Ping-Messung fehlgeschlagen.\n"); online_close(); return 1; }
     // Eingabeverzoegerung: halbe Rundlaufzeit plus Puffer, in 60-Hz-Frames
     delay = (o.ping_ms / 2 + 20 + 16) / 17 + 1;
     if (delay < 2) delay = 2;
@@ -224,8 +239,9 @@ static int online_menu(void)
              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, o.role ? "gast" : "host");
     CreateDirectoryA(logdir, NULL);
 
+    printf("STATUS spielstand\n");
     if (o.role == 0) {
-        if (!online_send_saves(&o, save_dir)) { online_close(); press_enter(); return 1; }
+        if (!online_send_saves(&o, save_dir)) { printf("ERROR Spielstand konnte nicht gesendet werden.\n"); online_close(); return 1; }
     } else {
         strcat(guest_saves, "\\gast-spielstand");
         // alte Dateien entfernen, damit nur der Stand des Hosts sichtbar ist
@@ -244,9 +260,9 @@ static int online_menu(void)
                 FindClose(fh);
             }
         }
-        if (!online_receive_saves(&o, guest_saves)) { online_close(); press_enter(); return 1; }
+        if (!online_receive_saves(&o, guest_saves)) { printf("ERROR Spielstand nicht empfangen.\n"); online_close(); return 1; }
     }
-    if (!online_ready_barrier(&o, &delay)) { printf("Mitspieler hat nicht bestaetigt.\n"); online_close(); press_enter(); return 1; }
+    if (!online_ready_barrier(&o, &delay)) { printf("ERROR Mitspieler hat nicht bestaetigt.\n"); online_close(); return 1; }
     snprintf(peer, sizeof peer, "%s:%d", inet_ntoa(o.peer.sin_addr), ntohs(o.peer.sin_port));
     online_close();
 
@@ -268,12 +284,67 @@ static int online_menu(void)
         SetEnvironmentVariableA("LBO_SAVEDIR", guest_saves);  // der Gast liest den Host-Stand
     }
 
+    if (autoload_slot >= 0) {  // beide Seiten muessen es wissen
+        snprintf(buf, sizeof buf, "%d", autoload_slot);
+        SetEnvironmentVariableA("LBO_AUTOLOAD", buf);
+    }
+
     printf("\nStarte LEGO Batman ... (Logs: %s)\n", logdir);
     printf("%s\n", o.role ? "Warte im Spiel, bis der Host den Spielstand geladen hat. Dann Start druecken, um einzusteigen."
                           : "Du bedienst die Menues. Dein Mitspieler steigt mit Start ein.");
+    printf("STATUS spiel\n");
     launch(game, dll, "-Windowed", 1);
-    press_enter();
+    printf("STATUS beendet\n");
     return 0;
+}
+
+// --- Modi fuer die App ------------------------------------------------------------------
+// lbo-launch --stun [--port P]
+//   Belegt einen UDP-Port, fragt per STUN die oeffentliche Adresse ab und gibt aus:
+//   STUN port=P public=IP:PORT local=IP:PORT symmetric=0|1 key=K
+// lbo-launch --connect host|join --port P --key K --peer-key K2 --peer-public IP:PORT
+//            --peer-local IP:PORT [--slot N]
+//   Verbindet (Hole Punching), uebertraegt den Spielstand und startet das Spiel.
+//   Fortschritt als Zeilen "STATUS ...", Fehler als "ERROR ...".
+static int app_mode(int argc, char **argv)
+{
+    char game[MAX_PATH], dll[MAX_PATH], code[40];
+    unsigned char hash[32];
+    ONLINE o;
+    int i, stun = 0, slot = -1;
+    unsigned key = 0, peer_key = 0;
+    const char *peer_pub = NULL, *peer_loc = NULL;
+    setvbuf(stdout, NULL, _IONBF, 0);
+    memset(&o, 0, sizeof o);
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--stun")) stun = 1;
+        else if (!strcmp(argv[i], "--connect") && i + 1 < argc) o.role = !strcmp(argv[++i], "join");
+        else if (!strcmp(argv[i], "--port") && i + 1 < argc) o.port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--key") && i + 1 < argc) key = (unsigned)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--peer-key") && i + 1 < argc) peer_key = (unsigned)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--peer-public") && i + 1 < argc) peer_pub = argv[++i];
+        else if (!strcmp(argv[i], "--peer-local") && i + 1 < argc) peer_loc = argv[++i];
+        else if (!strcmp(argv[i], "--slot") && i + 1 < argc) slot = atoi(argv[++i]);
+    }
+    if (!online_prepare(&o, code)) { printf("ERROR UDP-Port nicht verfuegbar\n"); return 1; }
+    if (stun) {
+        char pub[32], loc[32];
+        snprintf(pub, sizeof pub, "%s:%d", inet_ntoa(o.pub.sin_addr), ntohs(o.pub.sin_port));
+        snprintf(loc, sizeof loc, "%s:%d", inet_ntoa(o.local.sin_addr), ntohs(o.local.sin_port));
+        printf("STUN port=%d public=%s local=%s symmetric=%d key=%u\n", o.port, pub, loc, o.symmetric_nat, online_key_me());
+        online_close();
+        return 0;
+    }
+    if (!find_game(game)) { printf("ERROR LEGOBatman.exe nicht gefunden\n"); online_close(); return 1; }
+    dll_next_to_exe(dll);
+    online_sha256_file(game, hash);
+    online_set_keys(key, peer_key);
+    if (!peer_pub || !online_parse_endpoint(peer_pub, &o.peer_pub)) { printf("ERROR Adresse des Partners fehlt\n"); online_close(); return 1; }
+    if (peer_loc) online_parse_endpoint(peer_loc, &o.peer_local);
+    printf("STATUS verbinde\n");
+    if (!online_connect(&o, hash, 60)) { printf("ERROR Keine Verbindung zum Partner\n"); online_close(); return 1; }
+    printf("STATUS verbunden\n");
+    return run_session(&o, game, dll, slot);
 }
 
 int main(int argc, char **argv)
@@ -284,6 +355,8 @@ int main(int argc, char **argv)
     int wait = 0, i;
 
     if (argc == 1) return online_menu();
+    for (i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--stun") || !strcmp(argv[i], "--connect")) return app_mode(argc, argv);
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--game") && i + 1 < argc) strncpy(game, argv[++i], MAX_PATH - 1);

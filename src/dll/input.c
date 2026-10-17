@@ -106,6 +106,19 @@ static int read_dinput(NETPAD *p)
         return 0;
     }
     k = js.rgbButtons;
+    {
+        // Diagnose: die ersten Rohzustaende protokollieren, um Ruhewerte fremder Pads zu sehen
+        static int logged;
+        if (s_log && logged < 3) {
+            int i;
+            char btn[64] = "";
+            for (i = 0; i < 16; i++) btn[i] = (k[i] & 0x80) ? '1' : '0';
+            btn[16] = 0;
+            s_log("Eingabe roh: X=%ld Y=%ld Z=%ld Rx=%ld Ry=%ld Rz=%ld POV=%lu Tasten=%s",
+                  js.lX, js.lY, js.lZ, js.lRx, js.lRy, js.lRz, js.rgdwPOV[0], btn);
+            logged++;
+        }
+    }
     if (s_sony) {
         // DualSense / DualShock 4: Viereck, Kreuz, Kreis, Dreieck, L1, R1, L2, R2, Create, Options, L3, R3
         if (k[0] & 0x80) b |= XB_X;
@@ -196,12 +209,23 @@ static int read_keyboard(NETPAD *p)
     return b || x || y;
 }
 
+static short deadzone(short v)
+{
+    // Ruhewerte echter Sticks schwanken um die Mitte; wie bei XInput ueblich ~24 % ignorieren
+    return (v > -7849 && v < 7849) ? 0 : v;
+}
+
 void input_read(NETPAD *out)
 {
     NETPAD kb;
     int src;
+    char env[8];
     memset(out, 0, sizeof *out);
     memset(&kb, 0, sizeof kb);
+    if (GetEnvironmentVariableA("LBO_NOREALINPUT", env, sizeof env) && env[0] == '1') {
+        out->connected = 1;  // Testbetrieb: keine echten Geraete abfragen
+        return;
+    }
     if (read_xinput(out)) src = 0;
     else if (read_dinput(out)) src = 1;
     else src = 2;
@@ -209,6 +233,8 @@ void input_read(NETPAD *out)
         out->buttons |= kb.buttons;
         if (!out->lx && !out->ly) { out->lx = kb.lx; out->ly = kb.ly; }
     }
+    out->lx = deadzone(out->lx); out->ly = deadzone(out->ly);
+    out->rx = deadzone(out->rx); out->ry = deadzone(out->ry);
     out->connected = 1;
     if (src != s_last_source && s_log) {
         s_log("Eingabe: %s", src == 0 ? "Xbox-Controller (XInput)" : src == 1 ? s_name : "kein Controller, nur Tastatur");

@@ -448,6 +448,44 @@ static void write_shot(const char *name)
 }
 
 // --- Frame-Hooks ------------------------------------------------------------------
+// Automatisches Laden eines Spielstands (LBO_AUTOLOAD=<slot 0-5>, nur Host): Der Host-Pad
+// drueckt die Menues durch. Zeitpunkte aus der Live-Aufzeichnung r12 (festes dt, keine Videos,
+// 60 fps), danach uebernimmt der echte Controller. Weil die Eingaben ueber den Lockstep laufen,
+// sehen beide Spiele exakt dieselben Menuebewegungen.
+static long g_script_until = 0x7FFFFFFF;
+
+static void add_press(int from, int len, unsigned short buttons)
+{
+    LINE l;
+    memset(&l, 0, sizeof l);
+    l.dom = 'F'; l.from = from; l.to = from + len - 1; l.pad = net_role(); l.p.wButtons = buttons;
+    add_line(&l);
+}
+
+static void make_autoload_script(int slot)
+{
+    int i, f = 4400;
+    if (slot < 0 || slot > 5) return;
+    if (net_role() != 0) {
+        // Gast: kein Skript, aber bis zum Ende des Ladens zaehlt nur der Host (siehe net_exchange)
+        g_script_until = 6260;
+        logf_("Host laedt Spielstand %d automatisch, Eingaben bis Frame %ld gesperrt", slot + 1, g_script_until);
+        return;
+    }
+    add_press(3271, 30, 0x1000);              // Titel: A
+    add_press(4101, 20, 0x1000);              // Hauptmenue: "Load Game" (vorausgewaehlt, wenn es Spielstaende gibt)
+    for (i = 0; i < slot % 3; i++, f += 40)   // Slot-Raster 3x2: nach rechts ...
+        add_press(f, 10, 0x0008);
+    for (i = 0; i < slot / 3; i++, f += 40)   // ... und nach unten
+        add_press(f, 10, 0x0002);
+    add_press(4661, 20, 0x1000);              // Slot waehlen
+    add_press(4801, 20, 0x0001);              // Bestaetigung: hoch auf "Yes"
+    add_press(5301, 20, 0x1000);              // Yes
+    add_press(6201, 20, 0x1000);              // "Autosave will now use Game N": OK
+    g_script_until = 6260;
+    logf_("Automatisches Laden von Spielstand %d (Menue-Skript bis Frame %ld)", slot + 1, g_script_until);
+}
+
 // Lockstep: lokale Eingabe abtasten, mit dem Partner austauschen (blockiert bis beide da sind)
 static void net_exchange(long F)
 {
@@ -455,8 +493,8 @@ static void net_exchange(long F)
     PAD p;
     int i;
     memset(&local, 0, sizeof local);
-    if (g_nlines > 0) {
-        // Testbetrieb: lokale Eingabe aus dem Skript
+    if (g_nlines > 0 && F <= g_script_until) {
+        // Testbetrieb oder automatisches Laden: lokale Eingabe aus dem Skript
         EnterCriticalSection(&g_cs);
         scripted_state(net_role(), &p);
         LeaveCriticalSection(&g_cs);
@@ -467,6 +505,12 @@ static void net_exchange(long F)
         input_read(&local);  // echter Controller oder Tastatur des Spielers
     }
     net_frame((int)F, &local, both);
+    if (g_script_until != 0x7FFFFFFF && F <= g_script_until) {
+        // Waehrend des automatischen Ladens zaehlen nur die Skript-Eingaben des Hosts. Beide Seiten
+        // wenden diese Regel identisch an, daher bleibt der Lockstep synchron.
+        memset(&both[1], 0, sizeof both[1]);
+        both[1].connected = 1;
+    }
     for (i = 0; i < 2; i++) {
         g_net_pad[i].wButtons = both[i].buttons;
         g_net_pad[i].bLeftTrigger = both[i].lt; g_net_pad[i].bRightTrigger = both[i].rt;
@@ -851,6 +895,7 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_MAXFRAMES", buf, sizeof buf)) g_max_frames = atoi(buf);
     if (GetEnvironmentVariableA("LBO_SHOT_EVERY", buf, sizeof buf)) g_shot_every = atoi(buf);
     if (g_mode == MODE_SCRIPT && GetEnvironmentVariableA("LBO_SCRIPT", buf, sizeof buf)) load_script(buf);
+    if (g_net && GetEnvironmentVariableA("LBO_AUTOLOAD", buf, sizeof buf)) make_autoload_script(atoi(buf));
     if (g_mode == MODE_SCRIPT && GetEnvironmentVariableA("LBO_LIVE", g_live, sizeof g_live)) {
         FILE *f = fopen(g_live, "rb");
         if (f) { fseek(f, 0, SEEK_END); g_live_pos = ftell(f); fclose(f); }  // alte Befehle ignorieren

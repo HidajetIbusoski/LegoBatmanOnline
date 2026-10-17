@@ -54,6 +54,21 @@ static void (*g_log)(const char *fmt, ...);
 
 int net_role(void) { return g_role; }
 
+// Bis zum ersten Frame vergehen einige Sekunden (Spielstart). In der Zeit halten wir die
+// Zuordnung im Router des Partners offen, sonst wuerden seine ersten Pakete verworfen.
+static volatile LONG g_started;
+static HANDLE g_keepalive;
+static void send_inputs(void);
+static DWORD WINAPI keepalive(void *arg)
+{
+    (void)arg;
+    while (!g_started) {
+        send_inputs();
+        Sleep(200);
+    }
+    return 0;
+}
+
 int net_init(void (*logger)(const char *fmt, ...))
 {
     char buf[128], host[64];
@@ -101,6 +116,7 @@ int net_init(void (*logger)(const char *fmt, ...))
     memset(g_remote_have, 0, sizeof g_remote_have);
     for (port = 1; port <= g_delay; port++) g_remote_have[port % RING] = 1;
     if (g_loss) g_log("Netz-Test: simuliere %d %% Paketverlust", g_loss);
+    g_keepalive = CreateThread(NULL, 0, keepalive, NULL, 0, NULL);
     g_log("Netz: Rolle %s, Port %d, Partner %s:%d, Verzoegerung %d Frames",
           g_role ? "Client (Spieler 2)" : "Host (Spieler 1)", ntohs(me.sin_port), host, peer_port, g_delay);
     return 1;
@@ -161,6 +177,10 @@ static void receive(void)
 void net_frame(int F, const NETPAD *local_now, NETPAD out[2])
 {
     DWORD start = GetTickCount(), last_send = 0, last_log = start;
+    if (!g_started) {
+        InterlockedExchange(&g_started, 1);
+        if (g_keepalive) WaitForSingleObject(g_keepalive, 2000);
+    }
     // Lokale Eingabe dieses Frames gilt ab F + Verzoegerung
     while (g_local_upto < F + g_delay) {
         g_local_upto++;

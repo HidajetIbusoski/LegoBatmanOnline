@@ -23,6 +23,7 @@
 #include <ctype.h>
 #include <mmsystem.h>
 #include "net.h"
+#include "input.h"
 
 // --- Spieladressen ---------------------------------------------------------
 #define ADDR_FRAME_END      0x006E0240  // sub esp,14h / fldz  (5 Bytes)
@@ -292,6 +293,10 @@ static void fix_input_slots(void)
     int i;
     if (!obj) return;
     __try {
+        // Im Netzmodus darf die Tastatur nicht direkt ins Spiel (sonst Desync). 0x523c30 liefert
+        // fuer die Tastatur-Geraete 10-13 keine Eingabe, solange Slot+0x28 null ist.
+        if (g_net)
+            for (i = 10; i < 14; i++) SLOT(obj, i)[0x28] = 0;
         for (i = 0; i < 4; i++) {
             unsigned char *slot = SLOT(obj, i);
             XCAPS caps;
@@ -451,18 +456,16 @@ static void net_exchange(long F)
     int i;
     memset(&local, 0, sizeof local);
     if (g_nlines > 0) {
+        // Testbetrieb: lokale Eingabe aus dem Skript
         EnterCriticalSection(&g_cs);
         scripted_state(net_role(), &p);
         LeaveCriticalSection(&g_cs);
+        local.buttons = p.wButtons; local.lt = p.bLeftTrigger; local.rt = p.bRightTrigger;
+        local.lx = p.sThumbLX; local.ly = p.sThumbLY; local.rx = p.sThumbRX; local.ry = p.sThumbRY;
+        local.connected = 1;
     } else {
-        XSTATE st;
-        memset(&st, 0, sizeof st);
-        if (real_getstate(0, &st) != ERROR_SUCCESS) memset(&st, 0, sizeof st);
-        p = st.Gamepad;
+        input_read(&local);  // echter Controller oder Tastatur des Spielers
     }
-    local.buttons = p.wButtons; local.lt = p.bLeftTrigger; local.rt = p.bRightTrigger;
-    local.lx = p.sThumbLX; local.ly = p.sThumbLY; local.rx = p.sThumbRX; local.ry = p.sThumbRY;
-    local.connected = 1;
     net_frame((int)F, &local, both);
     for (i = 0; i < 2; i++) {
         g_net_pad[i].wButtons = both[i].buttons;
@@ -672,6 +675,16 @@ static int patch_jmp(DWORD at, void *to, const unsigned char *expect)
     return 1;
 }
 
+// Sucht in der Importtabelle der EXE den Eintrag, der auf fn zeigt (fuer Importe ohne festes Wissen)
+static void **find_iat_slot(void *fn)
+{
+    void **p;
+    if (!fn) return NULL;
+    for (p = (void **)0x02A17000; p < (void **)0x02A1A000; p++)
+        if (*p == fn) return p;
+    return NULL;
+}
+
 static void patch_iat(DWORD slot, void *fn, void **orig)
 {
     DWORD old;
@@ -713,9 +726,47 @@ static int is_protected(const char *path)
     return strstr(low, "savedgame") || strstr(low, "pcconfig.txt");
 }
 
+// Gast im Netzmodus (LBO_SAVEDIR): Alles unter "...\Saved Games\" kommt aus der Kopie des Host-
+// Spielstands, Lesen wie Schreiben. So laden beide Spiele exakt denselben Stand, und der eigene
+// Spielstand des Gastes bleibt unberuehrt.
+static char g_savedir[MAX_PATH];
+typedef DWORD (WINAPI *GetFileAttributesAFn)(LPCSTR);
+typedef HANDLE (WINAPI *FindFirstFileAFn)(LPCSTR, LPWIN32_FIND_DATAA);
+static GetFileAttributesAFn real_getattr;
+static FindFirstFileAFn real_findfirst;
+
+static const char *map_guest(const char *path, char *buf)
+{
+    char low[MAX_PATH];
+    const char *hit;
+    size_t i;
+    if (!g_savedir[0] || !path) return path;
+    for (i = 0; path[i] && i < MAX_PATH - 1; i++) low[i] = (char)tolower((unsigned char)path[i]);
+    low[i] = 0;
+    hit = strstr(low, "\\saved games");
+    if (!hit) return path;
+    snprintf(buf, MAX_PATH, "%s%s", g_savedir, path + (hit - low) + strlen("\\saved games"));
+    return buf;
+}
+
+static DWORD WINAPI hook_getattr(LPCSTR path)
+{
+    char buf[MAX_PATH];
+    return real_getattr(map_guest(path, buf));
+}
+
+static HANDLE WINAPI hook_findfirst(LPCSTR path, LPWIN32_FIND_DATAA fd)
+{
+    char buf[MAX_PATH];
+    return real_findfirst(map_guest(path, buf), fd);
+}
+
 static HANDLE WINAPI hook_createfile(LPCSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
                                      DWORD disp, DWORD flags, HANDLE tmpl)
 {
+    char gbuf[MAX_PATH];
+    const char *mapped = map_guest(path, gbuf);
+    if (mapped != path) return real_createfile(mapped, access, share, sa, disp, flags, tmpl);
     if ((access & (GENERIC_WRITE | GENERIC_ALL)) && is_protected(path)) {
         char red[MAX_PATH];
         const char *base = strrchr(path, '\\');
@@ -728,6 +779,9 @@ static HANDLE WINAPI hook_createfile(LPCSTR path, DWORD access, DWORD share, LPS
 
 static BOOL WINAPI hook_deletefile(LPCSTR path)
 {
+    char gbuf[MAX_PATH];
+    const char *mapped = map_guest(path, gbuf);
+    if (mapped != path) return real_deletefile(mapped);
     if (is_protected(path)) {
         logf_("Loeschen verhindert: %s", path);
         return TRUE;
@@ -818,6 +872,14 @@ static void init(void)
     patch_iat(IAT_CREATEFILEA, (void *)hook_createfile, (void **)&real_createfile);
     patch_iat(IAT_DELETEFILEA, (void *)hook_deletefile, (void **)&real_deletefile);
     logf_("Spielstand-Schutz %s", g_allow_save ? "AUS (LBO_ALLOWSAVE)" : "aktiv");
+    if (GetEnvironmentVariableA("LBO_SAVEDIR", g_savedir, sizeof g_savedir)) {
+        void **slot;
+        patch_iat(0x02A178F4, (void *)hook_getattr, (void **)&real_getattr);
+        slot = find_iat_slot(GetProcAddress(GetModuleHandleA("kernel32.dll"), "FindFirstFileA"));
+        if (slot) patch_iat((DWORD)slot, (void *)hook_findfirst, (void **)&real_findfirst);
+        logf_("Gast: Spielstand kommt aus %s (FindFirstFileA %s)", g_savedir, slot ? "umgeleitet" : "nicht gefunden");
+    }
+    input_init((void *)real_getstate, logf_);
     if (GetEnvironmentVariableA("LBO_MULTI", buf, sizeof buf)) g_multi = atoi(buf);
     patch_iat(IAT_CREATEMUTEXA, (void *)hook_createmutex, (void **)&real_createmutex);
     if (GetEnvironmentVariableA("LBO_NOMOVIES", buf, sizeof buf)) g_no_movies = atoi(buf);

@@ -102,15 +102,36 @@ public static class GameBridge
     /// Startet Verbindungsaufbau und Spiel. Jede Ausgabezeile des Launchers geht an onLine
     /// (z. B. "STATUS verbunden", "ERROR ..."). Kehrt zurueck, wenn das Spiel beendet ist.
     /// </summary>
-    public static async Task<int> ConnectAndPlayAsync(string launcher, bool host, Endpoint me, Endpoint peer,
-        int slot, Action<string> onLine, IDictionary<string, string>? extraEnv, CancellationToken ct)
+    public static Task<int> ConnectAndPlayAsync(string launcher, bool host, Endpoint me, Endpoint peer,
+        int slot, string? saveDir, Action<string> onLine, IDictionary<string, string>? extraEnv, CancellationToken ct)
     {
-        var args = $"--connect {(host ? "host" : "join")} --port {me.Port} --key {me.Key} --peer-key {peer.Key} " +
-                   $"--peer-public {peer.Public} --peer-local {peer.Local}" + (slot >= 0 ? $" --slot {slot}" : "");
-        var psi = new ProcessStartInfo(launcher, args)
-        {
-            UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true,
-        };
+        var psi = new ProcessStartInfo(launcher);
+        foreach (var a in new[] { "--connect", host ? "host" : "join", "--port", me.Port.ToString(), "--key", me.Key.ToString(),
+                     "--peer-key", peer.Key.ToString(), "--peer-public", peer.Public, "--peer-local", peer.Local })
+            psi.ArgumentList.Add(a);
+        if (slot >= 0) { psi.ArgumentList.Add("--slot"); psi.ArgumentList.Add(slot.ToString()); }
+        if (saveDir != null) { psi.ArgumentList.Add("--savedir"); psi.ArgumentList.Add(saveDir); }
+        return RunAsync(psi, onLine, extraEnv, ct);
+    }
+
+    /// <summary>Alleine spielen: Spiel ohne Netz, Spielstaende aus saveDir (gemeinsame Welt).</summary>
+    public static Task<int> PlaySoloAsync(string launcher, string saveDir, Action<string> onLine,
+        IDictionary<string, string>? extraEnv, CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo(launcher);
+        psi.ArgumentList.Add("--solo");
+        psi.ArgumentList.Add("--savedir");
+        psi.ArgumentList.Add(saveDir);
+        return RunAsync(psi, onLine, extraEnv, ct);
+    }
+
+    private static async Task<int> RunAsync(ProcessStartInfo psi, Action<string> onLine,
+        IDictionary<string, string>? extraEnv, CancellationToken ct)
+    {
+        psi.UseShellExecute = false;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.CreateNoWindow = true;
         if (extraEnv != null) foreach (var kv in extraEnv) psi.Environment[kv.Key] = kv.Value;
         using var p = Process.Start(psi)!;
         p.OutputDataReceived += (_, e) => { if (e.Data != null) onLine(e.Data); };

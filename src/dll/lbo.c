@@ -922,7 +922,7 @@ static void init(void)
         patch_iat(0x02A178F4, (void *)hook_getattr, (void **)&real_getattr);
         slot = find_iat_slot(GetProcAddress(GetModuleHandleA("kernel32.dll"), "FindFirstFileA"));
         if (slot) patch_iat((DWORD)slot, (void *)hook_findfirst, (void **)&real_findfirst);
-        logf_("Gast: Spielstand kommt aus %s (FindFirstFileA %s)", g_savedir, slot ? "umgeleitet" : "nicht gefunden");
+        logf_("Spielstand-Ordner umgeleitet nach %s (FindFirstFileA %s)", g_savedir, slot ? "umgeleitet" : "nicht gefunden");
     }
     input_init((void *)real_getstate, logf_);
     if (GetEnvironmentVariableA("LBO_MULTI", buf, sizeof buf)) g_multi = atoi(buf);

@@ -12,8 +12,10 @@ namespace LegoBatmanOnline.Core;
 ///
 /// Themen (alle unter lbobatman/v1/):
 ///   profile/[id]   oeffentlicher Schluessel + Name (retained), damit andere uns per Code finden
-///   presence/[id]  "on"/"off" (retained, Last Will = "off")
+///   presence/[id]  "on"/"busy"/"off" (retained, Last Will = "off"); busy = spielt gerade
 ///   inbox/[id]     Nachrichten an diesen Spieler, Ende-zu-Ende verschluesselt (ECDH + AES-GCM)
+///   world/[thema]  Spielstand einer gemeinsamen Welt (retained, mit dem Weltschluessel verschluesselt;
+///                  das Thema ist ein Hash des Schluessels und fuer Fremde nicht erratbar)
 ///
 /// Die App ist mit allen Diensten gleichzeitig verbunden und sendet ueber jeden. So finden sich zwei
 /// Spieler auch dann, wenn einer der Dienste bei einem von ihnen gerade nicht erreichbar ist.
@@ -33,7 +35,9 @@ public sealed class Messenger : IAsyncDisposable
     private readonly MqttClientFactory _factory = new();
     private readonly IMqttClient?[] _clients = new IMqttClient?[Brokers.Length];
     private readonly HashSet<string> _watched = new();
-    private readonly Dictionary<string, bool[]> _presence = new();
+    private readonly HashSet<string> _worlds = new();
+    private readonly Dictionary<string, string[]> _presence = new();
+    private string _status = "on";
     private readonly Dictionary<string, TaskCompletionSource<(byte[] Pub, string Name)?>> _pendingProfiles = new();
     private readonly HashSet<string> _seen = new();
     private readonly Queue<string> _seenOrder = new();
@@ -41,8 +45,9 @@ public sealed class Messenger : IAsyncDisposable
     private bool _wasConnected;
 
     public event Action<bool>? ConnectionChanged;
-    public event Action<string, bool>? PresenceChanged;                  // id, online
+    public event Action<string, string>? PresenceChanged;                // id, "on" | "busy" | "off"
     public event Action<string, byte[], JsonObject>? MessageReceived;    // von id, oeffentlicher Schluessel, Inhalt
+    public event Action<string, byte[]>? WorldReceived;                  // Thema, verschluesselter Spielstand
     public bool IsConnected => _clients.Any(c => c?.IsConnected == true);
     public string BrokerNames => string.Join(", ", Brokers.Where((_, i) => _clients[i]?.IsConnected == true).Select(b => b.Host));
 
@@ -65,6 +70,7 @@ public sealed class Messenger : IAsyncDisposable
     private async Task KeepConnectedAsync(int b, CancellationToken ct)
     {
         int wait = 3000;
+        var lastPresence = DateTime.UtcNow;
         while (!ct.IsCancellationRequested)
         {
             if (_clients[b]?.IsConnected != true)
@@ -73,12 +79,21 @@ public sealed class Messenger : IAsyncDisposable
                 {
                     await ConnectAsync(b);
                     wait = 3000;
+                    lastPresence = DateTime.UtcNow;
                 }
                 catch
                 {
                     wait = Math.Min(wait * 2, 60000);
                 }
                 NotifyConnection();
+            }
+            else if (DateTime.UtcNow - lastPresence > TimeSpan.FromSeconds(30))
+            {
+                // Status regelmaessig erneuern: ein verspaeteter Last Will einer alten Verbindung
+                // (Absturz, Neustart) wuerde uns sonst dauerhaft als offline zeigen
+                lastPresence = DateTime.UtcNow;
+                try { await PublishAsync(_clients[b]!, Prefix + "presence/" + _me.Id, Encoding.ASCII.GetBytes(_status), true); }
+                catch { }
             }
             await Task.Delay(_clients[b]?.IsConnected == true ? 2000 : wait, ct).ContinueWith(_ => { });
         }
@@ -115,8 +130,11 @@ public sealed class Messenger : IAsyncDisposable
         string[] watched;
         lock (_watched) watched = _watched.ToArray();
         foreach (var id in watched) await SubscribeAsync(client, Prefix + "presence/" + id);
+        string[] worlds;
+        lock (_worlds) worlds = _worlds.ToArray();
+        foreach (var t in worlds) await SubscribeAsync(client, Prefix + "world/" + t);
         await PublishAsync(client, Prefix + "profile/" + _me.Id, ProfilePayload(), true);
-        await PublishAsync(client, Prefix + "presence/" + _me.Id, Encoding.ASCII.GetBytes("on"), true);
+        await PublishAsync(client, Prefix + "presence/" + _me.Id, Encoding.ASCII.GetBytes(_status), true);
     }
 
     private IEnumerable<IMqttClient> Connected() => _clients.Where(c => c?.IsConnected == true).Select(c => c!);
@@ -153,6 +171,30 @@ public sealed class Messenger : IAsyncDisposable
         lock (_watched) if (!_watched.Add(id)) return;
         await OnAllAsync(c => SubscribeAsync(c, Prefix + "presence/" + id));
     }
+
+    /// <summary>Eigenen Status setzen: spielt gerade (busy) oder nur online.</summary>
+    public Task SetBusyAsync(bool busy)
+    {
+        _status = busy ? "busy" : "on";
+        return OnAllAsync(c => PublishAsync(c, Prefix + "presence/" + _me.Id, Encoding.ASCII.GetBytes(_status), true));
+    }
+
+    /// <summary>Spielstand einer Welt verfolgen (retained, kommt nach dem Abonnieren sofort).</summary>
+    public async Task WatchWorldAsync(string topic)
+    {
+        lock (_worlds) if (!_worlds.Add(topic)) return;
+        await OnAllAsync(c => SubscribeAsync(c, Prefix + "world/" + topic));
+    }
+
+    public async Task UnwatchWorldAsync(string topic)
+    {
+        lock (_worlds) _worlds.Remove(topic);
+        await OnAllAsync(c => c.UnsubscribeAsync(Prefix + "world/" + topic));
+    }
+
+    /// <summary>Spielstand einer Welt bei allen Diensten hinterlegen. true, wenn mindestens einer ihn hat.</summary>
+    public Task<bool> PublishWorldAsync(string topic, byte[] payload) =>
+        OnAllAsync(c => PublishAsync(c, Prefix + "world/" + topic, payload, true));
 
     /// <summary>Oeffentlichen Schluessel und Namen zu einem Code holen (aus dem retained Profil).</summary>
     public async Task<(byte[] Pub, string Name)?> LookupAsync(string id, TimeSpan timeout)
@@ -199,15 +241,21 @@ public sealed class Messenger : IAsyncDisposable
             if (topic.StartsWith(Prefix + "presence/"))
             {
                 var id = topic[(Prefix.Length + 9)..];
-                bool on = Encoding.ASCII.GetString(payload) == "on", before, after;
+                var state = Encoding.ASCII.GetString(payload) switch { "on" => "on", "busy" => "busy", _ => "off" };
+                string before, after;
                 lock (_presence)
                 {
-                    if (!_presence.TryGetValue(id, out var states)) _presence[id] = states = new bool[Brokers.Length];
-                    before = states.Any(x => x);
-                    states[broker] = on;
-                    after = states.Any(x => x);
+                    if (!_presence.TryGetValue(id, out var states))
+                        _presence[id] = states = Enumerable.Repeat("off", Brokers.Length).ToArray();
+                    before = Combine(states);
+                    states[broker] = state;
+                    after = Combine(states);
                 }
-                if (before != after || !on) PresenceChanged?.Invoke(id, after);
+                if (before != after || after == "off") PresenceChanged?.Invoke(id, after);
+            }
+            else if (topic.StartsWith(Prefix + "world/"))
+            {
+                if (payload.Length > 0) WorldReceived?.Invoke(topic[(Prefix.Length + 6)..], payload);
             }
             else if (topic.StartsWith(Prefix + "profile/"))
             {
@@ -256,6 +304,10 @@ public sealed class Messenger : IAsyncDisposable
         content["name"] = Clean((string?)content["name"]);
         MessageReceived?.Invoke(from, pub, content);
     }
+
+    /// <summary>Status ueber alle Dienste: einer meldet "busy" → busy, sonst einer "on" → on.</summary>
+    private static string Combine(string[] states) =>
+        states.Contains("busy") ? "busy" : states.Contains("on") ? "on" : "off";
 
     public static string Clean(string? name)
     {

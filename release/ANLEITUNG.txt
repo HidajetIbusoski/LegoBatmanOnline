@@ -27,24 +27,43 @@ Freunde hinzufuegen (einmalig)
 ------------------------------
 1. Oben links steht dein Freundescode, z. B. HN4U-JZJ2-9NYW.
    "Kopieren" druecken und dem Freund schicken (Discord, WhatsApp ...).
-2. Der Freund gibt den Code bei "Freund hinzufuegen" ein.
+2. Der Freund gibt den Code links bei "Freunde" ein und drueckt "Hinzufuegen".
 3. Bei dir erscheint die Anfrage in der Freundesliste -> "Annehmen".
-Ab jetzt seht ihr, wer online ist (gruener Punkt).
+Ab jetzt seht ihr, wer online ist (gruen = online, gelb = spielt gerade).
+
+
+Gemeinsame Welt anlegen (einmalig)
+----------------------------------
+Eine Welt ist ein Spielstand, den ihr zu zweit teilt.
+1. Rechts "+ Neue Welt" druecken.
+2. Namen eingeben (z. B. "Gotham"), den Freund waehlen und festlegen, ob ihr
+   neu anfangt oder einen deiner Spielstaende als Start nehmt.
+3. Die Welt erscheint bei euch beiden. Dein eigener Spielstand bleibt
+   unveraendert; die Welt bekommt eine Kopie.
 
 
 Spielen
 -------
-1. Beide starten die App. Steam muss NICHT laufen.
-2. Wer den Spielstand hat, waehlt links den Spielstand aus und drueckt beim
-   Freund auf "Einladen".
-3. Der Freund drueckt "Annehmen und spielen".
-4. Die App verbindet euch, schickt den Spielstand an den Freund und startet bei
-   beiden das Spiel. Mit "Spielstand automatisch laden" landet ihr direkt im
-   Spiel; sonst bedient der Einladende die Menues.
-5. Der Eingeladene drueckt START, sobald ihr im Spiel seid, und steigt ein.
+Steam muss NICHT laufen.
 
-Gespeichert wird nur beim Einladenden (in seinem normalen Spielstand). Der eigene
-Spielstand des Eingeladenen wird nie veraendert.
+Zusammen (beide online):
+1. Einer drueckt bei der Welt "Zusammen spielen", der andere "Annehmen und spielen".
+2. Die App verbindet euch und startet bei beiden das Spiel. Der Spielstand
+   wird automatisch geladen.
+3. Der Eingeladene drueckt START, sobald ihr im Spiel seid, und steigt ein.
+
+Alleine (Freund offline oder keine Zeit):
+1. Bei der Welt "Alleine spielen" druecken.
+2. Im Spiel unter "Load Game" den Spielstand laden. Du siehst dort nur die
+   Spielstaende dieser Welt.
+
+Nach jedem Spiel gleicht die App den Stand automatisch ab. Der Stand wird
+verschluesselt beim Vermittler hinterlegt, damit dein Freund ihn auch bekommt,
+wenn du gerade offline bist. Habt ihr beide getrennt gespielt, gewinnt der
+zuletzt gespeicherte Stand. Der andere landet in den Sicherungen
+(Ordner-Symbol bei der Welt) und kann von dort zurueckkopiert werden.
+Tipp: Die App waehrend des Spiels offen lassen, sonst wird erst beim
+naechsten Start abgeglichen.
 
 
 Steuerung ohne Controller (Tastatur)
@@ -83,8 +102,10 @@ Datenschutz
 -----------
 Die App findet Freunde ueber oeffentliche Vermittlungsdienste (MQTT: HiveMQ,
 EMQX, Mosquitto). Dort sichtbar sind nur dein Freundescode, dein Name und ob du
-online bist. Freundschaftsanfragen, Einladungen und eure IP-Adressen werden
-Ende-zu-Ende verschluesselt. Das Spiel selbst laeuft direkt zwischen euren PCs.
+online bist. Freundschaftsanfragen, Einladungen, eure IP-Adressen und die
+Spielstaende eurer Welten werden Ende-zu-Ende verschluesselt. Das Spiel selbst
+laeuft direkt zwischen euren PCs. Oeffentliche Dienste koennen hinterlegte
+Daten jederzeit loeschen; jeder von euch hat aber immer eine eigene Kopie.
 
 
 Bei Problemen

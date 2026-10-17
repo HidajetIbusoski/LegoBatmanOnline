@@ -1,4 +1,5 @@
 ﻿using System.ComponentModel;
+using System.Diagnostics;
 using System.Windows;
 using System.Windows.Input;
 using LegoBatmanOnline.Core;
@@ -46,6 +47,7 @@ public partial class MainWindow : Window
         CopyButton.Content = "Kopieren";
     }
 
+    // --- Freunde ---------------------------------------------------------------------
     private async void AddFriend_Click(object sender, RoutedEventArgs e)
     {
         var code = FriendCodeBox.Text;
@@ -60,27 +62,76 @@ public partial class MainWindow : Window
         if (e.Key == Key.Enter) AddFriend_Click(sender, e);
     }
 
-    private static FriendItem ItemOf(object sender) => (FriendItem)((FrameworkElement)sender).DataContext;
+    private static T ItemOf<T>(object sender) => (T)((FrameworkElement)sender).DataContext;
 
-    private async void AcceptFriend_Click(object sender, RoutedEventArgs e) => await _lobby.AcceptFriendAsync(ItemOf(sender));
-
-    private async void Invite_Click(object sender, RoutedEventArgs e) => await _lobby.InviteAsync(ItemOf(sender));
+    private async void AcceptFriend_Click(object sender, RoutedEventArgs e) =>
+        await _lobby.AcceptFriendAsync(ItemOf<FriendItem>(sender));
 
     private void RemoveFriend_Click(object sender, RoutedEventArgs e)
     {
-        var f = ItemOf(sender);
+        var f = ItemOf<FriendItem>(sender);
         if (MessageBox.Show($"{f.Name} aus der Freundesliste entfernen?", "LEGO Batman Online",
                 MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
             _lobby.RemoveFriend(f);
     }
 
+    // --- Welten ----------------------------------------------------------------------
+    private void NewWorld_Click(object sender, RoutedEventArgs e)
+    {
+        var friends = _lobby.Friends.Where(f => f.IsFriend).ToList();
+        if (friends.Count == 0)
+        {
+            _lobby.Hint = "Füge zuerst einen Freund hinzu – eine Welt teilst du immer mit einem Freund.";
+            return;
+        }
+        WorldNameBox.Text = "";
+        NewWorldError.Text = "";
+        PartnerList.ItemsSource = friends;
+        PartnerList.SelectedIndex = 0;
+        SeedList.ItemsSource = _lobby.Seeds().ToList();
+        SeedList.SelectedIndex = 0;
+        NewWorldOverlay.Visibility = Visibility.Visible;
+        WorldNameBox.Focus();
+    }
+
+    private void CancelNewWorld_Click(object sender, RoutedEventArgs e) => NewWorldOverlay.Visibility = Visibility.Collapsed;
+
+    private async void CreateWorld_Click(object sender, RoutedEventArgs e)
+    {
+        if (PartnerList.SelectedItem is not FriendItem partner) { NewWorldError.Text = "Wähle einen Freund."; return; }
+        if (SeedList.SelectedItem is not WorldSeed seed) { NewWorldError.Text = "Wähle einen Startpunkt."; return; }
+        var err = await _lobby.CreateWorldAsync(WorldNameBox.Text, partner, seed);
+        if (err.Length > 0) { NewWorldError.Text = err; return; }
+        NewWorldOverlay.Visibility = Visibility.Collapsed;
+    }
+
+    private async void PlayTogether_Click(object sender, RoutedEventArgs e) =>
+        await _lobby.PlayTogetherAsync(ItemOf<WorldItem>(sender));
+
+    private async void PlaySolo_Click(object sender, RoutedEventArgs e) =>
+        await _lobby.PlaySoloAsync(ItemOf<WorldItem>(sender));
+
+    private void OpenBackups_Click(object sender, RoutedEventArgs e)
+    {
+        var dir = _lobby.BackupFolder(ItemOf<WorldItem>(sender));
+        try { Process.Start(new ProcessStartInfo("explorer.exe", $"\"{dir}\"") { UseShellExecute = true }); } catch { }
+    }
+
+    private async void RemoveWorld_Click(object sender, RoutedEventArgs e)
+    {
+        var w = ItemOf<WorldItem>(sender);
+        if (MessageBox.Show($"Welt „{w.Name}“ aus der Liste entfernen?\n\nDie Dateien bleiben auf deinem PC erhalten. " +
+                            "Dein Freund behält die Welt.", "LEGO Batman Online",
+                MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+            await _lobby.RemoveWorldAsync(w);
+    }
+
+    // --- Einladung und Sitzung ---------------------------------------------------------------
     private async void AcceptInvite_Click(object sender, RoutedEventArgs e) => await _lobby.AcceptInviteAsync();
 
     private async void Decline_Click(object sender, RoutedEventArgs e) => await _lobby.DeclineInviteAsync();
 
     private async void CancelSession_Click(object sender, RoutedEventArgs e) => await _lobby.CancelSessionAsync();
-
-    private void RefreshSaves_Click(object sender, RoutedEventArgs e) => _lobby.RefreshSaves();
 
     private void PickGame_Click(object sender, RoutedEventArgs e)
     {
@@ -93,8 +144,8 @@ public partial class MainWindow : Window
         base.OnClosing(e);
         if (_closing) return;
         if (_lobby.SessionActive &&
-            MessageBox.Show("Es läuft gerade ein Online-Spiel. Trotzdem schließen?", "LEGO Batman Online",
-                MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+            MessageBox.Show("Es läuft gerade ein Spiel. Trotzdem schließen?\n\nDer Spielstand wird dann erst beim nächsten Start der App abgeglichen.",
+                "LEGO Batman Online", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
         {
             e.Cancel = true;
             return;

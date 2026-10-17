@@ -8,45 +8,97 @@ using System.Windows.Threading;
 
 namespace LegoBatmanOnline.Core;
 
-public sealed class FriendItem : INotifyPropertyChanged
+public abstract class Bindable : INotifyPropertyChanged
 {
-    private bool _online;
+    public event PropertyChangedEventHandler? PropertyChanged;
+    protected void Raise([CallerMemberName] string? n = null) => PropertyChanged?.Invoke(this, new(n));
+}
+
+public sealed class FriendItem : Bindable
+{
+    private string _presence = "off";
     private string _name = "";
     private FriendState _state;
     public string Id { get; init; } = "";
     public string Code => Identity.FormatCode(Id);
     public string Name { get => _name; set { _name = value; Raise(); } }
-    public bool Online { get => _online; set { _online = value; Raise(); Raise(nameof(CanInvite)); Raise(nameof(StatusText)); } }
+    /// <summary>"on", "busy" (spielt gerade) oder "off"</summary>
+    public string Presence
+    {
+        get => _presence;
+        set { _presence = value; Raise(); Raise(nameof(Online)); Raise(nameof(Busy)); Raise(nameof(StatusText)); }
+    }
+    public bool Online => Presence != "off";
+    public bool Busy => Presence == "busy";
     public FriendState State
     {
         get => _state;
-        set { _state = value; Raise(); Raise(nameof(CanInvite)); Raise(nameof(IsIncoming)); Raise(nameof(IsFriend)); Raise(nameof(StatusText)); }
+        set { _state = value; Raise(); Raise(nameof(IsIncoming)); Raise(nameof(IsFriend)); Raise(nameof(StatusText)); }
     }
-    public bool CanInvite => Online && State == FriendState.Friend;
     public bool IsIncoming => State == FriendState.RequestReceived;
     public bool IsFriend => State == FriendState.Friend;
     public string StatusText => State switch
     {
         FriendState.RequestSent => "Anfrage gesendet",
         FriendState.RequestReceived => "möchte dein Freund sein",
-        _ => Online ? "online" : "offline",
+        _ => Presence switch { "busy" => "spielt gerade", "on" => "online", _ => "offline" },
     };
-    public event PropertyChangedEventHandler? PropertyChanged;
-    private void Raise([CallerMemberName] string? n = null) => PropertyChanged?.Invoke(this, new(n));
+}
+
+public sealed class WorldItem : Bindable
+{
+    private FriendItem? _partner;
+    private string _syncText = "";
+    public WorldInfo Info { get; }
+    public WorldItem(WorldInfo info) => Info = info;
+
+    public FriendItem? Partner
+    {
+        get => _partner;
+        set
+        {
+            if (_partner != null) _partner.PropertyChanged -= OnPartner;
+            _partner = value;
+            if (_partner != null) _partner.PropertyChanged += OnPartner;
+            Refresh();
+        }
+    }
+    private void OnPartner(object? s, PropertyChangedEventArgs e) => Refresh();
+
+    public string Name => Info.Name;
+    public string PartnerText => $"mit {Partner?.Name ?? "?"}";
+    public bool PartnerOnline => Partner?.Online == true;
+    public bool CanPlayTogether => Partner is { Presence: "on", IsFriend: true };
+    public string PartnerStatus => Partner?.Presence switch { "busy" => "spielt gerade", "on" => "online", _ => "offline" };
+    public bool HasSave => Info.VersionTs > 0;
+    public string VersionText => HasSave
+        ? $"Stand vom {DateTimeOffset.FromUnixTimeMilliseconds(Info.VersionTs).LocalDateTime:dd.MM.yyyy, HH:mm} · zuletzt {Info.VersionBy}"
+        : "Noch kein Spielstand – startet im Spiel ein neues Spiel und speichert";
+    public string SyncText { get => _syncText; set { _syncText = value; Raise(); } }
+
+    public void Refresh()
+    {
+        foreach (var n in new[] { nameof(Name), nameof(PartnerText), nameof(PartnerOnline), nameof(CanPlayTogether),
+                     nameof(PartnerStatus), nameof(HasSave), nameof(VersionText) })
+            Raise(n);
+    }
 }
 
 public sealed class Invitation
 {
     public string Sid { get; init; } = "";
     public FriendItem From { get; init; } = null!;
-    public int Slot { get; init; }
-    public string Text => Slot >= 0
-        ? $"{From.Name} lädt dich ein (Spielstand {Slot + 1})"
+    public string? WorldName { get; init; }
+    public string Text => WorldName != null
+        ? $"{From.Name} möchte mit dir in „{WorldName}“ spielen"
         : $"{From.Name} lädt dich ein";
 }
 
-/// <summary>Ablauf der App: Freunde, Einladungen, Verbindungsaufbau und Spielstart.</summary>
-public sealed class Lobby : INotifyPropertyChanged
+/// <summary>Startpunkt einer neuen Welt: neues Spiel oder ein vorhandener eigener Spielstand.</summary>
+public sealed record WorldSeed(int Slot, string Title, string Sub);
+
+/// <summary>Ablauf der App: Freunde, gemeinsame Welten, Einladungen, Verbindungsaufbau und Spielstart.</summary>
+public sealed class Lobby : Bindable
 {
     private readonly Profile _profile;
     private readonly Identity _me;
@@ -56,19 +108,31 @@ public sealed class Lobby : INotifyPropertyChanged
     private string? _launcher;
     private CancellationTokenSource? _sessionCts;
 
-    // laufende Einladung
+    // laufende Sitzung
     private string? _sid;
     private FriendItem? _peer;
     private Endpoint? _myEp;
     private int _sessionSlot = -1;
     private bool _isHost;
+    private bool _solo;
+    private WorldItem? _world;
+
+    // Abgleich der Welten
+    private readonly Dictionary<string, WorldVersion> _pending = new();   // wartet aufs Spielende
+    private readonly Dictionary<string, long> _remoteSeen = new();         // neuester Stand beim Vermittler
+    private bool _autoWorldDone;
 
     public ObservableCollection<FriendItem> Friends { get; } = new();
+    public ObservableCollection<WorldItem> Worlds { get; } = new();
     public ObservableCollection<SaveSlot> Saves { get; } = new();
     public ObservableCollection<string> Log { get; } = new();
 
     public string MyCode => Identity.FormatCode(_me.Id);
-    public string Name { get => _profile.Name; set { _profile.Name = Messenger.Clean(value); _profile.Save(); Raise(); _ = _msg.PublishProfileAsync(); } }
+    public string Name
+    {
+        get => _profile.Name;
+        set { _profile.Name = Messenger.Clean(value); _profile.Save(); Raise(); _ = _msg.PublishProfileAsync(); }
+    }
     public bool NeedsName => string.IsNullOrWhiteSpace(_profile.Name);
 
     private bool _brokerOnline;
@@ -80,8 +144,6 @@ public sealed class Lobby : INotifyPropertyChanged
     public bool GameOk => GamePath != null;
     public bool GameMissing => GamePath == null;
 
-    private SaveSlot? _selectedSave;
-    public SaveSlot? SelectedSave { get => _selectedSave; set { _selectedSave = value; Raise(); if (value != null) { _profile.LastSlot = value.Index; _profile.Save(); } } }
     private bool _autoLoad = true;
     public bool AutoLoad { get => _autoLoad; set { _autoLoad = value; Raise(); } }
 
@@ -92,7 +154,17 @@ public sealed class Lobby : INotifyPropertyChanged
     private string _sessionText = "";
     public string SessionText { get => _sessionText; private set { _sessionText = value; Raise(); } }
     private bool _sessionActive;
-    public bool SessionActive { get => _sessionActive; private set { _sessionActive = value; Raise(); Raise(nameof(Idle)); } }
+    public bool SessionActive
+    {
+        get => _sessionActive;
+        private set
+        {
+            if (_sessionActive == value) return;
+            _sessionActive = value;
+            Raise(); Raise(nameof(Idle));
+            _ = _msg.SetBusyAsync(value);  // Freunde sehen "spielt gerade"
+        }
+    }
     public bool Idle => !SessionActive;
 
     private string _hint = "";
@@ -105,11 +177,20 @@ public sealed class Lobby : INotifyPropertyChanged
         _opt = opt;
         _ui = ui;
         _msg = new Messenger(me, () => string.IsNullOrWhiteSpace(_profile.Name) ? "Spieler" : _profile.Name);
-        _msg.ConnectionChanged += on => _ui.BeginInvoke(() => BrokerOnline = on);
-        _msg.PresenceChanged += (id, on) => _ui.BeginInvoke(() => { var f = Friends.FirstOrDefault(x => x.Id == id); if (f != null) f.Online = on; });
+        _msg.ConnectionChanged += on => _ui.BeginInvoke(() => OnConnection(on));
+        _msg.PresenceChanged += (id, state) => _ui.BeginInvoke(() =>
+        {
+            var f = Friends.FirstOrDefault(x => x.Id == id);
+            if (f == null) return;
+            f.Presence = state;
+            TryAutoPlay();
+        });
         _msg.MessageReceived += (from, pub, c) => _ui.BeginInvoke(() => OnMessage(from, pub, c));
+        _msg.WorldReceived += (topic, data) => _ui.BeginInvoke(() => OnWorldData(topic, data));
         foreach (var f in profile.Friends)
             Friends.Add(new FriendItem { Id = f.Id, Name = f.Name, State = f.State });
+        foreach (var w in profile.Worlds)
+            Worlds.Add(new WorldItem(w) { Partner = Friends.FirstOrDefault(f => f.Id == w.Partner) });
     }
 
     public async Task StartAsync()
@@ -128,9 +209,11 @@ public sealed class Lobby : INotifyPropertyChanged
         }
         if (_opt.Test)
             File.WriteAllText(Path.Combine(Profile.BaseDir, "app", _opt.Profile, "code.txt"), _me.Id);
-        if (_opt.Slot >= 0) SelectedSave = Saves.FirstOrDefault(s => s.Index == _opt.Slot) ?? SelectedSave;
+        // Wurde seit dem letzten Mal ausserhalb der App gespielt (oder ist sie abgestuerzt)?
+        foreach (var w in Worlds) TakeLocalChanges(w);
         await _msg.StartAsync();
         foreach (var f in Friends) await _msg.WatchAsync(f.Id);
+        foreach (var w in Worlds) await _msg.WatchWorldAsync(WorldStore.Topic(w.Info));
         if (_opt.AutoInvite != null) _ = AutoInviteAsync(_opt.AutoInvite);
     }
 
@@ -138,7 +221,13 @@ public sealed class Lobby : INotifyPropertyChanged
     {
         Saves.Clear();
         foreach (var s in GameBridge.ListSaves()) Saves.Add(s);
-        SelectedSave = Saves.FirstOrDefault(s => s.Index == _profile.LastSlot) ?? Saves.FirstOrDefault();
+    }
+
+    public IEnumerable<WorldSeed> Seeds()
+    {
+        yield return new WorldSeed(-1, "Neues Spiel", "Ihr fangt gemeinsam von vorne an");
+        foreach (var s in GameBridge.ListSaves())
+            yield return new WorldSeed(s.Index, $"Meinen Spielstand „{s.Title}“ übernehmen", s.SavedText);
     }
 
     public void SetGamePath(string path)
@@ -152,6 +241,12 @@ public sealed class Lobby : INotifyPropertyChanged
     {
         Log.Add($"{DateTime.Now:HH:mm:ss}  {line}");
         while (Log.Count > 200) Log.RemoveAt(0);
+    }
+
+    private void OnConnection(bool on)
+    {
+        BrokerOnline = on;
+        if (on) _ = SyncAllAsync();
     }
 
     // --- Freunde --------------------------------------------------------------------
@@ -178,6 +273,7 @@ public sealed class Lobby : INotifyPropertyChanged
         _profile.Save();
         await _msg.SendAsync(f.Id, Convert.FromBase64String(data.PublicKey), new JsonObject { ["t"] = "friend_ok" });
         await _msg.WatchAsync(f.Id);
+        RefreshWorlds();
     }
 
     public void RemoveFriend(FriendItem f)
@@ -199,26 +295,218 @@ public sealed class Lobby : INotifyPropertyChanged
         if (item == null) { item = new FriendItem { Id = id }; Friends.Add(item); }
         item.Name = name;
         item.State = data.State;
+        RefreshWorlds();
         return item;
+    }
+
+    private void RefreshWorlds()
+    {
+        foreach (var w in Worlds)
+        {
+            var p = Friends.FirstOrDefault(f => f.Id == w.Info.Partner);
+            if (w.Partner != p) w.Partner = p; else w.Refresh();
+        }
     }
 
     private byte[]? PubOf(string id) => _profile.Find(id) is { } f ? Convert.FromBase64String(f.PublicKey) : null;
 
-    // --- Einladen ---------------------------------------------------------------------
-    public async Task InviteAsync(FriendItem f)
+    // --- Welten -----------------------------------------------------------------------
+    private string SavesDir(WorldItem w) => WorldStore.SavesDir(_opt.Profile, w.Info.Id);
+
+    public async Task<string> CreateWorldAsync(string name, FriendItem partner, WorldSeed seed)
+    {
+        name = Messenger.Clean(name);
+        if (name.Length == 0) return "Bitte gib der Welt einen Namen.";
+        if (!partner.IsFriend) return "Ihr müsst erst befreundet sein.";
+        var info = WorldStore.Create(name, partner.Id);
+        var w = new WorldItem(info) { Partner = partner };
+        var dir = SavesDir(w);
+        Directory.CreateDirectory(dir);
+        if (seed.Slot >= 0)
+        {
+            var src = Path.Combine(GameBridge.SaveDir, $"SaveGame{seed.Slot}.LEGO Batman_SavedGame");
+            var dst = Path.Combine(dir, Path.GetFileName(src));
+            File.Copy(src, dst, true);
+            File.SetLastWriteTimeUtc(dst, File.GetLastWriteTimeUtc(src));
+        }
+        _profile.Worlds.Add(info);
+        Worlds.Add(w);
+        TakeLocalChanges(w);
+        _profile.Save();
+        await _msg.WatchWorldAsync(WorldStore.Topic(info));
+        await PublishWorldAsync(w);
+        await ShareWorldAsync(w);
+        AddLog($"Welt „{name}“ mit {partner.Name} erstellt");
+        return "";
+    }
+
+    private async Task ShareWorldAsync(WorldItem w)
+    {
+        if (PubOf(w.Info.Partner) is not { } pub) return;
+        await _msg.SendAsync(w.Info.Partner, pub, new JsonObject
+        {
+            ["t"] = "world", ["id"] = w.Info.Id, ["wname"] = w.Info.Name, ["key"] = w.Info.Key,
+        });
+    }
+
+    public async Task RemoveWorldAsync(WorldItem w)
+    {
+        if (_world == w && SessionActive) return;
+        Worlds.Remove(w);
+        _profile.Worlds.Remove(w.Info);
+        _profile.Save();
+        await _msg.UnwatchWorldAsync(WorldStore.Topic(w.Info));
+        AddLog($"Welt „{w.Name}“ entfernt (Dateien bleiben unter {WorldStore.Dir(_opt.Profile, w.Info.Id)})");
+    }
+
+    public string BackupFolder(WorldItem w)
+    {
+        var d = WorldStore.BackupDir(_opt.Profile, w.Info.Id);
+        Directory.CreateDirectory(d);
+        return d;
+    }
+
+    /// <summary>Hat sich der Spielstand im Weltordner geaendert, wird er zum neuen Stand der Welt.</summary>
+    private bool TakeLocalChanges(WorldItem w)
+    {
+        var dir = SavesDir(w);
+        var sha = WorldStore.Hash(dir);
+        if (sha == "" || sha == w.Info.VersionSha) return false;
+        var written = new DateTimeOffset(DateTime.SpecifyKind(WorldStore.LastWrite(dir), DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+        w.Info.VersionTs = Math.Max(written, w.Info.VersionTs + 1);
+        w.Info.VersionSha = sha;
+        w.Info.VersionBy = string.IsNullOrWhiteSpace(_profile.Name) ? "Spieler" : _profile.Name;
+        _profile.Save();
+        w.Refresh();
+        return true;
+    }
+
+    private async Task PublishWorldAsync(WorldItem w)
+    {
+        if (w.Info.VersionTs == 0 || WorldStore.SaveFiles(SavesDir(w)).Length == 0) return;
+        w.SyncText = "wird hochgeladen …";
+        var ok = await _msg.PublishWorldAsync(WorldStore.Topic(w.Info), WorldStore.Pack(w.Info, SavesDir(w)));
+        if (ok) _remoteSeen[w.Info.Id] = Math.Max(_remoteSeen.GetValueOrDefault(w.Info.Id), w.Info.VersionTs);
+        w.SyncText = ok ? "abgeglichen" : "noch nicht hochgeladen (keine Verbindung)";
+    }
+
+    /// <summary>Nach dem Verbinden: kurz auf die hinterlegten Staende warten, dann eigene neuere hochladen.</summary>
+    private async Task SyncAllAsync()
+    {
+        await Task.Delay(TimeSpan.FromSeconds(6));
+        foreach (var w in Worlds.ToArray())
+            if (!InUse(w) && _remoteSeen.GetValueOrDefault(w.Info.Id) <= w.Info.VersionTs) await PublishWorldAsync(w);
+    }
+
+    private bool InUse(WorldItem w) => SessionActive && _world == w && (_solo || _isHost);
+
+    private void OnWorldData(string topic, byte[] data)
+    {
+        var w = Worlds.FirstOrDefault(x => WorldStore.Topic(x.Info) == topic);
+        if (w == null) return;
+        var v = WorldStore.Unpack(w.Info, data);
+        if (v == null) return;
+        _remoteSeen[w.Info.Id] = Math.Max(_remoteSeen.GetValueOrDefault(w.Info.Id), v.Ts);
+        if (v.Name.Length > 0 && v.Name != w.Info.Name && v.Ts >= w.Info.VersionTs) { w.Info.Name = v.Name; _profile.Save(); w.Refresh(); }
+        if (v.Sha == w.Info.VersionSha)
+        {
+            if (v.Ts > w.Info.VersionTs) { w.Info.VersionTs = v.Ts; w.Info.VersionBy = v.By; _profile.Save(); w.Refresh(); }
+            w.SyncText = "abgeglichen";
+            return;
+        }
+        // Neuester gewinnt; bei gleicher Zeit entscheidet die Pruefsumme, damit beide dasselbe waehlen
+        bool remoteNewer = v.Ts > w.Info.VersionTs ||
+                           (v.Ts == w.Info.VersionTs && string.CompareOrdinal(v.Sha, w.Info.VersionSha) > 0);
+        if (!remoteNewer)
+        {
+            if (!InUse(w)) _ = PublishWorldAsync(w);  // unserer ist neuer: beim Vermittler ersetzen
+            return;
+        }
+        if (InUse(w))
+        {
+            _pending[w.Info.Id] = v;
+            w.SyncText = $"neuer Stand von {v.By} wird nach dem Spiel übernommen";
+            return;
+        }
+        Apply(w, v);
+    }
+
+    private void Apply(WorldItem w, WorldVersion v)
+    {
+        bool hadLocal = w.Info.VersionTs > 0 && WorldStore.SaveFiles(SavesDir(w)).Length > 0;
+        if (hadLocal) WorldStore.Backup(_opt.Profile, w.Info.Id, "ersetzt");
+        WorldStore.Replace(_opt.Profile, w.Info.Id, v);
+        w.Info.VersionTs = v.Ts;
+        w.Info.VersionSha = WorldStore.Hash(SavesDir(w));
+        w.Info.VersionBy = v.By;
+        _profile.Save();
+        w.Refresh();
+        w.SyncText = "abgeglichen";
+        AddLog(hadLocal
+            ? $"„{w.Name}“: neuerer Stand von {v.By} übernommen, dein alter Stand ist gesichert"
+            : $"„{w.Name}“: Stand von {v.By} übernommen");
+    }
+
+    private async Task AfterGameAsync(WorldItem w)
+    {
+        if (TakeLocalChanges(w))
+        {
+            AddLog($"„{w.Name}“: neuer Spielstand gespeichert");
+            // Wurde waehrenddessen beim Partner auch gespielt, gewinnt trotzdem der neueste
+            if (_pending.Remove(w.Info.Id, out var p) && p.Ts > w.Info.VersionTs) { Apply(w, p); return; }
+            await PublishWorldAsync(w);
+        }
+        else if (_pending.Remove(w.Info.Id, out var p))
+        {
+            if (p.Ts > w.Info.VersionTs) Apply(w, p);
+        }
+    }
+
+    // --- Spielen ----------------------------------------------------------------------
+    public async Task PlayTogetherAsync(WorldItem w)
     {
         if (SessionActive || !CheckReady()) return;
-        var pub = PubOf(f.Id);
-        if (pub == null) return;
+        if (w.Partner is not { IsFriend: true } f || PubOf(f.Id) is not { } pub) return;
+        if (!w.CanPlayTogether)
+        {
+            Hint = w.Partner.Busy ? $"{f.Name} spielt gerade. Sobald er fertig ist, könnt ihr zusammen spielen."
+                                  : $"{f.Name} ist offline. Du kannst alleine weiterspielen.";
+            return;
+        }
         _sid = RandomNumberGenerator.GetHexString(8);
         _peer = f;
         _isHost = true;
-        _sessionSlot = AutoLoad && SelectedSave != null ? SelectedSave.Index : -1;
+        _solo = false;
+        _world = w;
+        TakeLocalChanges(w);
+        _sessionSlot = AutoLoad ? WorldStore.NewestSlot(SavesDir(w)) : -1;
         SessionActive = true;
         SessionText = $"Warte auf {f.Name} …";
-        AddLog($"Einladung an {f.Name} gesendet");
-        await _msg.SendAsync(f.Id, pub, new JsonObject { ["t"] = "invite", ["sid"] = _sid, ["slot"] = _sessionSlot });
+        AddLog($"Einladung an {f.Name} für „{w.Name}“ gesendet");
+        await _msg.SendAsync(f.Id, pub, new JsonObject
+        {
+            ["t"] = "invite", ["sid"] = _sid, ["slot"] = _sessionSlot, ["world"] = w.Info.Id, ["wname"] = w.Info.Name,
+        });
         _ = TimeoutAsync(_sid, 120, "Keine Antwort auf die Einladung.");
+    }
+
+    public async Task PlaySoloAsync(WorldItem w)
+    {
+        if (SessionActive || !CheckReady()) return;
+        _sid = RandomNumberGenerator.GetHexString(8);
+        _peer = null;
+        _isHost = false;
+        _solo = true;
+        _world = w;
+        TakeLocalChanges(w);
+        SessionActive = true;
+        SessionText = $"Du spielst alleine in „{w.Name}“. Lade im Spiel unter „Load Game“ euren Spielstand.";
+        _sessionCts = new CancellationTokenSource();
+        var sid = _sid;
+        var env = TestEnv();
+        await GameBridge.PlaySoloAsync(_launcher!, SavesDir(w), line => _ui.BeginInvoke(() => OnLauncherLine(line)),
+            env, _sessionCts.Token);
+        if (_sid == sid) EndSession("Spiel beendet.");
     }
 
     public async Task AcceptInviteAsync()
@@ -229,7 +517,8 @@ public sealed class Lobby : INotifyPropertyChanged
         _sid = inv.Sid;
         _peer = inv.From;
         _isHost = false;
-        _sessionSlot = inv.Slot;
+        _solo = false;
+        _world = null;  // der Gast spielt mit der Kopie des Hosts, sein Weltordner bleibt unberuehrt
         SessionActive = true;
         SessionText = "Ermittle deine Adresse …";
         _myEp = await GameBridge.StunAsync(_launcher!);
@@ -259,8 +548,9 @@ public sealed class Lobby : INotifyPropertyChanged
 
     private bool CheckReady()
     {
-        if (GamePath == null) { Hint = "LEGO Batman wurde nicht gefunden. Bitte unten den Spielordner wählen."; return false; }
+        if (GamePath == null) { Hint = "LEGO Batman wurde nicht gefunden. Bitte links den Spielordner wählen."; return false; }
         if (_launcher == null) { Hint = "Die Mod-Dateien fehlen. Bitte die App neu herunterladen."; return false; }
+        Hint = "";
         return true;
     }
 
@@ -272,15 +562,32 @@ public sealed class Lobby : INotifyPropertyChanged
 
     private void EndSession(string text)
     {
+        var w = _world;
+        bool wrote = w != null && (_solo || _isHost);
         AddLog(text);
         Hint = text;
         _sid = null;
         _peer = null;
         _myEp = null;
         _sessionCts = null;
+        _world = null;
+        _solo = false;
         SessionActive = false;
         SessionText = "";
-        RefreshSaves();
+        if (wrote) _ = AfterGameAsync(w!);
+        TryAutoPlay();
+    }
+
+    private Dictionary<string, string> TestEnv()
+    {
+        var env = new Dictionary<string, string>();
+        if (_opt.Test)
+        {
+            env["LBO_MULTI"] = "1";
+            env["LBO_ALLOWSAVE"] = "0";
+            if (_opt.MaxFrames > 0) env["LBO_MAXFRAMES"] = _opt.MaxFrames.ToString();
+        }
+        return env;
     }
 
     private static JsonObject EpJson(Endpoint e) => new()
@@ -323,7 +630,11 @@ public sealed class Lobby : INotifyPropertyChanged
                 Upsert(from, name, pub, FriendState.Friend);
                 await _msg.WatchAsync(from);
                 AddLog($"{name} hat deine Anfrage angenommen");
-                if (_opt.AutoInvite != null && Identity.ParseCode(_opt.AutoInvite) == from) _ = AutoInviteAsync(_opt.AutoInvite);
+                await TryAutoWorldAsync();
+                break;
+            case "world":
+                if (known?.State != FriendState.Friend) break;  // nur Freunde koennen Welten teilen
+                await OnWorldShared(from, name, c);
                 break;
             case "invite":
                 if (known?.State != FriendState.Friend) break;  // nur Freunde duerfen einladen
@@ -333,7 +644,7 @@ public sealed class Lobby : INotifyPropertyChanged
                     break;
                 }
                 var f = Friends.First(x => x.Id == from);
-                Incoming = new Invitation { Sid = (string)c["sid"]!, From = f, Slot = (int?)c["slot"] ?? -1 };
+                Incoming = new Invitation { Sid = (string)c["sid"]!, From = f, WorldName = Messenger.Clean((string?)c["wname"]) is { Length: > 0 } wn ? wn : null };
                 AddLog(Incoming.Text);
                 if (_opt.AutoAccept) await AcceptInviteAsync();
                 break;
@@ -369,20 +680,33 @@ public sealed class Lobby : INotifyPropertyChanged
         }
     }
 
+    private async Task OnWorldShared(string from, string fromName, JsonObject c)
+    {
+        var id = (string?)c["id"];
+        var key = (string?)c["key"];
+        var wname = Messenger.Clean((string?)c["wname"]);
+        if (id == null || id.Length < 16 || id.Length > 64 || !id.All(Uri.IsHexDigit) || key == null) return;
+        try { if (Convert.FromBase64String(key).Length != 32) return; } catch { return; }
+        if (Worlds.Any(x => x.Info.Id == id)) return;
+        var info = new WorldInfo { Id = id, Name = wname.Length > 0 ? wname : "Gemeinsame Welt", Key = key, Partner = from };
+        var w = new WorldItem(info) { Partner = Friends.FirstOrDefault(f => f.Id == from) };
+        Directory.CreateDirectory(SavesDir(w));
+        _profile.Worlds.Add(info);
+        _profile.Save();
+        Worlds.Add(w);
+        w.SyncText = "lade Spielstand …";
+        AddLog($"{fromName} hat die Welt „{info.Name}“ mit dir geteilt");
+        await _msg.WatchWorldAsync(WorldStore.Topic(info));
+    }
+
     private async Task PlayAsync(Endpoint peerEp)
     {
         _sessionCts = new CancellationTokenSource();
         var sid = _sid;
         SessionText = "Verbinde …";
-        var env = new Dictionary<string, string>();
-        if (_opt.Test)
-        {
-            env["LBO_MULTI"] = "1";
-            env["LBO_ALLOWSAVE"] = "0";
-            if (_opt.MaxFrames > 0) env["LBO_MAXFRAMES"] = _opt.MaxFrames.ToString();
-        }
-        var code = await GameBridge.ConnectAndPlayAsync(_launcher!, _isHost, _myEp!, peerEp, _sessionSlot,
-            line => _ui.BeginInvoke(() => OnLauncherLine(line)), env, _sessionCts.Token);
+        string? saveDir = _isHost && _world != null ? SavesDir(_world) : null;
+        var code = await GameBridge.ConnectAndPlayAsync(_launcher!, _isHost, _myEp!, peerEp, _sessionSlot, saveDir,
+            line => _ui.BeginInvoke(() => OnLauncherLine(line)), TestEnv(), _sessionCts.Token);
         if (_sid == sid) EndSession(code == 0 ? "Spiel beendet." : "Verbindung fehlgeschlagen.");
     }
 
@@ -390,6 +714,7 @@ public sealed class Lobby : INotifyPropertyChanged
     {
         if (line.StartsWith("STATUS "))
         {
+            if (_solo) return;  // Text fuer Solo steht schon
             SessionText = line[7..] switch
             {
                 "verbinde" => "Verbinde …",
@@ -397,7 +722,7 @@ public sealed class Lobby : INotifyPropertyChanged
                 "ping" => "Messe Ping …",
                 "spielstand" => _isHost ? "Sende Spielstand …" : "Empfange Spielstand …",
                 "spiel" => _isHost
-                    ? (_sessionSlot >= 0 ? $"Spiel läuft – Spielstand {_sessionSlot + 1} wird automatisch geladen" : "Spiel läuft – du bedienst die Menüs")
+                    ? (_sessionSlot >= 0 ? "Spiel läuft – euer Spielstand wird automatisch geladen" : "Spiel läuft – du bedienst die Menüs")
                     : "Spiel läuft – drücke START, sobald ihr im Spiel seid",
                 "beendet" => "Spiel beendet",
                 var s => s,
@@ -407,19 +732,40 @@ public sealed class Lobby : INotifyPropertyChanged
         else if (line.StartsWith("Ping:") || line.StartsWith("Verbunden")) AddLog(line);
     }
 
+    // --- Testhilfen -------------------------------------------------------------------
     private async Task AutoInviteAsync(string code)
     {
-        // Testhilfe: Freund hinzufuegen und einladen, sobald er online ist
+        // Freund hinzufuegen; danach erstellt TryAutoWorldAsync die Welt
         var id = Identity.ParseCode(code);
         if (id == null) return;
         while (!_msg.IsConnected) await Task.Delay(500);
         if (!Friends.Any(f => f.Id == id)) AddLog(await AddFriendAsync(code));
-        for (int i = 0; i < 120; i++)
+        await TryAutoWorldAsync();
+    }
+
+    private async Task TryAutoWorldAsync()
+    {
+        if (_opt.AutoWorld == null || _autoWorldDone || _opt.AutoInvite == null) return;
+        var f = Friends.FirstOrDefault(x => x.Id == Identity.ParseCode(_opt.AutoInvite) && x.IsFriend);
+        if (f == null) return;
+        _autoWorldDone = true;
+        var w = Worlds.FirstOrDefault(x => x.Name == _opt.AutoWorld);
+        if (w == null)
         {
-            var f = Friends.FirstOrDefault(x => x.Id == id);
-            if (f is { CanInvite: true } && !SessionActive) { await InviteAsync(f); return; }
-            await Task.Delay(1000);
+            var seed = Seeds().FirstOrDefault(s => s.Slot == _opt.Slot) ?? Seeds().First();
+            await CreateWorldAsync(_opt.AutoWorld, f, seed);
         }
+        TryAutoPlay();
+    }
+
+    private bool _autoPlayed;
+    private void TryAutoPlay()
+    {
+        if (!_opt.AutoPlay || _autoPlayed || SessionActive || _opt.AutoWorld == null) return;
+        var w = Worlds.FirstOrDefault(x => x.Name == _opt.AutoWorld);
+        if (w is not { CanPlayTogether: true }) return;
+        _autoPlayed = true;
+        _ = PlayTogetherAsync(w);
     }
 
     public async Task ShutdownAsync()
@@ -427,9 +773,6 @@ public sealed class Lobby : INotifyPropertyChanged
         _sessionCts?.Cancel();
         await _msg.DisposeAsync();
     }
-
-    public event PropertyChangedEventHandler? PropertyChanged;
-    private void Raise([CallerMemberName] string? n = null) => PropertyChanged?.Invoke(this, new(n));
 }
 
 public sealed class AppOptions
@@ -438,6 +781,8 @@ public sealed class AppOptions
     public bool Test { get; set; }
     public bool AutoAccept { get; set; }
     public string? AutoInvite { get; set; }
+    public string? AutoWorld { get; set; }
+    public bool AutoPlay { get; set; }
     public string? Name { get; set; }
     public int MaxFrames { get; set; }
     public int Slot { get; set; } = -1;
@@ -453,6 +798,8 @@ public sealed class AppOptions
                 case "--test": o.Test = true; break;
                 case "--auto-accept": o.AutoAccept = true; break;
                 case "--auto-invite" when i + 1 < args.Length: o.AutoInvite = args[++i]; break;
+                case "--auto-world" when i + 1 < args.Length: o.AutoWorld = args[++i]; break;
+                case "--auto-play": o.AutoPlay = true; break;
                 case "--name" when i + 1 < args.Length: o.Name = args[++i]; break;
                 case "--slot" when i + 1 < args.Length: o.Slot = int.Parse(args[++i]); break;
                 case "--max-frames" when i + 1 < args.Length: o.MaxFrames = int.Parse(args[++i]); break;

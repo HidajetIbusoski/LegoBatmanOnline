@@ -23,6 +23,7 @@ public sealed class Profile
     public string Name { get; set; } = "";
     public string ProtectedKey { get; set; } = "";
     public List<Friend> Friends { get; set; } = new();
+    public List<WorldInfo> Worlds { get; set; } = new();
     public string? GamePath { get; set; }
     public int LastSlot { get; set; }
     public bool ShortcutsCreated { get; set; }

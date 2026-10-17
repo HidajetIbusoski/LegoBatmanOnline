@@ -6,7 +6,7 @@ Online-Koop für **LEGO Batman: The Videogame (2008, PC/Steam)**. Zwei Spieler, 
 
 - Spielt sich wie lokaler Koop: Spieler 2 kann jederzeit einsteigen und wieder aussteigen.
 - So viele Spieler wie das Original lokal erlaubt: **2**.
-- Für Endnutzer: App starten, Freund per Code hinzufügen, auf **Einladen** klicken, fertig.
+- Für Endnutzer: App starten, Freund per Code hinzufügen, gemeinsame Welt anlegen, **Zusammen spielen** oder **Alleine spielen**.
 - Stabile Verbindung: direkt per UDP zwischen den Spielern, Relay als Fallback.
 
 ## Technischer Ansatz (Entwurf)
@@ -27,7 +27,7 @@ Das funktioniert nur, wenn das Spiel bei gleichen Eingaben und gleichem Zeitschr
 - [x] **Phase 1:** Hook-DLL (per Launcher injiziert statt Proxy-DLL, damit nichts im Spielordner landet). Sie zeichnet Eingaben auf, spielt Skripte ab und vergleicht Prüfsummen, siehe [docs/phase1-werkzeuge.md](docs/phase1-werkzeuge.md).
 - [x] **Phase 2:** Lockstep (`src/dll/net.c`): lokal mit zwei Instanzen bestätigt, auch mit 20 % Paketverlust. Echte Controller (XInput, DirectInput/DualSense) und Tastatur werden gelesen.
 - [x] **Phase 3:** Internet ohne eigenen Server: STUN, Einladungscodes, Hole Punching, Spielstand-Übertragung (`src/launcher/online.c`). Direktmodus per IP für VPN.
-- [x] **Phase 4:** App für Endnutzer (`app/LegoBatmanOnline`, WPF): Freundescodes, Freundesliste mit Online-Status, Einladen, Spielstand wählen und automatisch laden. Siehe [docs/app.md](docs/app.md).
+- [x] **Phase 4:** App für Endnutzer (`app/LegoBatmanOnline`, WPF): Freundescodes, Freundesliste mit Online-Status und gemeinsame Welten (ein geteilter Spielstand, alleine oder zusammen spielbar, Abgleich über den Vermittler). Siehe [docs/app.md](docs/app.md).
 - [ ] **Offen:** Test zwischen zwei echten PCs in verschiedenen Haushalten (Determinismus über verschiedene Hardware, NAT), DualSense-Belegung mit echtem Spieler.
 
 ## Release bauen

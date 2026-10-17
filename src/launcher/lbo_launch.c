@@ -136,7 +136,7 @@ static void press_enter(void)
     read_line(b, sizeof b);
 }
 
-static int run_session(ONLINE *o, const char *game, const char *dll, int autoload_slot);
+static int run_session(ONLINE *o, const char *game, const char *dll, int autoload_slot, const char *host_saves);
 
 static int online_menu(void)
 {
@@ -205,7 +205,7 @@ static int online_menu(void)
         return 1;
     }
     {
-        int rc = run_session(&o, game, dll, -1);
+        int rc = run_session(&o, game, dll, -1, NULL);
         press_enter();
         return rc;
     }
@@ -213,7 +213,8 @@ static int online_menu(void)
 
 // Nach erfolgreichem Verbindungsaufbau: Ping, Spielstand, Bereit-Abgleich, Spiel starten.
 // autoload_slot >= 0: der Host laedt diesen Spielstand automatisch (Menue per Skript).
-static int run_session(ONLINE *o_, const char *game, const char *dll, int autoload_slot)
+// host_saves: Spielstand-Ordner des Hosts (z. B. eine gemeinsame Welt); NULL = normaler Ordner des Spiels.
+static int run_session(ONLINE *o_, const char *game, const char *dll, int autoload_slot, const char *host_saves)
 {
     char save_dir[MAX_PATH], guest_saves[MAX_PATH], logdir[MAX_PATH], peer[64], buf[64], appdata[MAX_PATH];
     SYSTEMTIME st;
@@ -228,8 +229,8 @@ static int run_session(ONLINE *o_, const char *game, const char *dll, int autolo
     printf("Ping: %d ms -> Eingabeverzoegerung %d Frames (%d ms)\n", o.ping_ms, delay, delay * 1000 / 60);
 
     SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata);
-    snprintf(save_dir, sizeof save_dir, "%s\\Warner Bros. Interactive Entertainment\\LEGO Batman\\Saved Games", appdata);
-    snprintf(buf, sizeof buf, "%s", "");
+    if (host_saves) snprintf(save_dir, sizeof save_dir, "%s", host_saves);
+    else snprintf(save_dir, sizeof save_dir, "%s\\Warner Bros. Interactive Entertainment\\LEGO Batman\\Saved Games", appdata);
     snprintf(guest_saves, sizeof guest_saves, "%s\\LegoBatmanOnline", appdata);
     CreateDirectoryA(guest_saves, NULL);
     GetLocalTime(&st);
@@ -280,6 +281,7 @@ static int run_session(ONLINE *o_, const char *game, const char *dll, int autolo
     // Der Host speichert normal (ausser LBO_ALLOWSAVE ist vorgegeben, z. B. in Tests)
     if (o.role == 0) {
         if (!GetEnvironmentVariableA("LBO_ALLOWSAVE", buf, sizeof buf)) SetEnvironmentVariableA("LBO_ALLOWSAVE", "1");
+        if (host_saves) SetEnvironmentVariableA("LBO_SAVEDIR", host_saves);  // Welt-Ordner statt echter Spielstaende
     } else {
         SetEnvironmentVariableA("LBO_SAVEDIR", guest_saves);  // der Gast liest den Host-Stand
     }
@@ -306,12 +308,42 @@ static int run_session(ONLINE *o_, const char *game, const char *dll, int autolo
 //            --peer-local IP:PORT [--slot N]
 //   Verbindet (Hole Punching), uebertraegt den Spielstand und startet das Spiel.
 //   Fortschritt als Zeilen "STATUS ...", Fehler als "ERROR ...".
+//   --savedir DIR: der Host spielt mit den Spielstaenden aus DIR (gemeinsame Welt).
+// lbo-launch --solo --savedir DIR
+//   Startet das Spiel ohne Netz; Spielstaende werden aus DIR gelesen und dorthin gespeichert.
+static int solo_mode(const char *savedir)
+{
+    char game[MAX_PATH], dll[MAX_PATH], logdir[MAX_PATH], appdata[MAX_PATH];
+    SYSTEMTIME st;
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (!savedir) { printf("ERROR --savedir fehlt\n"); return 1; }
+    if (!find_game(game)) { printf("ERROR LEGOBatman.exe nicht gefunden\n"); return 1; }
+    dll_next_to_exe(dll);
+    CreateDirectoryA(savedir, NULL);
+    SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata);
+    GetLocalTime(&st);
+    snprintf(logdir, sizeof logdir, "%s\\LegoBatmanOnline\\logs", appdata);
+    CreateDirectoryA(logdir, NULL);
+    snprintf(logdir + strlen(logdir), sizeof logdir - strlen(logdir), "\\%04d%02d%02d-%02d%02d%02d-solo",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    CreateDirectoryA(logdir, NULL);
+    SetEnvironmentVariableA("LBO_DIR", logdir);
+    SetEnvironmentVariableA("LBO_SAVEDIR", savedir);
+    // Spielstaende landen ohnehin in savedir; so bleiben auch Einstellungen (pcconfig.txt) erhalten
+    { char b[8]; if (!GetEnvironmentVariableA("LBO_ALLOWSAVE", b, sizeof b)) SetEnvironmentVariableA("LBO_ALLOWSAVE", "1"); }
+    printf("STATUS spiel\n");
+    launch(game, dll, "", 1);
+    printf("STATUS beendet\n");
+    return 0;
+}
+
 static int app_mode(int argc, char **argv)
 {
     char game[MAX_PATH], dll[MAX_PATH], code[40];
     unsigned char hash[32];
     ONLINE o;
-    int i, stun = 0, slot = -1;
+    int i, stun = 0, slot = -1, solo = 0;
+    const char *savedir = NULL;
     unsigned key = 0, peer_key = 0;
     const char *peer_pub = NULL, *peer_loc = NULL;
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -325,7 +357,10 @@ static int app_mode(int argc, char **argv)
         else if (!strcmp(argv[i], "--peer-public") && i + 1 < argc) peer_pub = argv[++i];
         else if (!strcmp(argv[i], "--peer-local") && i + 1 < argc) peer_loc = argv[++i];
         else if (!strcmp(argv[i], "--slot") && i + 1 < argc) slot = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--savedir") && i + 1 < argc) savedir = argv[++i];
+        else if (!strcmp(argv[i], "--solo")) solo = 1;
     }
+    if (solo) return solo_mode(savedir);
     if (!online_prepare(&o, code)) { printf("ERROR UDP-Port nicht verfuegbar\n"); return 1; }
     if (stun) {
         char pub[32], loc[32];
@@ -344,7 +379,7 @@ static int app_mode(int argc, char **argv)
     printf("STATUS verbinde\n");
     if (!online_connect(&o, hash, 60)) { printf("ERROR Keine Verbindung zum Partner\n"); online_close(); return 1; }
     printf("STATUS verbunden\n");
-    return run_session(&o, game, dll, slot);
+    return run_session(&o, game, dll, slot, savedir);
 }
 
 int main(int argc, char **argv)
@@ -356,7 +391,8 @@ int main(int argc, char **argv)
 
     if (argc == 1) return online_menu();
     for (i = 1; i < argc; i++)
-        if (!strcmp(argv[i], "--stun") || !strcmp(argv[i], "--connect")) return app_mode(argc, argv);
+        if (!strcmp(argv[i], "--stun") || !strcmp(argv[i], "--connect") || !strcmp(argv[i], "--solo"))
+            return app_mode(argc, argv);
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--game") && i + 1 < argc) strncpy(game, argv[++i], MAX_PATH - 1);

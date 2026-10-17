@@ -354,6 +354,8 @@ typedef struct {
     unsigned long long chars, rng;
     float p[2][3];
     int pvalid[2];
+    unsigned rngv[6];
+    char ids[160];  // Figuren-IDs (+0x15b0) in Array-Reihenfolge, z. B. "12:7:33"
 } SNAP;
 
 static void snapshot(SNAP *s)
@@ -362,14 +364,18 @@ static void snapshot(SNAP *s)
     memset(s, 0, sizeof *s);
     s->chars = s->rng = 14695981039346656037ULL;
     __try {
-        for (i = 0; i < (int)(sizeof rng_addrs / sizeof *rng_addrs); i++)
+        for (i = 0; i < (int)(sizeof rng_addrs / sizeof *rng_addrs); i++) {
             s->rng = fnv(s->rng, (const void *)rng_addrs[i], 4);
+            s->rngv[i] = *(const unsigned *)rng_addrs[i];
+        }
         s->nchars = G_CHAR_COUNT;
         if (s->nchars > 0 && s->nchars < 512 && G_CHAR_ARRAY) {
             const unsigned char *c = (const unsigned char *)G_CHAR_ARRAY;
             for (i = 0; i < s->nchars; i++, c += CHAR_STRIDE) {
                 s->chars = fnv(s->chars, c + 0x5c, 12);
                 s->chars = fnv(s->chars, c + 0x246, 2);
+                if (strlen(s->ids) < sizeof s->ids - 8)
+                    sprintf(s->ids + strlen(s->ids), i ? ":%d" : "%d", *(const short *)(c + 0x15b0));
             }
         }
         for (i = 0; i < 2; i++) {
@@ -452,20 +458,84 @@ static void cap_frame_rate(void)
     g_next_frame.QuadPart += period;
 }
 
+// --- Hintergrund-Worker synchronisieren (LBO_SYNCBG) ----------------------------
+// Das Spiel laedt per Worker-Thread (0x6e2cc0) asynchron. Wann ein Job fertig wird, haengt von
+// Festplatte und Scheduler ab und verschiebt Spawns um Frames. Modus 1: am Frame-Ende warten, bis
+// die Job-Schlange leer ist. Modus 2: zusaetzlich den Worker ueber das Event BGFreeze (0xb03bdc)
+// waehrend des Frames anhalten, damit Jobs nie parallel zur Simulation laufen.
+#define G_BG_QUEUE   (*(unsigned char *volatile *)0x00B03C68)
+#define G_BG_CURRENT (*(volatile int *)0x00B058C0)
+#define G_BG_FREEZE  (*(HANDLE volatile *)0x00B03BDC)
+static int g_sync_bg;
+static volatile LONG g_frozen_since;  // GetTickCount beim Einfrieren, 0 = nicht eingefroren
+static long g_bg_waits, g_bg_timeouts, g_bg_unfreezes;
+
+static int bg_busy(void)
+{
+    unsigned char *q = G_BG_QUEUE;
+    return G_BG_CURRENT != 0 || (q && *(volatile int *)(q + 8) != 0);
+}
+
+static void sync_background(void)
+{
+    DWORD start;
+    if (!g_sync_bg || !G_BG_QUEUE) return;
+    if (g_sync_bg >= 2 && G_BG_FREEZE) {
+        InterlockedExchange(&g_frozen_since, 0);
+        SetEvent(G_BG_FREEZE);
+    }
+    if (bg_busy()) {
+        g_bg_waits++;
+        start = GetTickCount();
+        while (bg_busy()) {
+            if (GetTickCount() - start > 5000) {
+                g_bg_timeouts++;
+                logf_("Hintergrund-Worker nach 5 s noch beschaeftigt, Frame laeuft weiter");
+                break;
+            }
+            Sleep(0);
+        }
+    }
+    if (g_sync_bg >= 2 && G_BG_FREEZE) {
+        ResetEvent(G_BG_FREEZE);
+        InterlockedExchange(&g_frozen_since, (LONG)GetTickCount() | 1);
+    }
+}
+
+// Wachhund: Wartet der Hauptthread mitten im Frame selbst auf einen Job, kaeme er nie zum
+// Frame-Ende. Dann tauen wir den Worker nach 500 ms auf.
+static DWORD WINAPI bg_watchdog(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        LONG since = g_frozen_since;
+        Sleep(50);
+        if (since && g_frozen_since == since && GetTickCount() - (DWORD)since > 500 && G_BG_FREEZE) {
+            InterlockedExchange(&g_frozen_since, 0);
+            SetEvent(G_BG_FREEZE);
+            g_bg_unfreezes++;
+        }
+    }
+}
+
 static void __cdecl on_frame_end(void)
 {
     SNAP s;
     long F = InterlockedIncrement(&g_F);
+    sync_background();
     cap_frame_rate();
+    if (F % 3000 == 0 && g_sync_bg)
+        logf_("Hintergrund-Sync: %ld Wartephasen, %ld Timeouts, %ld Wachhund-Auftauungen", g_bg_waits, g_bg_timeouts, g_bg_unfreezes);
     if (g_fixed_dt) G_DT_OVERRIDE = 1.0f / 60.0f;
     if (g_mode == MODE_SCRIPT) fix_input_slots();
 
     snapshot(&s);
     if (g_csv) {
-        fprintf(g_csv, "%ld,%ld,%d,%.6f,%d,%016llx,%016llx,%d,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%d,%lu\n",
+        fprintf(g_csv, "%ld,%ld,%d,%.6f,%d,%016llx,%016llx,%d,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%d,%lu,%08x,%08x,%08x,%08x,%08x,%08x,%s\n",
                 F, g_W, G_FRAMECOUNT, G_DT_GAME, s.nchars, s.chars, s.rng,
                 s.pvalid[0], s.p[0][0], s.p[0][1], s.p[0][2],
-                s.pvalid[1], s.p[1][0], s.p[1][1], s.p[1][2], g_polls_this_frame, GetTickCount() - g_t0);
+                s.pvalid[1], s.p[1][0], s.p[1][1], s.p[1][2], g_polls_this_frame, GetTickCount() - g_t0,
+                s.rngv[0], s.rngv[1], s.rngv[2], s.rngv[3], s.rngv[4], s.rngv[5], s.ids);
         if (F % 60 == 0) fflush(g_csv);
     }
     g_polls_this_frame = 0;
@@ -652,7 +722,7 @@ static void init(void)
     logf_("Modus %d, festes dt %d, max Frames %d, Screenshot alle %d", g_mode, g_fixed_dt, g_max_frames, g_shot_every);
 
     g_csv = open_out("frames.csv", "w");
-    if (g_csv) fprintf(g_csv, "F,W,game_frame,dt,nchars,chars_hash,rng_hash,p1,p1x,p1y,p1z,p2,p2x,p2y,p2z,polls,ms\n");
+    if (g_csv) fprintf(g_csv, "F,W,game_frame,dt,nchars,chars_hash,rng_hash,p1,p1x,p1y,p1z,p2,p2x,p2y,p2z,polls,ms,rng_ad3b6c,rng_95fd58,rng_95fd5c,rng_969730,rng_95dedc,rng_95e15c,char_ids\n");
 
     xi = GetModuleHandleA("xinput1_3.dll");
     logf_("IAT XInputGetState=%p (xinput1_3 Ordinal 2=%p), GetCapabilities=%p (Ordinal 4=%p)",
@@ -666,6 +736,9 @@ static void init(void)
     logf_("Spielstand-Schutz %s", g_allow_save ? "AUS (LBO_ALLOWSAVE)" : "aktiv");
     if (GetEnvironmentVariableA("LBO_NOMOVIES", buf, sizeof buf)) g_no_movies = atoi(buf);
     if (GetEnvironmentVariableA("LBO_FPSCAP", buf, sizeof buf)) g_fps_cap = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_SYNCBG", buf, sizeof buf)) g_sync_bg = atoi(buf);
+    if (g_sync_bg >= 2) CreateThread(NULL, 0, bg_watchdog, NULL, 0, NULL);
+    logf_("Hintergrund-Sync Modus %d", g_sync_bg);
     QueryPerformanceFrequency(&g_qpf);
     timeBeginPeriod(1);
     patch_iat(IAT_BINKOPEN, (void *)hook_binkopen, (void **)&real_binkopen);

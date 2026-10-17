@@ -7,34 +7,44 @@ Was ihr braucht
 - Windows 10 oder 11.
 - Ein Controller (Xbox-Controller, PS4- oder PS5-Controller per Kabel/Bluetooth)
   oder die Tastatur (siehe unten).
-- Beide nutzen diese Mod in derselben Version.
+- Beide nutzen diese App in derselben Version.
 
 
 Einrichten (einmalig)
 ---------------------
-1. ZIP irgendwo entpacken, z. B. auf den Desktop. Nichts in den Spielordner kopieren.
+1. ZIP irgendwo entpacken, z. B. in "Dokumente". Nichts in den Spielordner kopieren.
 2. "LegoBatmanOnline.exe" starten.
    - Windows-SmartScreen ("Der Computer wurde durch Windows geschuetzt"):
      "Weitere Informationen" -> "Trotzdem ausfuehren". Die Datei ist nicht signiert.
    - Fragt die Windows-Firewall, bitte "Zugriff zulassen".
    - Manche Virenscanner warnen, weil sich die Mod in das Spiel einklinkt.
      Das ist so gewollt; ggf. eine Ausnahme fuer den Ordner anlegen.
+3. Namen eingeben. Die App findet LEGO Batman selbst und legt eine Verknuepfung
+   auf dem Desktop an.
+
+
+Freunde hinzufuegen (einmalig)
+------------------------------
+1. Oben links steht dein Freundescode, z. B. HN4U-JZJ2-9NYW.
+   "Kopieren" druecken und dem Freund schicken (Discord, WhatsApp ...).
+2. Der Freund gibt den Code bei "Freund hinzufuegen" ein.
+3. Bei dir erscheint die Anfrage in der Freundesliste -> "Annehmen".
+Ab jetzt seht ihr, wer online ist (gruener Punkt).
 
 
 Spielen
 -------
-1. Beide starten LegoBatmanOnline.exe. Steam muss NICHT laufen.
-2. Einer waehlt 1 (Hosten), der andere 2 (Beitreten).
-3. Jeder bekommt einen Code, z. B. MVJP-3NHK-9RAL-TNVA-656S-2LJK.
-   Schickt euch die Codes gegenseitig (Discord, WhatsApp ...) und gebt jeweils
-   den Code des ANDEREN ein. Beide sollten ungefaehr gleichzeitig Enter druecken.
-4. Die Mod verbindet euch, misst den Ping und schickt den Spielstand des Hosts
-   an den Gast. Danach startet bei beiden das Spiel.
-5. Der HOST bedient die Menues (Load Game / New Game).
-   Der GAST wartet, bis er im Spiel ist, und drueckt dann START zum Einsteigen.
+1. Beide starten die App. Steam muss NICHT laufen.
+2. Wer den Spielstand hat, waehlt links den Spielstand aus und drueckt beim
+   Freund auf "Einladen".
+3. Der Freund drueckt "Annehmen und spielen".
+4. Die App verbindet euch, schickt den Spielstand an den Freund und startet bei
+   beiden das Spiel. Mit "Spielstand automatisch laden" landet ihr direkt im
+   Spiel; sonst bedient der Einladende die Menues.
+5. Der Eingeladene drueckt START, sobald ihr im Spiel seid, und steigt ein.
 
-Gespeichert wird nur beim Host (in seinem normalen Spielstand). Der eigene
-Spielstand des Gastes wird nie veraendert.
+Gespeichert wird nur beim Einladenden (in seinem normalen Spielstand). Der eigene
+Spielstand des Eingeladenen wird nie veraendert.
 
 
 Steuerung ohne Controller (Tastatur)
@@ -52,7 +62,8 @@ Dann hilft ein kostenloses VPN, das eure PCs in ein gemeinsames Netz bringt:
 
 1. Beide installieren "Radmin VPN" (radmin-vpn.com) oder "Tailscale".
 2. Einer erstellt ein Netzwerk, der andere tritt bei.
-3. Host startet LegoBatmanOnline.exe und waehlt 3 (Hosten direkt per IP).
+3. Im Ordner "Extras" liegt LegoBatmanOnline-Konsole.exe.
+   Host startet sie und waehlt 3 (Hosten direkt per IP).
 4. Gast waehlt 4 und gibt die IP des Hosts ein, die Radmin/Tailscale anzeigt
    (z. B. 26.12.34.56).
 
@@ -65,6 +76,20 @@ Wichtig waehrend des Spiels
 - Beide Spiele laufen im Gleichschritt. Hakt es bei einem, wartet der andere.
 - Fenster nicht schliessen oder minimieren. Beendet ihr das Spiel bei einem,
   bleibt es beim anderen stehen.
-- Logs fuer Fehlerberichte liegen unter
-  %LOCALAPPDATA%\LegoBatmanOnline\logs  (im Explorer in die Adresszeile eingeben).
-  Steht dort "DESYNC", sind die Spiele auseinandergelaufen - bitte melden.
+- Die App waehrend des Spiels offen lassen.
+
+
+Datenschutz
+-----------
+Die App findet Freunde ueber oeffentliche Vermittlungsdienste (MQTT: HiveMQ,
+EMQX, Mosquitto). Dort sichtbar sind nur dein Freundescode, dein Name und ob du
+online bist. Freundschaftsanfragen, Einladungen und eure IP-Adressen werden
+Ende-zu-Ende verschluesselt. Das Spiel selbst laeuft direkt zwischen euren PCs.
+
+
+Bei Problemen
+-------------
+Logs liegen unter %LOCALAPPDATA%\LegoBatmanOnline\logs
+(im Explorer in die Adresszeile eingeben). Steht dort "DESYNC", sind die
+Spiele auseinandergelaufen - bitte melden. App-Fehler stehen in
+%LOCALAPPDATA%\LegoBatmanOnline\app-fehler.txt.

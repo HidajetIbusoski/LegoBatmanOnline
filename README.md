@@ -6,7 +6,7 @@ Online-Koop für **LEGO Batman: The Videogame (2008, PC/Steam)**. Zwei Spieler, 
 
 - Spielt sich wie lokaler Koop: Spieler 2 kann jederzeit einsteigen und wieder aussteigen.
 - So viele Spieler wie das Original lokal erlaubt: **2**.
-- Für Endnutzer: Launcher starten, auf **Hosten** oder **Beitreten** klicken, Code teilen, fertig.
+- Für Endnutzer: App starten, Freund per Code hinzufügen, auf **Einladen** klicken, fertig.
 - Stabile Verbindung: direkt per UDP zwischen den Spielern, Relay als Fallback.
 
 ## Technischer Ansatz (Entwurf)
@@ -25,6 +25,15 @@ Das funktioniert nur, wenn das Spiel bei gleichen Eingaben und gleichem Zeitschr
 
 - [x] **Phase 0: Machbarkeit.** EXE analysiert, Determinismus auf einem PC bestätigt, siehe [docs/phase0-befunde.md](docs/phase0-befunde.md).
 - [x] **Phase 1:** Hook-DLL (per Launcher injiziert statt Proxy-DLL, damit nichts im Spielordner landet). Sie zeichnet Eingaben auf, spielt Skripte ab und vergleicht Prüfsummen, siehe [docs/phase1-werkzeuge.md](docs/phase1-werkzeuge.md).
-- [ ] **Phase 2:** Lockstep über LAN. Prototyp läuft lokal mit zwei Instanzen (`src/dll/net.c`). Offen: Test über zwei echte PCs, echte Controller (auch DirectInput/DualSense) und Tastatur abschalten.
-- [ ] **Phase 3:** Internet (NAT-Traversal, Relay, Einladungscode).
-- [ ] **Phase 4:** Launcher für Endnutzer.
+- [x] **Phase 2:** Lockstep (`src/dll/net.c`): lokal mit zwei Instanzen bestätigt, auch mit 20 % Paketverlust. Echte Controller (XInput, DirectInput/DualSense) und Tastatur werden gelesen.
+- [x] **Phase 3:** Internet ohne eigenen Server: STUN, Einladungscodes, Hole Punching, Spielstand-Übertragung (`src/launcher/online.c`). Direktmodus per IP für VPN.
+- [x] **Phase 4:** App für Endnutzer (`app/LegoBatmanOnline`, WPF): Freundescodes, Freundesliste mit Online-Status, Einladen, Spielstand wählen und automatisch laden. Siehe [docs/app.md](docs/app.md).
+- [ ] **Offen:** Test zwischen zwei echten PCs in verschiedenen Haushalten (Determinismus über verschiedene Hardware, NAT), DualSense-Belegung mit echtem Spieler.
+
+## Release bauen
+
+```
+powershell -ExecutionPolicy Bypass -File tools\make_release.ps1
+```
+
+Ergebnis: `dist\LegoBatmanOnline.zip` mit einer einzelnen `LegoBatmanOnline.exe` (enthält Launcher und Mod-DLL, kein .NET nötig), `ANLEITUNG.txt` und dem Konsolen-Launcher unter `Extras\`.

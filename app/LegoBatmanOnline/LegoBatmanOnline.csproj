@@ -6,10 +6,26 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <AssemblyName>LegoBatmanOnline</AssemblyName>
+    <Version>1.0.0</Version>
+    <Product>LEGO Batman Online</Product>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Eine einzelne EXE ohne .NET-Installation beim Mitspieler -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="MQTTnet" Version="5.2.0.1603" />
+  </ItemGroup>
+
+  <!-- Launcher und Mod-DLL (32 Bit, aus build.bat) werden in die App eingebettet -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\build\lbo-launch.exe" LogicalName="lbo-launch.exe" />
+    <EmbeddedResource Include="..\..\build\lbo.dll" LogicalName="lbo.dll" />
   </ItemGroup>
 
 </Project>

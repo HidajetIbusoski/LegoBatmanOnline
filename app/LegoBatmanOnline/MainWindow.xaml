@@ -1,12 +1,280 @@
 ﻿<Window x:Class="LegoBatmanOnline.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
-        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        xmlns:local="clr-namespace:LegoBatmanOnline"
-        mc:Ignorable="d"
-        Title="MainWindow" Height="450" Width="800">
+        Title="LEGO Batman Online" Height="640" Width="920" MinHeight="520" MinWidth="760"
+        Background="{StaticResource Bg}" Foreground="{StaticResource Text}" FontSize="14" WindowStartupLocation="CenterScreen"
+        UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
     <Grid>
+        <Grid Margin="20">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
 
+            <!-- Kopfzeile -->
+            <DockPanel Margin="0,0,0,16">
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Ellipse Width="8" Height="8" Margin="0,0,6,0">
+                        <Ellipse.Style>
+                            <Style TargetType="Ellipse">
+                                <Setter Property="Fill" Value="{StaticResource Bad}"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding BrokerOnline}" Value="True">
+                                        <Setter Property="Fill" Value="{StaticResource Ok}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Ellipse.Style>
+                    </Ellipse>
+                    <TextBlock Text="{Binding BrokerText}" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,0,16,0"/>
+                    <Ellipse Width="8" Height="8" Margin="0,0,6,0">
+                        <Ellipse.Style>
+                            <Style TargetType="Ellipse">
+                                <Setter Property="Fill" Value="{StaticResource Bad}"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding GameOk}" Value="True">
+                                        <Setter Property="Fill" Value="{StaticResource Ok}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Ellipse.Style>
+                    </Ellipse>
+                    <TextBlock Text="{Binding GameText}" Foreground="{StaticResource Muted}" FontSize="12"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="LEGO Batman Online" FontSize="22" FontWeight="Bold"/>
+                    <TextBlock Text="{Binding Name, StringFormat='  ·  {0}'}" FontSize="22" Foreground="{StaticResource Muted}"/>
+                </StackPanel>
+            </DockPanel>
+
+            <Grid Grid.Row="1">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="320"/>
+                    <ColumnDefinition Width="16"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <!-- Linke Spalte -->
+                <StackPanel>
+                    <Border Style="{StaticResource CardBorder}">
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource Heading}" Text="DEIN FREUNDESCODE"/>
+                            <DockPanel>
+                                <Button x:Name="CopyButton" DockPanel.Dock="Right" Content="Kopieren" Click="Copy_Click"/>
+                                <TextBlock x:Name="MyCodeText" Text="{Binding MyCode}" FontSize="22" FontFamily="Consolas"
+                                           FontWeight="Bold" Foreground="{StaticResource Accent}" VerticalAlignment="Center"/>
+                            </DockPanel>
+                            <TextBlock Text="Schick diesen Code deinem Freund." Foreground="{StaticResource Muted}"
+                                       FontSize="12" Margin="0,8,0,0"/>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorder}">
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource Heading}" Text="FREUND HINZUFÜGEN"/>
+                            <DockPanel>
+                                <Button DockPanel.Dock="Right" Content="Hinzufügen" Margin="8,0,0,0" Click="AddFriend_Click"
+                                        Style="{StaticResource Primary}"/>
+                                <TextBox x:Name="FriendCodeBox" FontFamily="Consolas" CharacterCasing="Upper" MaxLength="20"
+                                         KeyDown="FriendCodeBox_KeyDown"/>
+                            </DockPanel>
+                            <TextBlock x:Name="AddResult" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,8,0,0"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorder}">
+                        <StackPanel>
+                            <DockPanel>
+                                <Button DockPanel.Dock="Right" Style="{StaticResource Quiet}" Content="Neu laden"
+                                        Click="RefreshSaves_Click" Margin="0,-6,-8,0" VerticalAlignment="Top"/>
+                                <TextBlock Style="{StaticResource Heading}" Text="SPIELSTAND (WENN DU EINLÄDST)"/>
+                            </DockPanel>
+                            <ListBox ItemsSource="{Binding Saves}" SelectedItem="{Binding SelectedSave}"
+                                     Background="Transparent" BorderThickness="0" Padding="0" Foreground="{StaticResource Text}"
+                                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                <ListBox.ItemContainerStyle>
+                                    <Style TargetType="ListBoxItem">
+                                        <Setter Property="Cursor" Value="Hand"/>
+                                        <Setter Property="Template">
+                                            <Setter.Value>
+                                                <ControlTemplate TargetType="ListBoxItem">
+                                                    <Border x:Name="b" Background="{StaticResource Bg}" BorderBrush="{StaticResource Line}"
+                                                            BorderThickness="1" CornerRadius="7" Padding="10,7" Margin="0,0,0,6">
+                                                        <ContentPresenter/>
+                                                    </Border>
+                                                    <ControlTemplate.Triggers>
+                                                        <Trigger Property="IsMouseOver" Value="True">
+                                                            <Setter TargetName="b" Property="Background" Value="{StaticResource CardHover}"/>
+                                                        </Trigger>
+                                                        <Trigger Property="IsSelected" Value="True">
+                                                            <Setter TargetName="b" Property="BorderBrush" Value="{StaticResource Accent}"/>
+                                                        </Trigger>
+                                                    </ControlTemplate.Triggers>
+                                                </ControlTemplate>
+                                            </Setter.Value>
+                                        </Setter>
+                                    </Style>
+                                </ListBox.ItemContainerStyle>
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding Title}" FontSize="13" FontWeight="SemiBold"/>
+                                            <TextBlock Text="{Binding SavedText}" FontSize="11" Foreground="{StaticResource Muted}"/>
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                            <TextBlock Text="Noch kein Spielstand vorhanden – starte LEGO Batman einmal normal und speichere."
+                                       Foreground="{StaticResource Muted}" FontSize="12" TextWrapping="Wrap" Margin="0,6,0,0">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock" >
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Saves.Count}" Value="0">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                            <CheckBox IsChecked="{Binding AutoLoad}" Margin="0,10,0,0"
+                                      Content="Spielstand automatisch laden"/>
+                            <TextBlock Text="Dein Freund bekommt den Spielstand automatisch – ihr spielt beide denselben."
+                                       Foreground="{StaticResource Muted}" FontSize="12" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorder}" Visibility="{Binding GameMissing, Converter={StaticResource BoolVis}}">
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource Heading}" Text="SPIEL NICHT GEFUNDEN"/>
+                            <TextBlock Text="LEGO Batman (Steam) wurde nicht gefunden." TextWrapping="Wrap" FontSize="13"/>
+                            <Button Content="LEGOBatman.exe auswählen …" Margin="0,10,0,0" HorizontalAlignment="Left"
+                                    Click="PickGame_Click"/>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+
+                <!-- Rechte Spalte: Freunde -->
+                <Border Grid.Column="2" Style="{StaticResource CardBorder}" Margin="0">
+                    <DockPanel>
+                        <TextBlock DockPanel.Dock="Top" Style="{StaticResource Heading}" Text="FREUNDE"/>
+                        <Grid>
+                            <TextBlock Text="Noch keine Freunde. Tauscht eure Codes aus und fügt euch hinzu."
+                                       Foreground="{StaticResource Muted}" TextWrapping="Wrap" FontSize="13">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock" >
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Friends.Count}" Value="0">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                <ItemsControl ItemsSource="{Binding Friends}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Border Background="{StaticResource CardHover}" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
+                                                <DockPanel>
+                                                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                                                        <Button Content="Annehmen" Style="{StaticResource Primary}" Margin="0,0,6,0"
+                                                                Click="AcceptFriend_Click"
+                                                                Visibility="{Binding IsIncoming, Converter={StaticResource BoolVis}}"/>
+                                                        <Button Content="Einladen" Style="{StaticResource Primary}" Margin="0,0,6,0"
+                                                                Click="Invite_Click"
+                                                                IsEnabled="{Binding CanInvite}"
+                                                                Visibility="{Binding IsFriend, Converter={StaticResource BoolVis}}"/>
+                                                        <Button Content="✕" Style="{StaticResource Quiet}" ToolTip="Entfernen"
+                                                                Click="RemoveFriend_Click"/>
+                                                    </StackPanel>
+                                                    <Ellipse Width="10" Height="10" Margin="0,0,10,0" VerticalAlignment="Center">
+                                                        <Ellipse.Style>
+                                                            <Style TargetType="Ellipse">
+                                                                <Setter Property="Fill" Value="{StaticResource Line}"/>
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding Online}" Value="True">
+                                                                        <Setter Property="Fill" Value="{StaticResource Ok}"/>
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </Ellipse.Style>
+                                                    </Ellipse>
+                                                    <StackPanel VerticalAlignment="Center">
+                                                        <TextBlock Text="{Binding Name}" FontWeight="SemiBold"/>
+                                                        <TextBlock FontSize="12" Foreground="{StaticResource Muted}">
+                                                            <Run Text="{Binding StatusText, Mode=OneWay}"/>
+                                                            <Run Text="  ·  "/>
+                                                            <Run Text="{Binding Code, Mode=OneWay}" FontFamily="Consolas"/>
+                                                        </TextBlock>
+                                                    </StackPanel>
+                                                </DockPanel>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </ScrollViewer>
+                        </Grid>
+                    </DockPanel>
+                </Border>
+            </Grid>
+
+            <!-- Fusszeile: Hinweis + Protokoll -->
+            <StackPanel Grid.Row="2" Margin="0,12,0,0">
+                <TextBlock Text="{Binding Hint}" Foreground="{StaticResource Accent}" FontSize="13" TextWrapping="Wrap"/>
+                <Expander Header="Protokoll" Foreground="{StaticResource Muted}" Margin="0,6,0,0">
+                    <ListBox ItemsSource="{Binding Log}" Height="110" Background="{StaticResource Card}"
+                             BorderThickness="0" Foreground="{StaticResource Muted}" FontFamily="Consolas" FontSize="12"/>
+                </Expander>
+            </StackPanel>
+        </Grid>
+
+        <!-- Einladung erhalten -->
+        <Border Background="#CC000000" Visibility="{Binding HasIncoming, Converter={StaticResource BoolVis}}">
+            <Border Style="{StaticResource CardBorder}" Width="420" VerticalAlignment="Center" Padding="24">
+                <StackPanel>
+                    <TextBlock Style="{StaticResource Heading}" Text="EINLADUNG"/>
+                    <TextBlock Text="{Binding Incoming.Text}" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                    <TextBlock Text="Das Spiel startet nach dem Annehmen automatisch. Dein eigener Spielstand bleibt unverändert."
+                               Foreground="{StaticResource Muted}" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,16"/>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button Content="Ablehnen" Margin="0,0,8,0" Click="Decline_Click"/>
+                        <Button Content="Annehmen und spielen" Style="{StaticResource Primary}" Click="AcceptInvite_Click"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Border>
+
+        <!-- Laufende Sitzung -->
+        <Border Background="#CC000000" Visibility="{Binding SessionActive, Converter={StaticResource BoolVis}}">
+            <Border Style="{StaticResource CardBorder}" Width="440" VerticalAlignment="Center" Padding="24">
+                <StackPanel>
+                    <TextBlock Style="{StaticResource Heading}" Text="ONLINE-SPIEL"/>
+                    <TextBlock Text="{Binding SessionText}" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                    <ProgressBar IsIndeterminate="True" Height="4" Margin="0,16,0,16" Foreground="{StaticResource Accent}"
+                                 Background="{StaticResource Line}" BorderThickness="0"/>
+                    <TextBlock Text="Lass dieses Fenster offen, solange ihr spielt. Zum Beenden das Spiel schließen."
+                               Foreground="{StaticResource Muted}" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,16"/>
+                    <Button Content="Abbrechen" HorizontalAlignment="Right" Click="CancelSession_Click"/>
+                </StackPanel>
+            </Border>
+        </Border>
+
+        <!-- Ersteinrichtung: Name -->
+        <Border x:Name="SetupOverlay" Background="{StaticResource Bg}" Visibility="Collapsed">
+            <Border Style="{StaticResource CardBorder}" Width="440" VerticalAlignment="Center" Padding="28">
+                <StackPanel>
+                    <TextBlock Text="Willkommen!" FontSize="24" FontWeight="Bold"/>
+                    <TextBlock Text="Mit dieser App spielst du LEGO Batman zu zweit übers Internet. Wie sollen dich deine Freunde sehen?"
+                               Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,8,0,16" FontSize="13"/>
+                    <TextBox x:Name="NameBox" MaxLength="24" KeyDown="NameBox_KeyDown"/>
+                    <Button Content="Los geht's" Style="{StaticResource Primary}" HorizontalAlignment="Right" Margin="0,16,0,0"
+                            Click="SaveName_Click"/>
+                </StackPanel>
+            </Border>
+        </Border>
     </Grid>
 </Window>

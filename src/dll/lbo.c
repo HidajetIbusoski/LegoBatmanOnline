@@ -20,10 +20,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <mmsystem.h>
 
 // --- Spieladressen ---------------------------------------------------------
 #define ADDR_FRAME_END      0x006E0240  // sub esp,14h / fldz  (5 Bytes)
 #define ADDR_WORLD_UPDATE   0x004AEE90  // sub esp,38h / push ebx / push ebp (5 Bytes)
+#define ADDR_DEVICE_READ    0x005206C0  // sub esp,13Ch (6 Bytes)
 #define IAT_XINPUT_GETSTATE 0x02A17C38
 #define IAT_XINPUT_GETCAPS  0x02A17C3C
 #define G_DT_OVERRIDE       (*(volatile float *)0x00ADF690)
@@ -70,6 +73,7 @@ static int g_nlines, g_caplines;
 static PAD g_last_rec[4];
 static int g_last_rec_conn[4];
 static int g_polls_this_frame;
+static DWORD g_t0;  // Startzeit fuer die ms-Spalte im CSV
 
 static GetStateFn real_getstate;
 static GetCapsFn real_getcaps;
@@ -193,6 +197,9 @@ static void poll_live(void)
                 __try { *(unsigned *)addr = val; logf_("poke %08x = %08x", addr, val); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { logf_("poke %08x: Zugriffsfehler", addr); }
             }
+        } else if (!strncmp(buf, "clear", 5)) {
+            logf_("Live: clear (%d Skriptzeilen verworfen)", g_nlines);
+            g_nlines = 0;
         } else if (!strncmp(buf, "quit", 4)) {
             logf_("Live: quit");
             if (g_csv) fflush(g_csv);
@@ -286,6 +293,13 @@ static void fix_input_slots(void)
             slot[0x1c] = 0x40;
             memset(slot + 0x2e, 0, 0x3f);
             strcpy((char *)slot + 0x2e, "XBOX 360 For Windows (Controller)");
+            // Produkt-GUID eines kabelgebundenen Xbox-360-Pads {028E045E-0000-0000-0000-504944564944}
+            // ("PIDVID"), so wie sie DirectInput liefern wuerde. Die Belegungssuche haengt daran.
+            {
+                static const unsigned char guid[16] = { 0x5E, 0x04, 0x8E, 0x02, 0, 0, 0, 0,
+                                                        0, 0, 'P', 'I', 'D', 'V', 'I', 'D' };
+                memcpy(slot + 8, guid, 16);
+            }
             hook_getcaps(i, 1, &caps);
             ((CapsToSlotFn)0x0051D9B0)(obj, 0, &caps, slot);
             cfg = ((FindCfgFn)0x0051D5F0)(obj, 0, 7, i, *(int *)(obj + 0x6604));
@@ -298,38 +312,33 @@ static void fix_input_slots(void)
     }
 }
 
-// Echte Joysticks und Gamepads (DirectInput-Klasse GAMECTRL, Geraetetyp 0x14-0x18) sollen im
-// Skriptmodus gar nicht erst im Spiel landen. Dazu ersetzen wir den Callback, den das Spiel an
-// IDirectInput8::EnumDevices uebergibt (push 0x522fe0 an sechs Stellen).
-typedef BOOL (CALLBACK *EnumCb)(const void *inst, void *ref);
-static const DWORD enum_push_sites[] = { 0x5234F8, 0x52351B, 0x523530, 0x523FF4, 0x524016, 0x52402A };
-
-static BOOL CALLBACK filter_enum(const void *inst, void *ref)
+// Echte DirectInput-Joysticks (Geraete 4-9, z. B. ein DualSense) sollen im Skriptmodus keine
+// Eingaben liefern. Aufzaehlen lassen wir sie trotzdem, sonst sucht das Spiel jeden Frame neu
+// nach Geraeten (langsam). Stattdessen fangen wir die Geraete-Lesefunktion 0x5206c0 ab
+// (thiscall, (index, ausgabe), ret 8) und melden fuer 4-9 "nicht verbunden".
+__declspec(naked) static void stub_device_read(void)
 {
-    BYTE type = *((const BYTE *)inst + 0x24);
-    if (type >= 0x14 && type <= 0x18) {
-        static int logged;
-        if (logged++ < 8) logf_("DirectInput-Geraet ausgeblendet: %s", (const char *)inst + 0x12c);
-        return TRUE;  // DIENUM_CONTINUE
+    __asm {
+        cmp g_mode, MODE_SCRIPT
+        jne orig
+        mov eax, [esp + 4]
+        cmp eax, 4
+        jb orig
+        cmp eax, 9
+        ja orig
+        push edi
+        mov edi, [esp + 12]
+        xor eax, eax
+        mov ecx, 49
+        rep stosd
+        pop edi
+        xor eax, eax
+        ret 8
+    orig:
+        sub esp, 13Ch
+        push 005206C6h
+        ret
     }
-    return ((EnumCb)0x00522FE0)(inst, ref);
-}
-
-static void hide_real_gamepads(void)
-{
-    int i;
-    for (i = 0; i < (int)(sizeof enum_push_sites / sizeof *enum_push_sites); i++) {
-        unsigned char *p = (unsigned char *)enum_push_sites[i];
-        DWORD old;
-        if (p[0] != 0x68 || *(DWORD *)(p + 1) != 0x00522FE0) {
-            logf_("Enum-Callback bei 0x%08lx unerwartet, nicht gepatcht", enum_push_sites[i]);
-            continue;
-        }
-        VirtualProtect(p + 1, 4, PAGE_EXECUTE_READWRITE, &old);
-        *(DWORD *)(p + 1) = (DWORD)filter_enum;
-        VirtualProtect(p + 1, 4, old, &old);
-    }
-    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
 }
 
 // --- Pruefsumme -------------------------------------------------------------------
@@ -419,19 +428,44 @@ static void write_shot(const char *name)
 }
 
 // --- Frame-Hooks ------------------------------------------------------------------
+// Bildratenbegrenzung (LBO_FPSCAP): mit festem dt laeuft die Spielzeit sonst so schnell wie die
+// Grafikkarte. Wartet bis zum naechsten 1/fps-Takt (Sleep fuer den Grossteil, Rest aktiv).
+static int g_fps_cap;
+static LARGE_INTEGER g_qpf, g_next_frame;
+
+static void cap_frame_rate(void)
+{
+    LARGE_INTEGER now;
+    LONGLONG period;
+    if (g_fps_cap <= 0) return;
+    period = g_qpf.QuadPart / g_fps_cap;
+    QueryPerformanceCounter(&now);
+    if (!g_next_frame.QuadPart || now.QuadPart - g_next_frame.QuadPart > period * 4) {
+        g_next_frame.QuadPart = now.QuadPart + period;  // Start oder nach langer Pause neu takten
+        return;
+    }
+    while (now.QuadPart < g_next_frame.QuadPart) {
+        LONGLONG left_ms = (g_next_frame.QuadPart - now.QuadPart) * 1000 / g_qpf.QuadPart;
+        if (left_ms > 2) Sleep((DWORD)(left_ms - 1));
+        QueryPerformanceCounter(&now);
+    }
+    g_next_frame.QuadPart += period;
+}
+
 static void __cdecl on_frame_end(void)
 {
     SNAP s;
     long F = InterlockedIncrement(&g_F);
+    cap_frame_rate();
     if (g_fixed_dt) G_DT_OVERRIDE = 1.0f / 60.0f;
     if (g_mode == MODE_SCRIPT) fix_input_slots();
 
     snapshot(&s);
     if (g_csv) {
-        fprintf(g_csv, "%ld,%ld,%d,%.6f,%d,%016llx,%016llx,%d,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%d\n",
+        fprintf(g_csv, "%ld,%ld,%d,%.6f,%d,%016llx,%016llx,%d,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%d,%lu\n",
                 F, g_W, G_FRAMECOUNT, G_DT_GAME, s.nchars, s.chars, s.rng,
                 s.pvalid[0], s.p[0][0], s.p[0][1], s.p[0][2],
-                s.pvalid[1], s.p[1][0], s.p[1][1], s.p[1][2], g_polls_this_frame);
+                s.pvalid[1], s.p[1][0], s.p[1][1], s.p[1][2], g_polls_this_frame, GetTickCount() - g_t0);
         if (F % 60 == 0) fflush(g_csv);
     }
     g_polls_this_frame = 0;
@@ -518,14 +552,84 @@ static void patch_iat(DWORD slot, void *fn, void **orig)
     VirtualProtect((void *)slot, 4, old, &old);
 }
 
+// Das Spiel ignoriert Pad-Eingaben und haelt in 0x6e0240 an, solange sein Fenster nicht aktiv ist
+// (Flag 0x94d3a0). Fuer unbeaufsichtigte Skriptlaeufe halten wir das Flag dauerhaft auf 1.
+#define G_WINDOW_ACTIVE (*(volatile int *)0x0094D3A0)
+static DWORD WINAPI keep_focus_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        G_WINDOW_ACTIVE = 1;
+        Sleep(2);
+    }
+}
+
+// Schutz der echten Spielstaende: Schreibzugriffe auf SaveGame*/pcconfig.txt landen im Laufordner.
+// Lesen bleibt unveraendert, damit "Load Game" den echten Spielstand laden kann.
+#define IAT_CREATEFILEA 0x02A1796C
+#define IAT_DELETEFILEA 0x02A17990
+typedef HANDLE (WINAPI *CreateFileAFn)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+typedef BOOL (WINAPI *DeleteFileAFn)(LPCSTR);
+static CreateFileAFn real_createfile;
+static DeleteFileAFn real_deletefile;
+static int g_allow_save;
+
+static int is_protected(const char *path)
+{
+    char low[MAX_PATH];
+    size_t i;
+    if (!path || g_allow_save) return 0;
+    for (i = 0; path[i] && i < MAX_PATH - 1; i++) low[i] = (char)tolower((unsigned char)path[i]);
+    low[i] = 0;
+    return strstr(low, "savedgame") || strstr(low, "pcconfig.txt");
+}
+
+static HANDLE WINAPI hook_createfile(LPCSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
+                                     DWORD disp, DWORD flags, HANDLE tmpl)
+{
+    if ((access & (GENERIC_WRITE | GENERIC_ALL)) && is_protected(path)) {
+        char red[MAX_PATH];
+        const char *base = strrchr(path, '\\');
+        snprintf(red, sizeof red, "%s\\umgeleitet_%s", g_dir, base ? base + 1 : path);
+        logf_("Schreibzugriff umgeleitet: %s -> %s", path, red);
+        return real_createfile(red, access, share, sa, disp, flags, tmpl);
+    }
+    return real_createfile(path, access, share, sa, disp, flags, tmpl);
+}
+
+static BOOL WINAPI hook_deletefile(LPCSTR path)
+{
+    if (is_protected(path)) {
+        logf_("Loeschen verhindert: %s", path);
+        return TRUE;
+    }
+    return real_deletefile(path);
+}
+
+// Bink-Videos (Intro, Attract-Demo, Zwischensequenzen) laufen ausserhalb von 0x6e0240 und lassen
+// sich per Pad nicht abbrechen. Mit LBO_NOMOVIES=1 tut BinkOpen so, als fehle die Datei.
+#define IAT_BINKOPEN 0x02A17CA8
+typedef void *(WINAPI *BinkOpenFn)(const char *name, unsigned flags);
+static BinkOpenFn real_binkopen;
+static int g_no_movies;
+
+static void *WINAPI hook_binkopen(const char *name, unsigned flags)
+{
+    logf_("BinkOpen %s%s", name ? name : "(null)", g_no_movies ? " -> uebersprungen" : "");
+    if (g_no_movies) return NULL;
+    return real_binkopen(name, flags);
+}
+
 static void init(void)
 {
     char buf[MAX_PATH];
     HMODULE xi;
     static const unsigned char pro_frame[5] = { 0x83, 0xEC, 0x14, 0xD9, 0xEE };
     static const unsigned char pro_world[5] = { 0x83, 0xEC, 0x38, 0x53, 0x55 };
+    static const unsigned char pro_devread[5] = { 0x81, 0xEC, 0x3C, 0x01, 0x00 };
 
     InitializeCriticalSection(&g_cs);
+    g_t0 = GetTickCount();
     if (!GetEnvironmentVariableA("LBO_DIR", g_dir, MAX_PATH)) GetTempPathA(MAX_PATH, g_dir);
     CreateDirectoryA(g_dir, NULL);
     g_log = open_out("lbo.log", "w");
@@ -548,7 +652,7 @@ static void init(void)
     logf_("Modus %d, festes dt %d, max Frames %d, Screenshot alle %d", g_mode, g_fixed_dt, g_max_frames, g_shot_every);
 
     g_csv = open_out("frames.csv", "w");
-    if (g_csv) fprintf(g_csv, "F,W,game_frame,dt,nchars,chars_hash,rng_hash,p1,p1x,p1y,p1z,p2,p2x,p2y,p2z,polls\n");
+    if (g_csv) fprintf(g_csv, "F,W,game_frame,dt,nchars,chars_hash,rng_hash,p1,p1x,p1y,p1z,p2,p2x,p2y,p2z,polls,ms\n");
 
     xi = GetModuleHandleA("xinput1_3.dll");
     logf_("IAT XInputGetState=%p (xinput1_3 Ordinal 2=%p), GetCapabilities=%p (Ordinal 4=%p)",
@@ -556,10 +660,20 @@ static void init(void)
           *(void **)IAT_XINPUT_GETCAPS, xi ? GetProcAddress(xi, (LPCSTR)4) : NULL);
     patch_iat(IAT_XINPUT_GETSTATE, (void *)hook_getstate, (void **)&real_getstate);
     patch_iat(IAT_XINPUT_GETCAPS, (void *)hook_getcaps, (void **)&real_getcaps);
-    if (g_mode == MODE_SCRIPT) hide_real_gamepads();
+    if (GetEnvironmentVariableA("LBO_ALLOWSAVE", buf, sizeof buf)) g_allow_save = atoi(buf);
+    patch_iat(IAT_CREATEFILEA, (void *)hook_createfile, (void **)&real_createfile);
+    patch_iat(IAT_DELETEFILEA, (void *)hook_deletefile, (void **)&real_deletefile);
+    logf_("Spielstand-Schutz %s", g_allow_save ? "AUS (LBO_ALLOWSAVE)" : "aktiv");
+    if (GetEnvironmentVariableA("LBO_NOMOVIES", buf, sizeof buf)) g_no_movies = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_FPSCAP", buf, sizeof buf)) g_fps_cap = atoi(buf);
+    QueryPerformanceFrequency(&g_qpf);
+    timeBeginPeriod(1);
+    patch_iat(IAT_BINKOPEN, (void *)hook_binkopen, (void **)&real_binkopen);
+    if (g_mode == MODE_SCRIPT) CreateThread(NULL, 0, keep_focus_thread, NULL, 0, NULL);
 
     logf_("Hook Frame-Ende: %d", patch_jmp(ADDR_FRAME_END, (void *)stub_frame_end, pro_frame));
     logf_("Hook Weltupdate: %d", patch_jmp(ADDR_WORLD_UPDATE, (void *)stub_world_update, pro_world));
+    logf_("Hook Geraete-Lesen: %d", patch_jmp(ADDR_DEVICE_READ, (void *)stub_device_read, pro_devread));
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)

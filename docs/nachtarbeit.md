@@ -25,6 +25,14 @@ Phase 1 vorbereiten und den Determinismus-Test aus Phase 0 so weit wie möglich 
 ## Fortschritt
 
 - 02:35 Plan angelegt, Zeitplan-Fortsetzung eingerichtet (stündlich 03–08 Uhr, Abschlussbericht 08:30).
-- 03:15 Launcher (lbo-launch.exe) und Hook-DLL (lbo.dll) gebaut. Injektion ohne Dateien im Spielordner funktioniert. Hooks auf Frame-Ende 0x6e0240 und Weltupdate 0x4aee90 greifen, Prüfsummen-CSV läuft.
-- 03:15 Spielstand-Ordner nach runs/savebackup-0250 gesichert (pcconfig.txt wurde durch -Windowed-Läufe schon angepasst).
-- 03:15 Befund: Das Spiel erkennt XInput-Pads nur über die DirectInput-Geräteliste (Callback 0x522fe0). Die DLL meldet virtuelle Pads selbst an (0x51d9b0, 0x51d5f0, 0x51d800) und blendet echte Gamepads (DualSense, Maple) im Skriptmodus aus.
+- ~03:00 Launcher (lbo-launch.exe) und Hook-DLL (lbo.dll) gebaut. Injektion ohne Dateien im Spielordner funktioniert. Hooks auf Frame-Ende 0x6e0240 und Weltupdate 0x4aee90 greifen, Prüfsummen-CSV läuft.
+- ~03:00 Spielstand-Ordner nach runs/savebackup-0250 gesichert (pcconfig.txt wurde durch -Windowed-Läufe schon angepasst).
+- ~03:00 Befund: Das Spiel erkennt XInput-Pads nur über die DirectInput-Geräteliste (Callback 0x522fe0). Die DLL meldet virtuelle Pads selbst an (0x51d9b0, 0x51d5f0, 0x51d800) und blendet echte Gamepads (DualSense, Maple) im Skriptmodus aus.
+- 03:35 Weitere Befunde und Werkzeuge:
+  - Belegung: Die Tastenbelegung hängt an der Produkt-PID/VID im Slot (`+8`). Mit `0x028E045E` (Xbox 360) greift der eingebaute Eintrag, danach funktionieren A/B im Menü.
+  - Fokus: Ohne aktives Fenster verwirft das Spiel Pad-Eingaben und wartet in `0x6e0240` (Flag `0x94d3a0`). Die DLL hält das Flag im Skriptmodus auf 1.
+  - Echte Joysticks (DualSense, „Maple") liefern im Skriptmodus nichts mehr (Hook auf `0x5206c0`).
+  - Spielstand-Schutz: Schreibzugriffe auf `SaveGame*` und `pcconfig.txt` werden in den Lauf-Ordner umgeleitet. Grund: Nach „Load Game" ist Autosave auf Slot 1 aktiv. Der Original-Spielstand ist nachweislich unverändert (SHA-256 `4b29e1ab…`).
+  - Bink-Videos (`BinkOpen`) lassen sich mit `LBO_NOMOVIES=1` überspringen. Das Intro ist dagegen eine Echtzeitsequenz.
+  - Mit festem dt läuft die Spielzeit so schnell, wie die GPU Bilder liefert (~1000 fps). Deshalb gibt es jetzt `LBO_FPSCAP=60`.
+  - Das Pad-Polling in `0x6de440` hängt am Present-Zähler `0x9d08d0`, nicht am Frame. Für den Lockstep muss pro Simulationsschritt genau einmal gepollt werden.

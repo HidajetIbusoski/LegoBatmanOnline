@@ -40,6 +40,8 @@ static SOCKET g_sock = INVALID_SOCKET;
 static struct sockaddr_in g_peer;
 static int g_role;   // 0 = Host (Pad 0), 1 = Client (Pad 1)
 static int g_delay = 3;
+static int g_loss;        // LBO_NETLOSS: Prozent ausgehender Pakete verwerfen (nur zum Testen)
+static long g_dropped;
 static NETPAD g_local[RING], g_remote[RING];
 static int g_local_upto = 0;    // hoechster Frame mit lokaler Eingabe
 static int g_remote_upto = 0;   // hoechster lueckenlos bekannter Partner-Frame
@@ -67,6 +69,8 @@ int net_init(void (*logger)(const char *fmt, ...))
     port = g_role ? 47101 : 47100;
     if (GetEnvironmentVariableA("LBO_PORT", buf, sizeof buf)) port = atoi(buf);
     if (GetEnvironmentVariableA("LBO_DELAY", buf, sizeof buf)) g_delay = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_NETLOSS", buf, sizeof buf)) g_loss = atoi(buf);
+    srand(GetCurrentProcessId());  // eigene CRT der DLL, beruehrt den Zufall des Spiels nicht
     if (g_delay < 1) g_delay = 1;
     if (g_delay > REDUNDANCY / 2) g_delay = REDUNDANCY / 2;
     strcpy(host, "127.0.0.1");
@@ -96,6 +100,7 @@ int net_init(void (*logger)(const char *fmt, ...))
     g_remote_upto = g_delay;
     memset(g_remote_have, 0, sizeof g_remote_have);
     for (port = 1; port <= g_delay; port++) g_remote_have[port % RING] = 1;
+    if (g_loss) g_log("Netz-Test: simuliere %d %% Paketverlust", g_loss);
     g_log("Netz: Rolle %s, Port %d, Partner %s:%d, Verzoegerung %d Frames",
           g_role ? "Client (Spieler 2)" : "Host (Spieler 1)", ntohs(me.sin_port), host, peer_port, g_delay);
     return 1;
@@ -116,6 +121,7 @@ static void send_inputs(void)
         p.ck_frame = g_last_ck_sent;
         p.ck = g_my_ck[g_last_ck_sent % RING];
     }
+    if (g_loss && (rand() % 100) < g_loss) { g_dropped++; return; }  // Testmodus: Paketverlust
     sendto(g_sock, (const char *)&p, sizeof p, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
 }
 
@@ -195,4 +201,5 @@ void net_stats(long *stalls, long *desyncs)
 {
     *stalls = g_stalls;
     *desyncs = g_desyncs;
+    if (g_loss) g_log("Netz-Test: %ld Pakete absichtlich verworfen (%d %%)", g_dropped, g_loss);
 }

@@ -23,8 +23,8 @@ Das funktioniert nur, wenn das Spiel bei gleichen Eingaben und gleichem Zeitschr
 
 ## Phasen
 
-- [ ] **Phase 0: Machbarkeit.** EXE analysieren (Imports, Kopierschutz, Input-API, Timing, Zufallszahlen). Determinismus-Test: Eingaben aufnehmen, abspielen und die Positionen vergleichen. Die statische Analyse ist fertig, siehe [docs/phase0-befunde.md](docs/phase0-befunde.md).
-- [ ] **Phase 1:** Proxy-DLL, die Eingaben lokal aufzeichnet und wieder abspielt.
-- [ ] **Phase 2:** Lockstep über LAN.
+- [x] **Phase 0: Machbarkeit.** EXE analysiert, Determinismus auf einem PC bestätigt, siehe [docs/phase0-befunde.md](docs/phase0-befunde.md).
+- [x] **Phase 1:** Hook-DLL (per Launcher injiziert statt Proxy-DLL, damit nichts im Spielordner landet). Sie zeichnet Eingaben auf, spielt Skripte ab und vergleicht Prüfsummen, siehe [docs/phase1-werkzeuge.md](docs/phase1-werkzeuge.md).
+- [ ] **Phase 2:** Lockstep über LAN. Prototyp läuft lokal mit zwei Instanzen (`src/dll/net.c`). Offen: Test über zwei echte PCs, echte Controller (auch DirectInput/DualSense) und Tastatur abschalten.
 - [ ] **Phase 3:** Internet (NAT-Traversal, Relay, Einladungscode).
 - [ ] **Phase 4:** Launcher für Endnutzer.

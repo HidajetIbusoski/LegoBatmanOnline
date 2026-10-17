@@ -168,10 +168,21 @@ Risiken, die erst der Test zeigt:
 
 Nächster Schritt ist der Determinismus-Test mit zwei lokalen Instanzen. Mit festem dt, aufgezeichneter Eingabe und Prüfsumme pro Frame zeigt sich, ob und ab welchem Frame die beiden Läufe auseinanderlaufen.
 
+## Laufzeit-Bestätigung (Nacht 2026-10-17)
+
+Getestet mit der Hook-DLL aus Phase 1 (siehe [phase1-werkzeuge.md](phase1-werkzeuge.md) und [nachtarbeit.md](nachtarbeit.md)). Das sind jetzt **beobachtete** Ergebnisse, keine statischen Folgerungen mehr.
+
+- **Determinismus bestätigt.** Mit festem dt (`0xadf690 = 1/60`), synchronisiertem Lade-Worker und gleichen Eingaben laufen wiederholte Läufe bitgleich. Geprüft wurden Figurenpositionen, alle 6 PRNG-Zustände und die Figurenliste über bis zu 12.500 Frames: Menüs, Laden des Spielstands, Bathöhle, Drop-in von Spieler 2, Kämpfen, Springen, Respawn.
+- **Einzige gefundene Störquelle: der asynchrone Lade-Worker** `0x6e2cc0` (Schlange `0xb03c68`, Events „BGWorkToDo“ `0xb03bd8` und „BGFreeze“ `0xb03bdc`). Ohne Synchronisation spawnen Figuren je nach Ladezeit einen Frame früher oder später, und der 16-Bit-PRNG `0x95fd5c` läuft auseinander. Die Lösung ist, Jobs nur am Frame-Ende laufen zu lassen und darauf zu warten.
+- **Figurenfelder bestätigt.** `+0x5c/+0x60/+0x64` ist die Position (x, y, z). y ändert sich beim Springen, x/z beim Laufen.
+- **Eingabe.** XInput-Pads erkennt das Spiel nur über die DirectInput-Geräteliste. Die Belegung hängt an PID/VID im Slot (`+8`). Ohne Fensterfokus werden Pad-Eingaben verworfen (`0x94d3a0`). Gepollt wird pro Present (`0x9d08d0`).
+- **Lockstep-Prototyp funktioniert lokal.** Zwei Instanzen auf einem PC tauschen Eingaben über UDP aus. Host und Client blieben über 9000 Frames bitgleich, 0 Desyncs.
+
 ## Offen (dynamisch zu klären)
 
 - [x] Läuft das Spiel mit festem oder variablem Zeitschritt? → **variabel**, einziger Einhakpunkt `0x6e0240`/`0xadf690` (Abschnitt 1)
 - [x] Woher kommt der Zufall? → **eigene PRNGs, feste Seeds** in `0x5ae190`, Haupt-Seed `0xad3b6c` (Abschnitt 2)
-- [ ] Determinismus-Test: gleiche Eingaben plus gleiche Uhr ergeben in zwei Läufen gleiche Figurenpositionen.
+- [x] Determinismus-Test: gleiche Eingaben plus gleiche Uhr ergeben in zwei Läufen gleiche Figurenpositionen. → **ja**, mit Worker-Sync (siehe oben)
 - [x] Wie verteilt das Spiel die Eingaben auf Spieler 1 und 2? → logische Ports 0/1, dynamische Gerätezuordnung per Start (Abschnitt 3). Offen ist noch, welcher Code Drop-in und Drop-out der P2-Figur auslöst.
-- [ ] Laufzeit-Bestätigung der Figurenfelder (`+0x5c` Position, `+0x8c` Vorframe) und des dt-Overrides `0xadf690`.
+- [x] Laufzeit-Bestätigung der Figurenfelder und des dt-Overrides `0xadf690`. → Position `+0x5c` und dt-Override bestätigt; dass `+0x8c` der Vorframe ist, bleibt ungeprüft.
+- [ ] Determinismus **zwischen verschiedenen PCs** (Intel/AMD, andere GPU). Bisher nur auf einem Rechner getestet.

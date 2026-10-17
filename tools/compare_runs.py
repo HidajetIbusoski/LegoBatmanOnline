@@ -42,6 +42,9 @@ def main():
             diffs += 1
             for c in bad:
                 first.setdefault(c, fr)
+    if not frames:
+        print("FEHLER: keine gemeinsamen Frames (ein Lauf ist leer oder abgebrochen)")
+        sys.exit(2)
     if not diffs:
         print("IDENTISCH: alle Spalten in allen gemeinsamen Frames gleich")
         return

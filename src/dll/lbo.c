@@ -22,6 +22,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <mmsystem.h>
+#include "net.h"
 
 // --- Spieladressen ---------------------------------------------------------
 #define ADDR_FRAME_END      0x006E0240  // sub esp,14h / fldz  (5 Bytes)
@@ -57,6 +58,8 @@ enum { MODE_OFF, MODE_RECORD, MODE_SCRIPT };
 typedef struct { char dom; int from, to, pad; PAD p; } LINE;
 
 static int g_mode;
+static int g_net;            // 1 = Lockstep ueber UDP aktiv (net.c)
+static PAD g_net_pad[2];     // synchronisierte Eingaben des aktuellen Frames
 static int g_fixed_dt;
 static int g_max_frames;
 static int g_shot_every;
@@ -228,6 +231,12 @@ static DWORD WINAPI hook_getstate(DWORD idx, XSTATE *st)
 {
     DWORD r;
     g_polls_this_frame++;
+    if (g_net) {
+        if (idx > 1) return ERROR_DEVICE_NOT_CONNECTED;
+        st->Gamepad = g_net_pad[idx];
+        st->dwPacketNumber = (DWORD)g_F;
+        return ERROR_SUCCESS;
+    }
     if (g_mode == MODE_SCRIPT) {
         if (idx > 3 || !g_connected[idx]) return ERROR_DEVICE_NOT_CONNECTED;
         EnterCriticalSection(&g_cs);
@@ -434,6 +443,40 @@ static void write_shot(const char *name)
 }
 
 // --- Frame-Hooks ------------------------------------------------------------------
+// Lockstep: lokale Eingabe abtasten, mit dem Partner austauschen (blockiert bis beide da sind)
+static void net_exchange(long F)
+{
+    NETPAD local, both[2];
+    PAD p;
+    int i;
+    memset(&local, 0, sizeof local);
+    if (g_nlines > 0) {
+        EnterCriticalSection(&g_cs);
+        scripted_state(net_role(), &p);
+        LeaveCriticalSection(&g_cs);
+    } else {
+        XSTATE st;
+        memset(&st, 0, sizeof st);
+        if (real_getstate(0, &st) != ERROR_SUCCESS) memset(&st, 0, sizeof st);
+        p = st.Gamepad;
+    }
+    local.buttons = p.wButtons; local.lt = p.bLeftTrigger; local.rt = p.bRightTrigger;
+    local.lx = p.sThumbLX; local.ly = p.sThumbLY; local.rx = p.sThumbRX; local.ry = p.sThumbRY;
+    local.connected = 1;
+    net_frame((int)F, &local, both);
+    for (i = 0; i < 2; i++) {
+        g_net_pad[i].wButtons = both[i].buttons;
+        g_net_pad[i].bLeftTrigger = both[i].lt; g_net_pad[i].bRightTrigger = both[i].rt;
+        g_net_pad[i].sThumbLX = both[i].lx; g_net_pad[i].sThumbLY = both[i].ly;
+        g_net_pad[i].sThumbRX = both[i].rx; g_net_pad[i].sThumbRY = both[i].ry;
+    }
+    if (F % 3000 == 0) {
+        long stalls, desyncs;
+        net_stats(&stalls, &desyncs);
+        logf_("Netz: %ld Wartephasen, %ld Desyncs bis Frame %ld", stalls, desyncs, F);
+    }
+}
+
 // Bildratenbegrenzung (LBO_FPSCAP): mit festem dt laeuft die Spielzeit sonst so schnell wie die
 // Grafikkarte. Wartet bis zum naechsten 1/fps-Takt (Sleep fuer den Grossteil, Rest aktiv).
 static int g_fps_cap;
@@ -487,13 +530,16 @@ static void sync_background(void)
     if (bg_busy()) {
         g_bg_waits++;
         start = GetTickCount();
+        // Sleep(1) statt Sleep(0): Sleep(0) gibt nur an Threads gleicher Prioritaet ab, der Worker
+        // laeuft aber mit THREAD_PRIORITY_BELOW_NORMAL und verhungert sonst unter Last. Ein Timeout
+        // wuerde den Determinismus brechen (der Job liefe parallel weiter), daher nur eine Notbremse.
         while (bg_busy()) {
-            if (GetTickCount() - start > 5000) {
+            if (GetTickCount() - start > 60000) {
                 g_bg_timeouts++;
-                logf_("Hintergrund-Worker nach 5 s noch beschaeftigt, Frame laeuft weiter");
+                logf_("WARNUNG: Hintergrund-Worker nach 60 s noch beschaeftigt, Frame laeuft weiter (Determinismus nicht mehr garantiert)");
                 break;
             }
-            Sleep(0);
+            Sleep(1);
         }
     }
     if (g_sync_bg >= 2 && G_BG_FREEZE) {
@@ -528,8 +574,10 @@ static void __cdecl on_frame_end(void)
         logf_("Hintergrund-Sync: %ld Wartephasen, %ld Timeouts, %ld Wachhund-Auftauungen", g_bg_waits, g_bg_timeouts, g_bg_unfreezes);
     if (g_fixed_dt) G_DT_OVERRIDE = 1.0f / 60.0f;
     if (g_mode == MODE_SCRIPT) fix_input_slots();
+    if (g_net) net_exchange(F);
 
     snapshot(&s);
+    if (g_net && F % 60 == 0) net_checksum((int)F, s.chars ^ s.rng);
     if (g_csv) {
         fprintf(g_csv, "%ld,%ld,%d,%.6f,%d,%016llx,%016llx,%d,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%d,%lu,%08x,%08x,%08x,%08x,%08x,%08x,%s\n",
                 F, g_W, G_FRAMECOUNT, G_DT_GAME, s.nchars, s.chars, s.rng,
@@ -690,6 +738,24 @@ static void *WINAPI hook_binkopen(const char *name, unsigned flags)
     return real_binkopen(name, flags);
 }
 
+// Einzelinstanz-Sperre (0x527010): CreateMutexA("TTales-{...}") + ERROR_ALREADY_EXISTS beendet die
+// zweite Instanz. Mit LBO_MULTI=1 bekommt der Mutex die PID als Suffix, damit zwei Spiele laufen.
+#define IAT_CREATEMUTEXA 0x02A178F0
+typedef HANDLE (WINAPI *CreateMutexAFn)(LPSECURITY_ATTRIBUTES, BOOL, LPCSTR);
+static CreateMutexAFn real_createmutex;
+static int g_multi;
+
+static HANDLE WINAPI hook_createmutex(LPSECURITY_ATTRIBUTES sa, BOOL owner, LPCSTR name)
+{
+    if (g_multi && name && !strncmp(name, "TTales-", 7)) {
+        char uniq[256];
+        snprintf(uniq, sizeof uniq, "%s-lbo%lu", name, GetCurrentProcessId());
+        logf_("Einzelinstanz-Mutex umbenannt: %s", uniq);
+        return real_createmutex(sa, owner, uniq);
+    }
+    return real_createmutex(sa, owner, name);
+}
+
 static void init(void)
 {
     char buf[MAX_PATH];
@@ -708,6 +774,13 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_MODE", buf, sizeof buf)) {
         if (!_stricmp(buf, "record")) g_mode = MODE_RECORD;
         else if (!_stricmp(buf, "script")) g_mode = MODE_SCRIPT;
+    }
+    // Netzmodus (LBO_NET=host|join): Pads 0 und 1 kommen aus dem Lockstep-Austausch. Die lokale
+    // Eingabe stammt vom echten Pad 0 oder, falls LBO_SCRIPT gesetzt ist, aus dem Skript.
+    g_net = net_init(logf_);
+    if (g_net) {
+        g_mode = MODE_SCRIPT;
+        g_connected[0] = g_connected[1] = 1;
     }
     if (GetEnvironmentVariableA("LBO_FIXEDDT", buf, sizeof buf)) g_fixed_dt = atoi(buf);
     if (GetEnvironmentVariableA("LBO_MAXFRAMES", buf, sizeof buf)) g_max_frames = atoi(buf);
@@ -734,6 +807,8 @@ static void init(void)
     patch_iat(IAT_CREATEFILEA, (void *)hook_createfile, (void **)&real_createfile);
     patch_iat(IAT_DELETEFILEA, (void *)hook_deletefile, (void **)&real_deletefile);
     logf_("Spielstand-Schutz %s", g_allow_save ? "AUS (LBO_ALLOWSAVE)" : "aktiv");
+    if (GetEnvironmentVariableA("LBO_MULTI", buf, sizeof buf)) g_multi = atoi(buf);
+    patch_iat(IAT_CREATEMUTEXA, (void *)hook_createmutex, (void **)&real_createmutex);
     if (GetEnvironmentVariableA("LBO_NOMOVIES", buf, sizeof buf)) g_no_movies = atoi(buf);
     if (GetEnvironmentVariableA("LBO_FPSCAP", buf, sizeof buf)) g_fps_cap = atoi(buf);
     if (GetEnvironmentVariableA("LBO_SYNCBG", buf, sizeof buf)) g_sync_bg = atoi(buf);

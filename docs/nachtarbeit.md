@@ -36,3 +36,6 @@ Phase 1 vorbereiten und den Determinismus-Test aus Phase 0 so weit wie möglich 
   - Bink-Videos (`BinkOpen`) lassen sich mit `LBO_NOMOVIES=1` überspringen. Das Intro ist dagegen eine Echtzeitsequenz.
   - Mit festem dt läuft die Spielzeit so schnell, wie die GPU Bilder liefert (~1000 fps). Deshalb gibt es jetzt `LBO_FPSCAP=60`.
   - Das Pad-Polling in `0x6de440` hängt am Present-Zähler `0x9d08d0`, nicht am Frame. Für den Lockstep muss pro Simulationsschritt genau einmal gepollt werden.
+- 04:05 **Erster Determinismus-Test** (r13/r14, festes dt, gleiches Skript): bitgleich bis F 6668, dann Abweichung beim Betreten der Bathöhle (Figur spawnt einen Frame früher, PRNG kippt). r15/r16 weichen schon beim Übergang Intro→Titel um einen Frame ab. Ursache: asynchroner Lade-Worker `0x6e2cc0` (Job-Schlange `0xb03c68`, Event „BGFreeze" `0xb03bdc`).
+- 04:20 **Mit `LBO_SYNCBG=2`** (Worker nur am Frame-Ende laufen lassen): r17 und r18 über 9000 Frames **vollständig identisch** (Positionen, alle 6 PRNG-Zustände, Figurenliste, Weltupdate-Zähler).
+- 04:45 r19 und r20 (je 12.500 Frames) ebenfalls identisch, auch mit r17. **4 von 4 Läufen bitgleich.** Original-Spielstand weiterhin unverändert.

@@ -522,7 +522,14 @@ static int bg_busy(void)
 static void sync_background(void)
 {
     DWORD start;
+    static int boosted;
     if (!g_sync_bg || !G_BG_QUEUE) return;
+    // Der Worker laeuft mit THREAD_PRIORITY_BELOW_NORMAL und verhungert in einer Hintergrund-
+    // instanz minutenlang. Da wir ohnehin auf ihn warten, darf er normale Prioritaet haben.
+    if (!boosted && *(HANDLE *)0x00B058C4) {
+        SetThreadPriority(*(HANDLE *)0x00B058C4, THREAD_PRIORITY_NORMAL);
+        boosted = 1;
+    }
     if (g_sync_bg >= 2 && G_BG_FREEZE) {
         InterlockedExchange(&g_frozen_since, 0);
         SetEvent(G_BG_FREEZE);
@@ -534,10 +541,14 @@ static void sync_background(void)
         // laeuft aber mit THREAD_PRIORITY_BELOW_NORMAL und verhungert sonst unter Last. Ein Timeout
         // wuerde den Determinismus brechen (der Job liefe parallel weiter), daher nur eine Notbremse.
         while (bg_busy()) {
-            if (GetTickCount() - start > 60000) {
+            // Wurde ein Job eingereiht, waehrend der Worker eingefroren war, kann sein Wecksignal
+            // "BGWorkToDo" (Auto-Reset-Event 0xb03bd8) verloren sein. Ein zusaetzliches Wecken ist
+            // harmlos: findet der Worker keine Arbeit, wartet er einfach weiter.
+            if (*(HANDLE *)0x00B03BD8) SetEvent(*(HANDLE *)0x00B03BD8);
+            if (GetTickCount() - start > 10000) {
                 g_bg_timeouts++;
-                logf_("WARNUNG: Hintergrund-Worker nach 60 s noch beschaeftigt, Frame laeuft weiter (Determinismus nicht mehr garantiert)");
-                break;
+                logf_("Hintergrund-Worker seit 10 s beschaeftigt, warte weiter");
+                start = GetTickCount();
             }
             Sleep(1);
         }

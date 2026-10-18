@@ -10,3 +10,4 @@ build/
 dist/
 app/**/bin/
 app/**/obj/
+dist-neu/

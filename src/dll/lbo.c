@@ -23,6 +23,8 @@
 #include <ctype.h>
 #include <mmsystem.h>
 #include <xmmintrin.h>
+#include <mmreg.h>
+#include <dsound.h>
 #include "net.h"
 #include "input.h"
 
@@ -66,6 +68,8 @@ static int g_fixed_dt;
 static int g_max_frames;
 static int g_stutter_every, g_stutter_ms;
 static long g_fake_desync;
+static int g_owncam, g_owncam_player, g_camlog;
+static void cam_log(long F);
 static int g_shot_every;
 static char g_dir[MAX_PATH];
 static FILE *g_log, *g_csv, *g_rec, *g_liveout;
@@ -765,6 +769,7 @@ static void __cdecl on_frame_end(void)
         g_csv = g_rec = NULL;
         TerminateProcess(GetCurrentProcess(), 0);
     }
+    if (g_camlog > 0 && F % g_camlog == 0) cam_log(F);
     if (g_net) enforce_fpu("Frame-Ende");
     bg_freeze();
 }
@@ -840,6 +845,169 @@ static void patch_iat(DWORD slot, void *fn, void **orig)
     *orig = *(void **)slot;
     *(void **)slot = fn;
     VirtualProtect((void *)slot, 4, old, &old);
+}
+
+// --- Eigene Kamera pro Spieler (LBO_OWNCAM) ----------------------------------------------
+// Die Spiellogik behaelt die gemeinsame Kamera (Objekt *0x95f624, Matrix bei +0xB8), damit der
+// Lockstep synchron bleibt. Nur fuer das Zeichnen des Hauptbilds (Aufruf 0x4af2db der
+// View-Funktion 0x6f1e80) wird die Matrix so verschoben, dass sie der eigenen Figur folgt.
+#define G_GAME_CAMERA   (*(unsigned char *volatile *)0x0095F624)
+#define ADDR_VIEW_CALL  0x004AF2DB
+#define ADDR_SET_VIEW   0x006F1E80
+typedef void (__cdecl *SetViewFn)(const float *m);
+
+static int player_pos(int i, float out[3])
+{
+    const unsigned char *pc = (const unsigned char *)G_PLAYER_SLOTS[i];
+    if (!pc) return 0;
+    memcpy(out, pc + 0x5c, 12);
+    return 1;
+}
+
+static void __cdecl own_view(const float *m)
+{
+    float v[16], me[3], other[3], d[3];
+    int i;
+    memcpy(v, m, sizeof v);
+    __try {
+        if (g_owncam && player_pos(g_owncam_player, me) && player_pos(1 - g_owncam_player, other)) {
+            // Die gemeinsame Kamera zielt auf die Mitte beider Spieler; um die halbe Differenz zur
+            // eigenen Figur verschieben
+            for (i = 0; i < 3; i++) d[i] = (me[i] - other[i]) * 0.5f;
+            if (g_owncam == 1) {
+                // Matrix als Kamera-Weltmatrix: Zeile 3 ist die Augenposition
+                for (i = 0; i < 3; i++) v[12 + i] += d[i];
+            } else {
+                // Matrix als View-Matrix (Zeilenvektoren): t' = t - d * R
+                for (i = 0; i < 3; i++) v[12 + i] -= d[0] * v[0 + i] + d[1] * v[4 + i] + d[2] * v[8 + i];
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    ((SetViewFn)ADDR_SET_VIEW)(v);
+}
+
+static void patch_call(DWORD at, void *to)
+{
+    DWORD old;
+    unsigned char *p = (unsigned char *)at;
+    if (p[0] != 0xE8) { logf_("Kamera: Aufruf bei %08lx nicht gefunden", at); return; }
+    VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+    *(DWORD *)(p + 1) = (DWORD)to - (at + 5);
+    VirtualProtect(p, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+}
+
+// Diagnose LBO_WATCHPOS=1: Hardware-Haltepunkt (DR0) auf die x-Position von Spieler 1. Jede
+// schreibende Codeadresse wird gezaehlt und mit cam_log ausgegeben. So findet man z. B. den Code,
+// der die Spieler im gemeinsamen Bild haelt.
+static int g_watchpos;
+static void *g_watch_addr;
+static struct { DWORD eip; long n; } g_writers[64];
+static int g_nwriters;
+
+static LONG CALLBACK watch_handler(EXCEPTION_POINTERS *e)
+{
+    int i;
+    DWORD eip;
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(e->ContextRecord->Dr6 & 1))
+        return EXCEPTION_CONTINUE_SEARCH;
+    eip = e->ContextRecord->Eip;   // Instruktion nach dem Schreibzugriff
+    for (i = 0; i < g_nwriters && g_writers[i].eip != eip; i++) {}
+    if (i == g_nwriters && g_nwriters < 64) g_writers[g_nwriters++].eip = eip;
+    if (i < 64) g_writers[i].n++;
+    e->ContextRecord->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void watch_set(void *addr)
+{
+    CONTEXT c;
+    if (!g_main_thread || addr == g_watch_addr) return;
+    if (SuspendThread(g_main_thread) == (DWORD)-1) return;
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (GetThreadContext(g_main_thread, &c)) {
+        c.Dr0 = (DWORD)addr;
+        c.Dr7 = (c.Dr7 & ~0x000F0003u) | 1u | (1u << 16) | (3u << 18);  // L0, nur Schreiben, 4 Byte
+        SetThreadContext(g_main_thread, &c);
+        g_watch_addr = addr;
+        logf_("Positionswaechter auf %p", addr);
+    }
+    ResumeThread(g_main_thread);
+}
+
+static DWORD WINAPI watch_thread(void *arg)
+{
+    (void)arg;
+    AddVectoredExceptionHandler(1, watch_handler);
+    for (;;) {
+        Sleep(500);
+        __try {
+            const unsigned char *pc = (const unsigned char *)G_PLAYER_SLOTS[0];
+            if (pc) watch_set((void *)(pc + 0x5c));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+}
+
+static void cam_log(long F)
+{
+    if (g_watchpos && g_nwriters) {
+        char line[1024];
+        int i, len = snprintf(line, sizeof line, "Schreiber P1.x:");
+        for (i = 0; i < g_nwriters && len < 980; i++) len += snprintf(line + len, sizeof line - len, " %08lx:%ld", g_writers[i].eip, g_writers[i].n);
+        logf_("%s", line);
+    }
+    float p0[3] = {0}, p1[3] = {0};
+    const float *m, *r;
+    unsigned f0 = 0, f1 = 0;
+    __try {
+        if (!G_GAME_CAMERA) return;
+        m = (const float *)(G_GAME_CAMERA + 0xB8);
+        r = *(const float **)0x00A96128;
+        if (player_pos(0, p0)) f0 = *(const unsigned *)((const unsigned char *)G_PLAYER_SLOTS[0] + 0x1fc);
+        if (player_pos(1, p1)) f1 = *(const unsigned *)((const unsigned char *)G_PLAYER_SLOTS[1] + 0x1fc);
+        logf_("Kamera F%ld: M=[%.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f] "
+              "R3=[%.2f %.2f %.2f] P1=(%.2f %.2f %.2f) f%x P2=(%.2f %.2f %.2f) f%x",
+              F, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15],
+              r ? r[12] : 0, r ? r[13] : 0, r ? r[14] : 0, p0[0], p0[1], p0[2], f0, p1[0], p1[1], p1[2], f1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// --- Ton auch ohne Fensterfokus ---------------------------------------------------------
+// DirectSound schaltet Puffer ohne DSBCAPS_GLOBALFOCUS stumm, solange das Spielfenster nicht im
+// Vordergrund ist. Das Spiel wird aus der App gestartet und bekommt den Fokus oft nicht; Eingaben
+// funktionieren trotzdem (die Mod liest die Controller selbst), der Ton fehlte aber.
+typedef HRESULT (WINAPI *DSCreate8Fn)(const GUID *, void **, void *);
+typedef HRESULT (__stdcall *CreateSoundBufferFn)(void *self, const DSBUFFERDESC *desc, void **buf, void *outer);
+static DSCreate8Fn real_dscreate8;
+static CreateSoundBufferFn real_createbuffer;
+static long g_globalfocus_buffers;
+
+static HRESULT __stdcall hook_createbuffer(void *self, const DSBUFFERDESC *desc, void **buf, void *outer)
+{
+    DSBUFFERDESC d;
+    if (desc && !(desc->dwFlags & DSBCAPS_PRIMARYBUFFER) && desc->dwSize <= sizeof d) {
+        memset(&d, 0, sizeof d);
+        memcpy(&d, desc, desc->dwSize);
+        d.dwFlags |= DSBCAPS_GLOBALFOCUS;
+        if (g_globalfocus_buffers++ == 0) logf_("Ton: Puffer mit DSBCAPS_GLOBALFOCUS (spielt auch ohne Fensterfokus)");
+        return real_createbuffer(self, &d, buf, outer);
+    }
+    return real_createbuffer(self, desc, buf, outer);
+}
+
+static HRESULT WINAPI hook_dscreate8(const GUID *dev, void **out, void *outer)
+{
+    HRESULT hr = real_dscreate8(dev, out, outer);
+    if (SUCCEEDED(hr) && out && *out && !real_createbuffer) {
+        void **vtbl = *(void ***)*out;   // IDirectSound8: 0-2 IUnknown, 3 CreateSoundBuffer
+        DWORD old;
+        VirtualProtect(&vtbl[3], 4, PAGE_READWRITE, &old);
+        real_createbuffer = (CreateSoundBufferFn)vtbl[3];
+        vtbl[3] = (void *)hook_createbuffer;
+        VirtualProtect(&vtbl[3], 4, old, &old);
+        logf_("Ton: DirectSound8 erzeugt, CreateSoundBuffer umgeleitet");
+    }
+    return hr;
 }
 
 // Das Spiel ignoriert Pad-Eingaben und haelt in 0x6e0240 an, solange sein Fenster nicht aktiv ist
@@ -1008,6 +1176,18 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_MAXFRAMES", buf, sizeof buf)) g_max_frames = atoi(buf);
     if (GetEnvironmentVariableA("LBO_STUTTER", buf, sizeof buf)) sscanf(buf, "%d %d", &g_stutter_every, &g_stutter_ms);
     if (GetEnvironmentVariableA("LBO_FAKEDESYNC", buf, sizeof buf)) g_fake_desync = atol(buf);
+    if (GetEnvironmentVariableA("LBO_CAMLOG", buf, sizeof buf)) g_camlog = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_WATCHPOS", buf, sizeof buf) && (g_watchpos = atoi(buf)) != 0)
+        CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
+    if (GetEnvironmentVariableA("LBO_OWNCAM", buf, sizeof buf)) {
+        g_owncam = atoi(buf);
+        // Eigene Figur: im Netz die eigene Rolle (Host = Spieler 1), sonst LBO_OWNCAM_PLAYER
+        g_owncam_player = g_net ? net_role() : (GetEnvironmentVariableA("LBO_OWNCAM_PLAYER", buf, sizeof buf) ? atoi(buf) : 0);
+        if (g_owncam) {
+            patch_call(ADDR_VIEW_CALL, (void *)own_view);
+            logf_("Kamera: eigene Kamera fuer Spieler %d (Modus %d)", g_owncam_player + 1, g_owncam);
+        }
+    }
     if (GetEnvironmentVariableA("LBO_NODIALOG", buf, sizeof buf)) g_no_dialog = atoi(buf);
     if (GetEnvironmentVariableA("LBO_SHOT_EVERY", buf, sizeof buf)) g_shot_every = atoi(buf);
     if (g_mode == MODE_SCRIPT && GetEnvironmentVariableA("LBO_SCRIPT", buf, sizeof buf)) load_script(buf);
@@ -1030,6 +1210,11 @@ static void init(void)
     patch_iat(IAT_XINPUT_GETSTATE, (void *)hook_getstate, (void **)&real_getstate);
     patch_iat(IAT_XINPUT_GETCAPS, (void *)hook_getcaps, (void **)&real_getcaps);
     if (GetEnvironmentVariableA("LBO_ALLOWSAVE", buf, sizeof buf)) g_allow_save = atoi(buf);
+    {
+        void **ds = find_iat_slot(GetProcAddress(GetModuleHandleA("dsound.dll"), (LPCSTR)11));  // DirectSoundCreate8
+        if (ds) patch_iat((DWORD)ds, (void *)hook_dscreate8, (void **)&real_dscreate8);
+        else logf_("Ton: DirectSoundCreate8 nicht in der Importtabelle gefunden");
+    }
     patch_iat(IAT_CREATEFILEA, (void *)hook_createfile, (void **)&real_createfile);
     patch_iat(IAT_DELETEFILEA, (void *)hook_deletefile, (void **)&real_deletefile);
     logf_("Spielstand-Schutz %s", g_allow_save ? "AUS (LBO_ALLOWSAVE)" : "aktiv");

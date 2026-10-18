@@ -50,7 +50,7 @@ Aus dem Abbild entsteht eine analysierbare PE-Datei: Jeder Abschnitt liegt dort 
 
 Aufrufkette bei `EndScene` (außen → innen): CRT `0xbd1f3b` → `0x640455` → `0x7e7010` → `0x7e6cd0` → `0x5528c0` → `0x5bc2d0` → … → Zeichnen.
 
-Ghidra-Projekt: `runsatman2\ghidra` (headless analysiert, 20 MB). Dekompilieren mit `tools\ghidra\decompile.bat <ausgabe.txt> 0xADR …`.
+Ghidra-Projekt: `runs\batman2\ghidra` (headless analysiert, 20 MB). Dekompilieren mit `tools\ghidra\decompile.bat <ausgabe.txt> 0xADR …`.
 
 | Funktion | Inhalt | Batman 1 |
 |---|---|---|

@@ -660,7 +660,11 @@ static DWORD WINAPI desync_notice(void *arg)
 }
 
 // Wachhund: Wartet der Hauptthread mitten im Frame selbst auf einen Job, kaeme er nie zum
-// Frame-Ende. Dann tauen wir den Worker nach 500 ms auf.
+// Frame-Ende. Dann tauen wir den Worker auf. Das ist nur eine Notbremse: In allen protokollierten
+// Faellen hing der Hauptthread woanders (Geraetesuche von DirectInput beim Start und mitten im
+// Spiel, 0x528xxx), und der dann parallel laufende Worker liess die Spiele auseinanderlaufen.
+// Daher erst nach 10 s, was keine Geraetesuche und kein Ruckler erreicht.
+#define BG_WATCHDOG_MS 10000
 static HANDLE g_main_thread;
 
 // Diagnose: Wo steht der Hauptthread, wenn der Wachhund auftauen muss? Schreibt EIP und die
@@ -696,7 +700,7 @@ static DWORD WINAPI bg_watchdog(void *arg)
     for (;;) {
         LONG since = g_frozen_since;
         Sleep(50);
-        if (since && g_frozen_since == since && GetTickCount() - (DWORD)since > 500 && G_BG_FREEZE) {
+        if (since && g_frozen_since == since && GetTickCount() - (DWORD)since > BG_WATCHDOG_MS && G_BG_FREEZE) {
             log_main_stack();
             InterlockedExchange(&g_frozen_since, 0);
             SetEvent(G_BG_FREEZE);
@@ -711,7 +715,7 @@ static void __cdecl on_frame_end(void)
     long F = InterlockedIncrement(&g_F);
     if (!g_main_thread)
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_main_thread,
-                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0);
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0);
     sync_background();
     cap_frame_rate();
     if (F % 3000 == 0 && g_sync_bg)
@@ -852,9 +856,7 @@ static void patch_iat(DWORD slot, void *fn, void **orig)
 // Lockstep synchron bleibt. Nur fuer das Zeichnen des Hauptbilds (Aufruf 0x4af2db der
 // View-Funktion 0x6f1e80) wird die Matrix so verschoben, dass sie der eigenen Figur folgt.
 #define G_GAME_CAMERA   (*(unsigned char *volatile *)0x0095F624)
-#define ADDR_VIEW_CALL  0x004AF2DB
 #define ADDR_SET_VIEW   0x006F1E80
-typedef void (__cdecl *SetViewFn)(const float *m);
 
 static int player_pos(int i, float out[3])
 {
@@ -864,38 +866,64 @@ static int player_pos(int i, float out[3])
     return 1;
 }
 
-static void __cdecl own_view(const float *m)
+static float g_own_matrix[16];
+static long g_own_hits;
+
+// Wird am Anfang von 0x6f1e80 (Kamera-Weltmatrix an den Renderer) aufgerufen. Ist es die Matrix der
+// Spielkamera, liefert sie eine zur eigenen Figur verschobene Kopie; alle anderen Matrizen
+// (Schatten, Spiegelungen, Menues) bleiben unveraendert.
+static const float *__cdecl view_filter(const float *m)
 {
-    float v[16], me[3], other[3], d[3];
+    float me[3], other[3];
     int i;
-    memcpy(v, m, sizeof v);
     __try {
-        if (g_owncam && player_pos(g_owncam_player, me) && player_pos(1 - g_owncam_player, other)) {
-            // Die gemeinsame Kamera zielt auf die Mitte beider Spieler; um die halbe Differenz zur
-            // eigenen Figur verschieben
-            for (i = 0; i < 3; i++) d[i] = (me[i] - other[i]) * 0.5f;
-            if (g_owncam == 1) {
-                // Matrix als Kamera-Weltmatrix: Zeile 3 ist die Augenposition
-                for (i = 0; i < 3; i++) v[12 + i] += d[i];
-            } else {
-                // Matrix als View-Matrix (Zeilenvektoren): t' = t - d * R
-                for (i = 0; i < 3; i++) v[12 + i] -= d[0] * v[0 + i] + d[1] * v[4 + i] + d[2] * v[8 + i];
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    ((SetViewFn)ADDR_SET_VIEW)(v);
+        const float *cam;
+        if (g_owncam == 9) return m;   // Diagnose: Haken ohne Wirkung
+        if (!g_owncam || !G_GAME_CAMERA || G_CHAR_COUNT <= 0) return m;   // nur im Level, nie in Menues
+        cam = (const float *)(G_GAME_CAMERA + 0xB8);
+        if (memcmp(m, cam, 64) != 0) return m;
+        if (!player_pos(g_owncam_player, me) || !player_pos(1 - g_owncam_player, other)) return m;
+        memcpy(g_own_matrix, m, 64);
+        // Die gemeinsame Kamera zielt auf die Mitte beider Spieler: um die halbe Differenz zur
+        // eigenen Figur verschieben (Zeile 3 der Weltmatrix ist die Augenposition)
+        for (i = 0; i < 3; i++) g_own_matrix[12 + i] += (me[i] - other[i]) * 0.5f;
+        if (g_own_hits++ < 3) logf_("Kamera: Ersetzung Nr. %ld bei Frame %ld", g_own_hits, g_F);
+        if (g_owncam == 8) return m;   // Diagnose: alles berechnen, aber nichts ersetzen
+        return g_own_matrix;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return m;
+    }
 }
 
-static void patch_call(DWORD at, void *to)
+// Alle Register und Flags bleiben erhalten: Der Aufrufer kann sich (Optimierung ueber Funktionsgrenzen)
+// darauf verlassen, dass z. B. ECX/EDX den Aufruf von 0x6f1e80 unveraendert ueberstehen.
+static const float *g_view_arg;
+
+__declspec(naked) static void stub_set_view(void)
 {
-    DWORD old;
-    unsigned char *p = (unsigned char *)at;
-    if (p[0] != 0xE8) { logf_("Kamera: Aufruf bei %08lx nicht gefunden", at); return; }
-    VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
-    *(DWORD *)(p + 1) = (DWORD)to - (at + 5);
-    VirtualProtect(p, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    __asm {
+        pushad
+        pushfd
+        mov eax, dword ptr [esp + 40]     // Argument: 36 Byte pushad/pushfd + Ruecksprungadresse
+        push eax
+        call view_filter
+        add esp, 4
+        mov g_view_arg, eax
+        popfd
+        popad
+        push eax
+        mov eax, g_view_arg
+        mov dword ptr [esp + 8], eax      // Argument ersetzen (nach push eax um 4 verschoben)
+        pop eax
+        // ueberschriebener Anfang von 0x6f1e80: mov eax,[esp+4]; push esi; push edi
+        mov eax, dword ptr [esp + 4]
+        push esi
+        push edi
+        push 006F1E86h
+        ret
+    }
 }
+
 
 // Diagnose LBO_WATCHPOS=1: Hardware-Haltepunkt (DR0) auf die x-Position von Spieler 1. Jede
 // schreibende Codeadresse wird gezaehlt und mit cam_log ausgegeben. So findet man z. B. den Code,
@@ -969,6 +997,7 @@ static void cam_log(long F)
               "R3=[%.2f %.2f %.2f] P1=(%.2f %.2f %.2f) f%x P2=(%.2f %.2f %.2f) f%x",
               F, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15],
               r ? r[12] : 0, r ? r[13] : 0, r ? r[14] : 0, p0[0], p0[1], p0[2], f0, p1[0], p1[1], p1[2], f1);
+        if (g_owncam) logf_("Kamera: %ld Hauptbild-Matrizen ersetzt", g_own_hits);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -1184,8 +1213,9 @@ static void init(void)
         // Eigene Figur: im Netz die eigene Rolle (Host = Spieler 1), sonst LBO_OWNCAM_PLAYER
         g_owncam_player = g_net ? net_role() : (GetEnvironmentVariableA("LBO_OWNCAM_PLAYER", buf, sizeof buf) ? atoi(buf) : 0);
         if (g_owncam) {
-            patch_call(ADDR_VIEW_CALL, (void *)own_view);
-            logf_("Kamera: eigene Kamera fuer Spieler %d (Modus %d)", g_owncam_player + 1, g_owncam);
+            static const unsigned char pro_view[5] = { 0x8B, 0x44, 0x24, 0x04, 0x56 };
+            logf_("Kamera: eigene Kamera fuer Spieler %d, Hook %d", g_owncam_player + 1,
+                  patch_jmp(ADDR_SET_VIEW, (void *)stub_set_view, pro_view));
         }
     }
     if (GetEnvironmentVariableA("LBO_NODIALOG", buf, sizeof buf)) g_no_dialog = atoi(buf);

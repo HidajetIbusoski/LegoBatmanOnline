@@ -12,7 +12,7 @@ launcher = sys.argv[1]
 seconds = int(sys.argv[2]) if len(sys.argv) > 2 else 60
 W = os.path.join(os.environ["LOCALAPPDATA"], "LegoBatmanOnline", "welten", "wA")
 saves = [os.path.join(W, x, "spielstand") for x in os.listdir(W)][0]
-env = dict(os.environ, LBO_WINDOWED="1", LBO_ALLOWSAVE="0", LBO_MAXFRAMES=str(seconds * 60 + 600))
+env = dict(os.environ, LBO_WINDOWED="1", LBO_MULTI="1", LBO_ALLOWSAVE="0", LBO_MAXFRAMES=str(seconds * 60 + 600))
 p = subprocess.Popen([launcher, "--solo", "--savedir", saves], stdout=subprocess.PIPE, text=True, env=env)
 u = ctypes.windll.user32
 t0 = time.time()

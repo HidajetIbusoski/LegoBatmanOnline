@@ -8,7 +8,7 @@ Ergebnis: Anzahl DESYNC-Meldungen im Host-Log und erster betroffener Frame.
 import os, re, subprocess, sys, threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LAUNCHER = os.path.join(ROOT, "build", "lbo-launch.exe")
+LAUNCHER = os.environ.get("LBO_TEST_LAUNCHER") or os.path.join(ROOT, "build", "lbo-launch.exe")
 REAL_CFG = os.path.join(os.environ["LOCALAPPDATA"], "Warner Bros. Interactive Entertainment", "LEGO Batman", "pcconfig.txt")
 TMP = os.path.join(ROOT, "runs", "cfgtest")
 
@@ -18,11 +18,14 @@ frames = "4500"
 both = False
 changes = {}
 gast_env = {}
+scripts = False  # --skript: Menues und Spieler 2 per net_host.txt/net_join.txt statt Autoload
 focus = None  # (sekunde, art): art = msg (WM_ACTIVATEAPP), min (minimieren), fg (Fokus wegnehmen)
 while args:
     a = args.pop(0)
     if a == "--frames":
         frames = args.pop(0)
+    elif a == "--skript":
+        scripts = True
     elif a == "--both":
         both = True
     elif a == "--gast-focus":
@@ -117,9 +120,13 @@ def run(role, me, peer, cfg):
     env = dict(os.environ, LBO_MULTI="1", LBO_WINDOWED="1", LBO_ALLOWSAVE="0", LBO_MAXFRAMES=frames, LBO_PCCONFIG=cfg)
     if role == "join":
         env.update(gast_env)
-    p = subprocess.Popen([LAUNCHER, "--connect", role, "--port", me["port"], "--key", me["key"],
-                          "--peer-key", peer["key"], "--peer-public", peer["public"], "--peer-local", peer["local"],
-                          "--slot", "0"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    cmd = [LAUNCHER, "--connect", role, "--port", me["port"], "--key", me["key"],
+           "--peer-key", peer["key"], "--peer-public", peer["public"], "--peer-local", peer["local"]]
+    if scripts:
+        env["LBO_SCRIPT"] = os.path.join(ROOT, "tools", "scripts", "net_host.txt" if role == "host" else "net_join.txt")
+    else:
+        cmd += ["--slot", "0"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     for line in p.stdout:
         m = re.search(r"PID (\d+)", line)
         if m:

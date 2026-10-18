@@ -39,6 +39,34 @@ Aus dem Abbild entsteht eine analysierbare PE-Datei: Jeder Abschnitt liegt dort 
 | Einzelinstanz | `CreateMutexA` in `0x635530`; Fensterklassen `TTalesWindow`, `TTalesAdditionalWindow` | Mutex `TTales-{…}` in `0x527010` |
 | Speichern | Strings `SaveGame`, `pcconfig` vorhanden (`0xd16000`, `0xeca118`) | `Saved Games`-Pfad |
 
+
+## Laufzeit-Sonde und Hauptschleife (18.10.2026, abends)
+
+`src/dump/probe.c` → `build/probe.dll`:
+- Die Sonde biegt den `Direct3DCreate9`-Aufruf des Spiels (`0x63e59a` → Thunk `0xbcc518`) um, sobald der Code entschlüsselt ist (nach ~10 ms). Dann hakt sie `CreateDevice` und am Spielgerät `EndScene` (Vtable-Index 42).
+- `Present` des Geräts ruft das Spiel nicht auf. Die Vtables liegen auf dem Heap, Direct3D ist also umhüllt: ein eigenes Hilfsgerät hätte eine andere Vtable.
+- Im exklusiven Vollbild ohne Fokus zeichnet das Spiel nicht. Für Tests deshalb `-- -Windowed` übergeben.
+- Ohne Bildratenbremse läuft das Spiel mit etwa 330 Bildern pro Sekunde.
+
+Aufrufkette bei `EndScene` (außen → innen): CRT `0xbd1f3b` → `0x640455` → `0x7e7010` → `0x7e6cd0` → `0x5528c0` → `0x5bc2d0` → … → Zeichnen.
+
+Ghidra-Projekt: `runsatman2\ghidra` (headless analysiert, 20 MB). Dekompilieren mit `tools\ghidra\decompile.bat <ausgabe.txt> 0xADR …`.
+
+| Funktion | Inhalt | Batman 1 |
+|---|---|---|
+| `0x7e7010` | Hauptschleife: Spielobjekt `*0x1389e8c` anlegen, `do { Schritt (Vtable +0x18) } while` | `0x4b01d0`-Umfeld |
+| `0x7e6cd0` | Spielschritt; ruft das Frame-Ende auf (beim Laden über `0x11cf0b8` zusätzlich), prüft per `0x7e9e80` (kritischer Abschnitt `0x138b9f8`), ob der Worker beschäftigt ist | Levelschleife |
+| `0x5528c0` | Frame-Ende: dt per Timer nach `0x11cf0dc`; Begrenzung auf 0,1 (`0xcf30c4`); **Überschreibung `if (0x11cf0f8 != 0) dt = 0x11cf0f8`**; Frame-Zähler `0x11cf0e4`; Zeichnen `0x5bc2d0(1, Breite 0x11cc120, Höhe 0x11cc124)`; Gesamtzeit `0x11cf104`; am Ende `ReleaseSemaphore` für einen wartenden Thread (`*0x11cc114 + 0x8050`) | `0x6e0240`, Überschreibung `0xadf690`, Zähler `0xadf68c` |
+
+**Folgerung:** Die Engine ist dieselbe Familie wie bei Batman 1. Fester Zeitschritt, Frame-Ende-Haken und Bildratenbremse lassen sich direkt übertragen: dt-Überschreibung `0x11cf0f8 = 1/60`, Haken am Anfang von `0x5528c0`.
+
+## Nächste Schritte (aktualisiert)
+
+1. Spielerplätze und Figurenarray finden (Position, Spieler-Flag), z. B. über die XInput-Kette (`0xc55334`) zur Pad-Zuordnung.
+2. Job-System untersuchen: Wer wartet auf `ReleaseSemaphore` in `0x5528c0`, welche Jobs laufen parallel zur Simulation?
+3. `lbo.dll` mit einer Adresstabelle pro Spiel bauen (Batman 1 / Batman 2), zuerst für Batman 2: Frame-Ende-Haken, festes dt, Bildratenbremse, Zufalls-Prüfsumme (`0x11a1840`, `0x11a1844`, `0x102b358`, CRT).
+4. Determinismus-Test mit Eingabeskript.
+
 ## Erste Einschätzung
 
 - **Vorteil:** Batman 2 rechnet die Logik offenbar schon mit festem 60-Hz-Schritt. Den Zeitschritt müsste man dann nicht mehr erzwingen, nur noch die Bildrate takten.

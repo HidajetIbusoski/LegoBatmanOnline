@@ -6,17 +6,21 @@ import csv, os, sys
 IGNORE = {'ms'}
 
 
-def load(run):
+def load(run, key='F'):
     with open(os.path.join(run, 'frames.csv'), newline='') as f:
-        return {int(r['F']): r for r in csv.DictReader(f)}
+        rows = csv.DictReader(f)
+        return {int(r[key]): r for r in rows if r.get(key) not in (None, '') and int(r[key]) >= 0}
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith('--')]
-    start = 1
+    # --anker: Zeilen ueber die Spalte "rel" (Frames ab Levelanker, LBO_ANCHOR) statt ueber F zuordnen
+    key = 'rel' if '--anker' in sys.argv else 'F'
+    args = [a for a in sys.argv[1:] if not a.startswith('--') and not a.lstrip('-').isdigit()]
+    start = 0 if key == 'rel' else 1
     if '--ab' in sys.argv:
         start = int(sys.argv[sys.argv.index('--ab') + 1])
-    a, b = load(args[0]), load(args[1])
+    a, b = load(args[0], key), load(args[1], key)
+    IGNORE.update({'F', 'rel', 'game_frame'} if key == 'rel' else set())
     frames = sorted(f for f in set(a) & set(b) if f >= start)
     if not frames:
         print('keine gemeinsamen Frames')

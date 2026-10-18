@@ -170,8 +170,10 @@ static void parse_script_line(char *s)
         if (pad >= 0 && pad < 4 && !g_connected[pad]) { g_connected[pad] = 1; g_devchange = 1; }
         return;
     }
-    if (s[0] == 'F' && sscanf(s + 1, "%d %d %n", &l.from, &l.to, &n) == 2 && parse_pad(s + 1 + n, &l.pad, &l.p)) {
-        l.dom = 'F';
+    // F: absolute Frames; A: Frames ab dem Levelanker (LBO_ANCHOR)
+    if ((s[0] == 'F' || s[0] == 'A') && sscanf(s + 1, "%d %d %n", &l.from, &l.to, &n) == 2 &&
+        parse_pad(s + 1 + n, &l.pad, &l.p)) {
+        l.dom = s[0];
         add_line(&l);
         if (!g_connected[l.pad]) { g_connected[l.pad] = 1; g_devchange = 1; }
         return;
@@ -189,13 +191,19 @@ static void load_script(const char *path)
     logf_("Skript %s: %d Zeilen", path, g_nlines);
 }
 
+// LBO_ANCHOR=1: Levelanker = erster Frame mit mehr als 2 Figuren. Dort werden die Zustaende abgeglichen
+// (wie online beim Levelstart) und "A"-Skriptzeilen zaehlen ab hier.
+static int g_anchor_mode;
+static volatile long g_anchor = -1;
+
 static void scripted_state(int pad, PAD *out)
 {
     int i;
     memset(out, 0, sizeof *out);
     for (i = 0; i < g_nlines; i++) {
         const LINE *l = &g_lines[i];
-        if (l->pad == pad && g_F >= l->from && (l->to < 0 || g_F <= l->to)) *out = l->p;
+        long t = l->dom == 'A' ? (g_anchor < 0 ? -1 : g_F - g_anchor) : g_F;
+        if (l->pad == pad && t >= l->from && (l->to < 0 || t <= l->to)) *out = l->p;
     }
 }
 
@@ -796,6 +804,40 @@ static int loads_in_flight(int *first_state)
 
 // LBO_LOADSYNC: Laden und Entladen werden innerhalb des Frames fertig, in dem die Spiellogik sie anfordert.
 // So erscheinen Figuren und Levelteile an festen Frames, unabhaengig von der Ladezeit.
+// LBO_IOWAIT=1: Datei-Threads des Spiels (Thread-Tabelle 0x102dbe0, Abstand 0xb4, Handle +0xa8):
+// 2 m_readThread, 3 m_decodeThread, 4 TextureDecode. Das Frame-Ende wartet, bis keiner von ihnen
+// 3 ms lang gerechnet hat (QueryThreadCycleTime), hoechstens 500 ms.
+static int g_iowait;
+static long g_io_waits, g_io_timeouts;
+
+static ULONG64 io_cycles(void)
+{
+    static const int idx[3] = { 2, 3, 4 };
+    ULONG64 sum = 0, c;
+    int i;
+    for (i = 0; i < 3; i++) {
+        HANDLE h = *(HANDLE *)(0x0102DBE0 + idx[i] * 0xB4 + 0xA8);
+        if (h && QueryThreadCycleTime(h, &c)) sum += c;
+    }
+    return sum;
+}
+
+static void wait_io(void)
+{
+    DWORD t0 = GetTickCount();
+    ULONG64 prev = io_cycles(), now;
+    int waited = 0;
+    for (;;) {
+        Sleep(3);
+        now = io_cycles();
+        if (now == prev) break;
+        prev = now;
+        waited = 1;
+        if (GetTickCount() - t0 > 500) { g_io_timeouts++; break; }
+    }
+    if (waited) g_io_waits++;
+}
+
 static void wait_loads(void)
 {
     DWORD t0 = GetTickCount();
@@ -1019,6 +1061,8 @@ static void __cdecl on_frame_end(void)
     if (g_mode == MODE_SCRIPT) G_WINDOW_ACTIVE = 1;
     if (g_bgsync == 2) bg_wait_idle();
     if (g_loadsync) wait_loads();
+    if (g_iowait) wait_io();
+    if (g_iowait && F % 3000 == 0) logf_("Datei-Threads: %ld Wartephasen, %ld Zeitgrenzen", g_io_waits, g_io_timeouts);
     if (F % 3000 == 0 && g_loadsync) logf_("Laden: %ld Wartephasen, %ld Zeitgrenzen", g_load_waits, g_load_timeouts);
     if (F % 3000 == 0 && g_bgsync == 2) logf_("NuBgProc: %ld Wartephasen, %ld Zeitgrenzen", g_bg_waits, g_bg_timeouts);
     if (g_bgsync == 1 && G_BGPROC && !G_BGPROC[BGPROC_SYNC]) {
@@ -1027,12 +1071,24 @@ static void __cdecl on_frame_end(void)
     }
     if (g_devchange) { g_devchange = 0; notify_devchange(); }
     if (g_rng_reset && F == g_rng_reset) reset_rng();
+    if (g_anchor_mode && g_anchor < 0 && G_CHAR_COUNT > 2) {
+        g_anchor = F;
+        reset_rng();
+        logf_("Levelanker bei Frame %ld", F);
+    }
     if (g_csv) {
         char_snapshot(&cs);
         __try {
-            fprintf(g_csv, "%ld,%d,%.6f,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%d,%d,%08x,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%lu\n", F, G_FRAMECOUNT,
+            int st, inflight = loads_in_flight(&st), *ll = G_LOADLIST;
+            unsigned char *q = G_BGPROC;
+            int *cur = (int *)G_BGPROC_CURRENT;
+            fprintf(g_csv, "%ld,%d,%.6f,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%d,%d,%08x,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                    "%d,%d,%d,%d,%d,%d,%ld,%08x,%d,%d,%ld,%lu\n", F, G_FRAMECOUNT,
                     G_DT, G_RNG_PM_SEED, G_RNG_LCG16, G_RNG_PM_DEFAULT, G_RNG_A, G_RNG_B, G_RNG_C, crt_rand_state(), g_polls, cs.n, cs.hash,
-                    cs.p1[0], cs.p1[1], cs.p1[2], cs.p2[0], cs.p2[1], cs.p2[2], GetTickCount() - g_t0);
+                    cs.p1[0], cs.p1[1], cs.p1[2], cs.p2[0], cs.p2[1], cs.p2[2],
+                    *(int *)0x011CF178, *(int *)0x0131356C, *(int *)0x01313574, *(int *)0x0131359C, *(int *)0x013135B0,
+                    *(int *)0x01313568, q ? *(LONG *)(q + BGPROC_PENDING) : -1, cur ? cur[2] : 0, ll ? ll[2] : -1, inflight,
+                    g_anchor < 0 ? -1L : F - g_anchor, GetTickCount() - g_t0);
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         if (F % 60 == 0) fflush(g_csv);
         if (g_trace && F == g_trace_to + 1) fflush(g_trace);
@@ -1184,6 +1240,8 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_VCLOCK", buf, sizeof buf)) g_vclock = atoi(buf);
     if (GetEnvironmentVariableA("LBO_WATCHLCG", buf, sizeof buf)) g_watch_lcg = atoi(buf);
     if (GetEnvironmentVariableA("LBO_RENDERRNG", buf, sizeof buf)) g_render_rng = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_ANCHOR", buf, sizeof buf)) g_anchor_mode = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_IOWAIT", buf, sizeof buf)) g_iowait = atoi(buf);
     if (GetEnvironmentVariableA("LBO_TRACERNG", buf, sizeof buf) && sscanf(buf, "%d,%d", &g_trace_from, &g_trace_to) == 2)
         g_trace = open_out("rngtrace.txt", "w");
     if (GetEnvironmentVariableA("LBO_RNGRESET", buf, sizeof buf)) g_rng_reset = atoi(buf);
@@ -1195,7 +1253,7 @@ static void init(void)
     }
     logf_("Spielstand-Schutz %s", g_allow_save ? "AUS (LBO_ALLOWSAVE)" : "aktiv");
     g_csv = open_out("frames.csv", "w");
-    if (g_csv) fprintf(g_csv, "F,game_frame,dt,rng_pm_seed,rng_lcg16,rng_pm_default,rng_a,rng_b,rng_c,crt_rand,polls,chars,char_hash,p1x,p1y,p1z,p2x,p2y,p2z,ms\n");
+    if (g_csv) fprintf(g_csv, "F,game_frame,dt,rng_pm_seed,rng_lcg16,rng_pm_default,rng_a,rng_b,rng_c,crt_rand,polls,chars,char_hash,p1x,p1y,p1z,p2x,p2y,p2z,vid,fmv_a,fmv_b,fmv_c,fmv_d,fmv_frame,bg_pend,bg_job,ll_n,ll_loading,rel,ms\n");
     logf_("Modus %d, festes dt %d, fps %d, max Frames %d, Screenshot alle %d, Mehrfach %d", g_mode, g_fixed_dt,
           g_fps_cap, g_max_frames, g_shot_every, g_multi);
     logf_("NuBgProc synchron %d, ohne Videos %d, Zufalls-Reset bei Frame %d, Lade-Sync %d, Video-dt fest %d, virtuelle Uhr %d", g_bgsync,

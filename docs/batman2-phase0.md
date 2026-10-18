@@ -171,6 +171,8 @@ Ursachen für Abweichungen und was die DLL dagegen tut:
 | Eingabe-Takt | `0x63bcd0` liest pro Frame nur ein Gerät, reihum (Countdown `0x1154400`, Gerät `0x13666c8`, Flag `0x13655a7`). Jedes Pad wird alle 5 Frames gelesen. | Diese drei Werte gehören zum Abgleich (`LBO_RNGRESET`) |
 | Programmstart | Das erste Laden (132 Einträge, Frame ~10) braucht den Hauptthread; Zufallszustände laufen ab Frame 6 auseinander | Abgleichpunkt nötig: online übernimmt der Gast die Zustände vom Host, lokal `LBO_RNGRESET=<Frame>` |
 
+Weitere Schalter: `LBO_ANCHOR=1` (Levelanker: Abgleich beim ersten Frame mit mehr als 2 Figuren, Skriptzeilen `A von bis …` zählen ab dort; `compare_b2.py --anker`), `LBO_IOWAIT=1` (siehe k2).
+
 Diagnose-Hilfen: `LBO_TRACERNG=von,bis` schreibt die Aufrufer von `rng_a` und CRT-`rand` je Frame nach `rngtrace.txt`. `LBO_WATCHLCG=1` setzt zusätzlich in allen Threads einen Hardware-Haltepunkt auf den LCG (Schreibzugriffe mit Codeadresse und Thread).
 
 Leere Ordner `SavedGames\SlotN` zeigt das Spiel als „beschädigt“ an und fragt dann nach einem Speicherplatz. Im Schutzmodus legt die DLL sie deshalb gar nicht erst an (`CreateDirectoryA`, `SHCreateDirectoryExA`). Ohne diese Umleitung blieben drei Testpaare im Speichermenü stehen; ihre scheinbar gleichen Ergebnisse waren deshalb wertlos.
@@ -186,10 +188,19 @@ Leere Ordner `SavedGames\SlotN` zeigt das Spiel als „beschädigt“ an und fra
 | Figuren beim Levelstart | 3/8/9/11/12/13 bei +0/+1/+2/+3/+49/+73 bzw. 3/8/10/11/12/13 bei +0/+1/+3/+11/+65/+69 | 3/8/10/11/12/13 bei +0/+1/+3/+12/+55/+66 bzw. 3/8/11/12/13 bei +0/+1/+3/+40/+58 |
 | LCG `0x11a1844` | ab Frame 11 | ab Frame 5034 (ein zusätzlicher Zug in einer Instanz) |
 
-Offene Quellen:
-1. **Video-Ende:** Das Nachrichten-Video endet trotz festem dt nicht im selben Frame. Vermutlich entscheidet die Decoderzeit (`NuFmvStream`, `0x5ba670`), wann es fertig ist.
-2. **Weitere Ladewege:** Figuren erscheinen weiterhin nach Ladezeit. Die Streaming-Liste deckt nicht alles ab: NuBgProc-Aufträge (`DoDynamicLoad`, `CutsceneResourcePacket::DoLoad`, `SampleLoader`) und `m_readThread` laufen weiter frei.
-3. **LCG ab Frame 5034:** Im Trace von d7 war `0x94ced9` die einzige zeitabhängige Schreibstelle; die ist jetzt umgeleitet. Der verbleibende Zug ist noch nicht gefunden (nächster Schritt: `LBO_WATCHLCG` in einem Lauf mit Spielgeschehen).
+### Weitere Messungen (e1, k1, k2)
+
+`frames.csv` enthält jetzt auch die Video- und Ladezustände: `vid` (`0x11cf178`), `fmv_*` (`0x131356c`, `0x1313574`, `0x131359c`, `0x13135b0`, Videoframe `0x1313568`), NuBgProc (`bg_pend`, laufender Auftrag `bg_job`), Streaming-Liste (`ll_n`, `ll_loading`) und `rel` (Frames ab Levelanker).
+
+- **e1 (bis Frame 9000):** Die Videozustände sind in beiden Instanzen gleich. Die erste Abweichung ist der NuBgProc-Auftrag **SampleLoader** (`0x7359b0`): Er startet bei 5041 bzw. 5034 (dort kippt auch der LCG) und vor jedem versetzten Szenenwechsel (6508 bzw. 6512). Eingereiht wird er von der Sample-Verwaltung `0x7372b0` über `0x735a20`. Die gibt Samples frei, deren Referenzzähler (`+0x18`) auf 0 gefallen ist. Das passiert, wenn ein Sound in XAudio2 **in Echtzeit** zu Ende gespielt hat.
+- **k1 (Levelanker, `LBO_ANCHOR=1`, Skript `b2_anchor.txt`):** Der Anker liegt bei 20509 bzw. 20516. Ab dem Anker weicht schon bei +3 die Streaming-Liste ab (3 bzw. 11 Einträge), bei +26 die Figurenzahl, ab +1147 die Position von Spieler 1. Das Level lädt beim Anker noch nach, ein Abgleich direkt beim ersten Erscheinen der Figuren ist zu früh.
+- **k2 (zusätzlich `LBO_IOWAIT=1`):** Das Frame-Ende wartet, bis `m_readThread`, `m_decodeThread` und `TextureDecode` ruhen (`QueryThreadCycleTime`). Sie waren in 6000 Frames nur 8-mal aktiv, der Menü-Versatz wurde nicht kleiner (6474 bzw. 6511). **Datei-I/O ist nicht die Ursache.**
+
+**Stand:** Die Abweichungen gehen auf das Ton-Timing zurück. Menü- und Szenenwechsel sowie das Freigeben und Nachladen von Samples hängen daran, wann XAudio2 einen Sound tatsächlich zu Ende gespielt hat.
+
+Nächster Schritt:
+- Den Ton von der Echtzeit entkoppeln: die XAudio2-Quellstimmen hooken (`GetState`: `SamplesPlayed`, `BuffersQueued`; Rückrufe `OnBufferEnd`/`OnStreamEnd`) und das Abspielende nach Frames melden, also Samples = Frame × Abtastrate / 60.
+- Erst danach den Levelanker später setzen (wenn Streaming-Liste und Figurenzahl ruhen) und k1 wiederholen.
 
 ## Zufallsgeneratoren
 
@@ -203,7 +214,7 @@ Neben `0x11a1840` (Park-Miller-Startwert), `0x11a1844` (16-Bit-LCG, 615 Zugriffe
 
 ## Nächste Schritte
 
-1. **Restliche Ladewege und Video-Ende** synchronisieren (siehe „Offene Quellen“), dann d11 wiederholen, bis Figuren und Positionen gleich bleiben.
+1. **Ton von der Echtzeit entkoppeln** (XAudio2-Stimmen nach Frames melden, siehe „Weitere Messungen“), dann d11/k1 wiederholen, bis Figuren und Positionen gleich bleiben.
 2. **Abgleichpunkt für online:** Beim Start des Levels (bzw. beim Verlassen des Hauptmenüs) überträgt der Host Zufallszustände, Eingabe-Takt und ggf. weitere Zähler an den Gast; danach Lockstep wie bei Batman 1.
 3. Netzcode und App-Anbindung für Batman 2 (Adresstabelle pro Spiel).
 4. Längere Tests in weiteren Levels (Fahrzeuge, Charakterwechsel, Speichern ist im Test umgeleitet).

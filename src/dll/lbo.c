@@ -19,6 +19,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <ctype.h>
 #include <mmsystem.h>
@@ -27,6 +28,7 @@
 #include <dsound.h>
 #include "net.h"
 #include "input.h"
+#include "render.h"
 
 // --- Spieladressen ---------------------------------------------------------
 #define ADDR_FRAME_END      0x006E0240  // sub esp,14h / fldz  (5 Bytes)
@@ -70,6 +72,7 @@ static int g_stutter_every, g_stutter_ms;
 static long g_fake_desync;
 static int g_owncam, g_owncam_player, g_camlog;
 static void cam_log(long F);
+static void update_view_shift(void);
 static int g_shot_every;
 static char g_dir[MAX_PATH];
 static FILE *g_log, *g_csv, *g_rec, *g_liveout;
@@ -412,9 +415,30 @@ static void snapshot(SNAP *s)
 }
 
 // --- Screenshot (BMP, Client-Bereich des Spielfensters) ---------------------------
+// Das Spielfenster dieses Prozesses (laufen zwei Spiele auf einem PC, fand FindWindowA bei beiden
+// dasselbe Fenster).
+static BOOL CALLBACK find_own_window(HWND h, LPARAM out)
+{
+    DWORD pid = 0;
+    char cls[32];
+    GetWindowThreadProcessId(h, &pid);
+    if (pid == GetCurrentProcessId() && GetClassNameA(h, cls, sizeof cls) && !strcmp(cls, "TTalesWindow")) {
+        *(HWND *)out = h;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static HWND own_game_window(void)
+{
+    HWND h = NULL;
+    EnumWindows(find_own_window, (LPARAM)&h);
+    return h;
+}
+
 static void write_shot(const char *name)
 {
-    HWND hwnd = FindWindowA("TTalesWindow", NULL);
+    HWND hwnd = own_game_window();
     RECT rc;
     HDC src, mem;
     HBITMAP bmp;
@@ -774,6 +798,7 @@ static void __cdecl on_frame_end(void)
         TerminateProcess(GetCurrentProcess(), 0);
     }
     if (g_camlog > 0 && F % g_camlog == 0) cam_log(F);
+    if (g_owncam == 5) update_view_shift();
     if (g_net) enforce_fpu("Frame-Ende");
     bg_freeze();
 }
@@ -866,33 +891,237 @@ static int player_pos(int i, float out[3])
     return 1;
 }
 
-static float g_own_matrix[16];
+// Erster Versuch (Kamera im Logik-Update ersetzen) liess die Spiele auseinanderlaufen: Das Update
+// berechnet mit der gesetzten Kamera, was sichtbar ist, und davon haengt z. B. ab, wo Figuren
+// erscheinen. Daher wird die Kamera nur waehrend des Zeichnens am Frame-Ende (0x6fb1c0, Aufruf bei
+// 0x6e03a3) ersetzt und danach der vorherige Zustand wiederhergestellt; die Logik sieht immer die
+// gemeinsame Kamera.
+#define ADDR_RENDER_CALL 0x006E03A3
+#define ADDR_RENDER      0x006FB1C0
+typedef void (__cdecl *SetViewFn)(const float *m);
+typedef int (__cdecl *RenderFn)(int a, void *cb);
+static float g_own_matrix[16], g_last_view[16];
+static int g_have_last, g_in_render;
 static long g_own_hits;
+static float g_owncam_shift;
 
-// Wird am Anfang von 0x6f1e80 (Kamera-Weltmatrix an den Renderer) aufgerufen. Ist es die Matrix der
-// Spielkamera, liefert sie eine zur eigenen Figur verschobene Kopie; alle anderen Matrizen
-// (Schatten, Spiegelungen, Menues) bleiben unveraendert.
-static const float *__cdecl view_filter(const float *m)
+// Eigene Kamera berechnen: die gemeinsame Kamera zielt auf die Mitte beider Spieler; um die halbe
+// Differenz zur eigenen Figur verschieben (Zeile 3 der Weltmatrix ist die Augenposition).
+static int build_view_for(int player)
 {
     float me[3], other[3];
     int i;
     __try {
-        const float *cam;
-        if (g_owncam == 9) return m;   // Diagnose: Haken ohne Wirkung
-        if (!g_owncam || !G_GAME_CAMERA || G_CHAR_COUNT <= 0) return m;   // nur im Level, nie in Menues
-        cam = (const float *)(G_GAME_CAMERA + 0xB8);
-        if (memcmp(m, cam, 64) != 0) return m;
-        if (!player_pos(g_owncam_player, me) || !player_pos(1 - g_owncam_player, other)) return m;
-        memcpy(g_own_matrix, m, 64);
-        // Die gemeinsame Kamera zielt auf die Mitte beider Spieler: um die halbe Differenz zur
-        // eigenen Figur verschieben (Zeile 3 der Weltmatrix ist die Augenposition)
+        if (!G_GAME_CAMERA || G_CHAR_COUNT <= 0) return 0;   // nur im Level, nie in Menues
+        if (!player_pos(player, me) || !player_pos(1 - player, other)) return 0;
+        memcpy(g_own_matrix, G_GAME_CAMERA + 0xB8, 64);
         for (i = 0; i < 3; i++) g_own_matrix[12 + i] += (me[i] - other[i]) * 0.5f;
-        if (g_own_hits++ < 3) logf_("Kamera: Ersetzung Nr. %ld bei Frame %ld", g_own_hits, g_F);
-        if (g_owncam == 8) return m;   // Diagnose: alles berechnen, aber nichts ersetzen
-        return g_own_matrix;
+        g_own_matrix[12] += g_owncam_shift;   // Diagnose LBO_OWNCAM_SHIFT: sichtbare Zusatzverschiebung in x
+        return 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return m;
+        return 0;
     }
+}
+
+// Modus 5: eigene Kamera pro Spieler, nur fuer die Darstellung (Shader-Konstanten, render.c).
+// Ausgangspunkt ist die Spielkamera C (Zeilen 0-2 Basis, Zeile 2 Blickrichtung, Zeile 3 Auge E), die
+// auf die Mitte M beider Figuren blickt. Die eigene Kamera dreht sich um das Auge von M zur eigenen Figur
+// und faehrt auf dieser Sichtlinie bis zum Normalabstand heran. Die Sichtlinie ist frei (die Spielkamera
+// sieht beide Figuren), daher landet die Kamera nicht in Waenden. Folgt die Spielkamera den Figuren
+// nicht (Zwischensequenz, Levelauswahl, feste Kamera), bleibt das Bild unveraendert.
+static float g_base_dist;    // Abstand Auge-Mitte, wenn beide Figuren nah beieinander stehen (gelernt)
+static float g_track[3];     // geglaettete Position der eigenen Figur
+static float g_alpha;        // 0 = Spielkamera, 1 = eigene Kamera (weich ein- und ausblenden)
+static int g_track_init;
+
+static float vlen(const float *v) { return (float)sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
+
+// v um die Achse k (Einheitsvektor) mit cos c und sin s drehen (Rodrigues)
+static void rotate_vec(float *out, const float *v, const float *k, float c, float s)
+{
+    float kv = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+    float cr[3] = { k[1] * v[2] - k[2] * v[1], k[2] * v[0] - k[0] * v[2], k[0] * v[1] - k[1] * v[0] };
+    int i;
+    for (i = 0; i < 3; i++) out[i] = v[i] * c + cr[i] * s + k[i] * kv * (1 - c);
+}
+
+static void mat_mul(float *out, const float *a, const float *b)
+{
+    int i, j, k;
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 4; j++) {
+            float s = 0;
+            for (k = 0; k < 4; k++) s += a[i * 4 + k] * b[k * 4 + j];
+            out[i * 4 + j] = s;
+        }
+}
+
+static void update_view_shift(void)
+{
+    float me[3], other[3], C[16], Cn[16], V[16], M[16], mid[3], aim[3], u[3], w[3], k[3];
+    float E[3], En[3], fwd_dist = 0, len_mid = 0, len_aim, sep, want, c, s;
+    int ok = 0, follow = 0, i, j;
+    __try {
+        ok = G_GAME_CAMERA && G_CHAR_COUNT > 0 && player_pos(g_owncam_player, me) && player_pos(1 - g_owncam_player, other);
+        if (ok) memcpy(C, G_GAME_CAMERA + 0xB8, 64);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    if (ok) {
+        for (i = 0; i < 3; i++) { mid[i] = (me[i] + other[i]) * 0.5f; E[i] = C[12 + i]; u[i] = mid[i] - E[i]; }
+        fwd_dist = u[0] * C[8] + u[1] * C[9] + u[2] * C[10];
+        len_mid = vlen(u);
+        follow = fwd_dist > 0.5f && len_mid > 0 && fwd_dist / len_mid > 0.9f;   // Mitte innerhalb ~25 Grad
+    }
+    g_alpha += ((follow ? 1.0f : 0.0f) - g_alpha) * 0.1f;
+    if (!ok || g_alpha < 0.01f) {
+        g_track_init = 0;
+        render_set_view(0, NULL, NULL);
+        return;
+    }
+    if (!g_track_init) { memcpy(g_track, me, 12); g_track_init = 1; }
+    for (i = 0; i < 3; i++) g_track[i] += (me[i] - g_track[i]) * 0.25f;
+    sep = (float)sqrt((me[0] - other[0]) * (me[0] - other[0]) + (me[2] - other[2]) * (me[2] - other[2]));
+    if (follow && sep < 1.5f) g_base_dist = g_base_dist > 0 ? g_base_dist * 0.95f + len_mid * 0.05f : len_mid;
+
+    // Zielpunkt: von der Mitte zur eigenen Figur ueberblenden
+    for (i = 0; i < 3; i++) { aim[i] = mid[i] + (g_track[i] - mid[i]) * g_alpha; w[i] = aim[i] - E[i]; }
+    len_aim = vlen(w);
+    if (len_aim < 0.01f) { render_set_view(0, NULL, NULL); return; }
+    // Drehung so, dass die eigene Figur an fester Bildposition steht (Mitte, leicht unterhalb wie beim Spiel):
+    // u = Richtung dieser Bildposition in der Spielkamera, w = Richtung zur eigenen Figur
+    for (i = 0; i < 3; i++) { u[i] = C[8 + i] - 0.12f * C[4 + i]; w[i] /= len_aim; }
+    len_mid = len_mid > 0 ? len_mid : 1;
+    {
+        float lu = vlen(u);
+        for (i = 0; i < 3; i++) u[i] /= lu;
+    }
+    // Drehung u -> w
+    k[0] = u[1] * w[2] - u[2] * w[1]; k[1] = u[2] * w[0] - u[0] * w[2]; k[2] = u[0] * w[1] - u[1] * w[0];
+    s = vlen(k);
+    c = u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
+    memcpy(Cn, C, 64);
+    if (s > 1e-6f) {
+        for (i = 0; i < 3; i++) k[i] /= s;
+        for (j = 0; j < 3; j++) rotate_vec(&Cn[j * 4], &C[j * 4], k, c, s);
+    }
+    // Auf der Sichtlinie bis zum Normalabstand heranfahren (nie hinter die Spielkamera)
+    want = g_base_dist > 0 ? g_base_dist : len_mid;
+    for (i = 0; i < 3; i++) En[i] = len_aim > want ? aim[i] - w[i] * want : E[i];
+    for (i = 0; i < 3; i++) Cn[12 + i] = En[i] + (i == 0 ? g_owncam_shift : 0);
+    // View = Inverse der (orthonormalen) Kamera-Weltmatrix
+    memset(V, 0, sizeof V);
+    for (i = 0; i < 3; i++)
+        for (j = 0; j < 3; j++) V[i * 4 + j] = Cn[j * 4 + i];
+    for (j = 0; j < 3; j++) V[12 + j] = -(Cn[12] * Cn[j * 4] + Cn[13] * Cn[j * 4 + 1] + Cn[14] * Cn[j * 4 + 2]);
+    V[15] = 1;
+    mat_mul(M, V, C);   // VP_eigen = V_eigen * P = (V_eigen * C) * (V_spiel * P)
+    render_set_view(1, M, V);
+    if (g_camlog > 0 && g_F % g_camlog == 0) {
+        // Kontrolle: eigene Figur im eigenen Kameraraum (x, y ~ 0 = Bildmitte, z = Abstand)
+        float vx = me[0] * V[0] + me[1] * V[4] + me[2] * V[8] + V[12];
+        float vy = me[0] * V[1] + me[1] * V[5] + me[2] * V[9] + V[13];
+        float vz = me[0] * V[2] + me[1] * V[6] + me[2] * V[10] + V[14];
+        logf_("Eigene Kamera: alpha %.2f, Figur im Bild x/z %.2f y/z %.2f Abstand %.2f (Spielkamera %.2f, normal %.2f)",
+              g_alpha, vz > 0 ? vx / vz : 0, vz > 0 ? vy / vz : 0, vz, len_mid, g_base_dist);
+    }
+}
+
+// Am Anfang von 0x6f1e80 (Kamera-Weltmatrix an den Renderer). Ausserhalb des Zeichnens nur merken;
+// waehrend des Zeichnens die Matrix der Spielkamera durch die eigene ersetzen (falls der Renderer sie
+// selbst noch einmal setzt). Schatten, Spiegelungen usw. bleiben unveraendert.
+static const float *__cdecl view_filter(const float *m)
+{
+    __try {
+        if (g_owncam == 9) return m;   // Diagnose: Haken ohne Wirkung
+        if (!g_in_render) {
+            memcpy(g_last_view, m, 64);
+            g_have_last = 1;
+            return m;
+        }
+        if (G_GAME_CAMERA && m != g_own_matrix && memcmp(m, G_GAME_CAMERA + 0xB8, 64) == 0) return g_own_matrix;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return m;
+}
+
+static int __cdecl render_wrap(int a, void *cb)
+{
+    int r, own;
+    if (g_owncam == 4 && g_have_last && G_CHAR_COUNT > 0) {
+        // Splitscreen: Beide PCs zeichnen jeden Frame dieselbe Folge (Ansicht Spieler 1, dann Spieler 2),
+        // damit die Nebenwirkungen des Zeichnens auf beiden Seiten gleich sind. Angezeigt wird die eigene.
+        int v, saved = 0, drawn = 0;
+        r = 0;
+        for (v = 0; v < 2; v++) {
+            if (!build_view_for(v)) break;
+            g_in_render = 1;
+            ((SetViewFn)ADDR_SET_VIEW)(g_own_matrix);
+            r = ((RenderFn)ADDR_RENDER)(a, cb);
+            g_in_render = 0;
+            drawn++;
+            if (v == g_owncam_player && v == 0) saved = render_save_view();
+        }
+        if (drawn == 0) return ((RenderFn)ADDR_RENDER)(a, cb);
+        ((SetViewFn)ADDR_SET_VIEW)(g_last_view);   // Logik sieht wieder die gemeinsame Kamera
+        if (saved) render_restore_view();             // Spieler 1: seine Ansicht statt der zuletzt gezeichneten
+        if (g_own_hits++ < 3) logf_("Kamera: Splitscreen-Frame %ld (%d Ansichten, gesichert %d)", g_F, drawn, saved);
+        return r;
+    }
+    if (g_owncam == 3 && G_CHAR_COUNT > 0) {
+        // Diagnose: zweimal mit der gemeinsamen Kamera zeichnen (hat das Zeichnen Nebenwirkungen?)
+        ((RenderFn)ADDR_RENDER)(a, cb);
+        if (g_own_hits++ < 3) logf_("Kamera: doppelt gezeichnet ab Frame %ld", g_F);
+    }
+    own = g_owncam == 1 && g_have_last && build_view_for(g_owncam_player);
+    if (own) {
+        g_in_render = 1;
+        ((SetViewFn)ADDR_SET_VIEW)(g_own_matrix);
+        if (g_own_hits++ < 3) logf_("Kamera: eigene Ansicht beim Zeichnen ab Frame %ld", g_F);
+    }
+    r = ((RenderFn)ADDR_RENDER)(a, cb);
+    if (own) {
+        g_in_render = 0;
+        ((SetViewFn)ADDR_SET_VIEW)(g_last_view);   // Logik sieht wieder die gemeinsame Kamera
+    }
+    return r;
+}
+
+// Diagnose: jeder Aufruf von 0x72ffc0 (Kamera an den Renderer, 108 Byte ab Zeiger) im Trace-Frame
+static long g_camtrace_frame = -1;
+
+static void __cdecl log_set_cam(const float *c, DWORD ret)
+{
+    if (g_F != g_camtrace_frame) return;
+    __try {
+        logf_("SetCam %p ret %08lx in_render %d eye=(%.2f %.2f %.2f) f=[%.2f %.2f %.2f %.2f %.2f]", (void *)c, ret,
+              g_in_render, c[12], c[13], c[14], c[16], c[17], c[18], c[19], c[20]);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+__declspec(naked) static void stub_set_cam(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push dword ptr [esp + 36]   // Ruecksprungadresse
+        push dword ptr [esp + 44]   // Argument (Kamera)
+        call log_set_cam
+        add esp, 8
+        popfd
+        popad
+        sub esp, 0C8h               // ueberschriebener Anfang von 0x72ffc0
+        push 0072FFC6h
+        ret
+    }
+}
+
+static void patch_call(DWORD at, void *to)
+{
+    DWORD old;
+    unsigned char *p = (unsigned char *)at;
+    if (p[0] != 0xE8) { logf_("Aufruf bei %08lx nicht gefunden", at); return; }
+    VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+    *(DWORD *)(p + 1) = (DWORD)to - (at + 5);
+    VirtualProtect(p, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
 }
 
 // Alle Register und Flags bleiben erhalten: Der Aufrufer kann sich (Optimierung ueber Funktionsgrenzen)
@@ -970,7 +1199,7 @@ static DWORD WINAPI watch_thread(void *arg)
     for (;;) {
         Sleep(500);
         __try {
-            const unsigned char *pc = (const unsigned char *)G_PLAYER_SLOTS[0];
+            const unsigned char *pc = (const unsigned char *)G_PLAYER_SLOTS[g_watchpos >= 2 ? 1 : 0];
             if (pc) watch_set((void *)(pc + 0x5c));
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
@@ -980,7 +1209,7 @@ static void cam_log(long F)
 {
     if (g_watchpos && g_nwriters) {
         char line[1024];
-        int i, len = snprintf(line, sizeof line, "Schreiber P1.x:");
+        int i, len = snprintf(line, sizeof line, "Schreiber P%d.x:", g_watchpos >= 2 ? 2 : 1);
         for (i = 0; i < g_nwriters && len < 980; i++) len += snprintf(line + len, sizeof line - len, " %08lx:%ld", g_writers[i].eip, g_writers[i].n);
         logf_("%s", line);
     }
@@ -1206,16 +1435,25 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_STUTTER", buf, sizeof buf)) sscanf(buf, "%d %d", &g_stutter_every, &g_stutter_ms);
     if (GetEnvironmentVariableA("LBO_FAKEDESYNC", buf, sizeof buf)) g_fake_desync = atol(buf);
     if (GetEnvironmentVariableA("LBO_CAMLOG", buf, sizeof buf)) g_camlog = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_CAMTRACE", buf, sizeof buf)) {
+        static const unsigned char pro_setcam[5] = { 0x81, 0xEC, 0xC8, 0x00, 0x00 };
+        g_camtrace_frame = atol(buf);
+        logf_("Kamera-Trace Frame %ld, Hook %d", g_camtrace_frame, patch_jmp(0x0072FFC0, (void *)stub_set_cam, pro_setcam));
+    }
     if (GetEnvironmentVariableA("LBO_WATCHPOS", buf, sizeof buf) && (g_watchpos = atoi(buf)) != 0)
         CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
     if (GetEnvironmentVariableA("LBO_OWNCAM", buf, sizeof buf)) {
         g_owncam = atoi(buf);
+        if (GetEnvironmentVariableA("LBO_OWNCAM_SHIFT", buf, sizeof buf)) g_owncam_shift = (float)atof(buf);
         // Eigene Figur: im Netz die eigene Rolle (Host = Spieler 1), sonst LBO_OWNCAM_PLAYER
         g_owncam_player = g_net ? net_role() : (GetEnvironmentVariableA("LBO_OWNCAM_PLAYER", buf, sizeof buf) ? atoi(buf) : 0);
-        if (g_owncam) {
+        if (g_owncam == 5) {
+            logf_("Kamera: eigene Kamera fuer Spieler %d (nur Darstellung, Shader-Konstanten)", g_owncam_player + 1);
+        } else if (g_owncam) {
             static const unsigned char pro_view[5] = { 0x8B, 0x44, 0x24, 0x04, 0x56 };
             logf_("Kamera: eigene Kamera fuer Spieler %d, Hook %d", g_owncam_player + 1,
                   patch_jmp(ADDR_SET_VIEW, (void *)stub_set_view, pro_view));
+            patch_call(ADDR_RENDER_CALL, (void *)render_wrap);
         }
     }
     if (GetEnvironmentVariableA("LBO_NODIALOG", buf, sizeof buf)) g_no_dialog = atoi(buf);
@@ -1260,6 +1498,7 @@ static void init(void)
             logf_("Spielstand-Ordner umgeleitet nach %s (FindFirstFileA %s)", g_savedir, slot ? "umgeleitet" : "nicht gefunden");
     }
     input_init((void *)real_getstate, logf_);
+    render_init(logf_, &g_F, g_owncam == 4 || g_owncam == 5);
     if (GetEnvironmentVariableA("LBO_MULTI", buf, sizeof buf)) g_multi = atoi(buf);
     patch_iat(IAT_CREATEMUTEXA, (void *)hook_createmutex, (void **)&real_createmutex);
     if (GetEnvironmentVariableA("LBO_NOMOVIES", buf, sizeof buf)) g_no_movies = atoi(buf);

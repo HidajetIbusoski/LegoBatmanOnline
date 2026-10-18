@@ -147,6 +147,9 @@ public sealed class Lobby : Bindable
     private bool _autoLoad = true;
     public bool AutoLoad { get => _autoLoad; set { _autoLoad = value; Raise(); } }
 
+    /// <summary>Eigene Kamera fuer jeden Spieler. Betrifft nur die eigene Darstellung, nicht die Spiellogik.</summary>
+    public bool OwnCamera { get => _profile.OwnCamera; set { _profile.OwnCamera = value; _profile.Save(); Raise(); } }
+
     private Invitation? _incoming;
     public Invitation? Incoming { get => _incoming; private set { _incoming = value; Raise(); Raise(nameof(HasIncoming)); } }
     public bool HasIncoming => Incoming != null;
@@ -581,6 +584,7 @@ public sealed class Lobby : Bindable
     private Dictionary<string, string> TestEnv()
     {
         var env = new Dictionary<string, string>();
+        if (_profile.OwnCamera) env["LBO_OWNCAM"] = "5";
         if (_opt.Test)
         {
             env["LBO_MULTI"] = "1";

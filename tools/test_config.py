@@ -26,6 +26,8 @@ while args:
         frames = args.pop(0)
     elif a == "--skript":
         scripts = True
+    elif a == "--skripte":   # eigene Skripte: --skripte host.txt join.txt
+        scripts = (args.pop(0), args.pop(0))
     elif a == "--both":
         both = True
     elif a == "--gast-focus":
@@ -123,7 +125,8 @@ def run(role, me, peer, cfg):
     cmd = [LAUNCHER, "--connect", role, "--port", me["port"], "--key", me["key"],
            "--peer-key", peer["key"], "--peer-public", peer["public"], "--peer-local", peer["local"]]
     if scripts:
-        env["LBO_SCRIPT"] = os.path.join(ROOT, "tools", "scripts", "net_host.txt" if role == "host" else "net_join.txt")
+        names = scripts if isinstance(scripts, tuple) else ("net_host.txt", "net_join.txt")
+        env["LBO_SCRIPT"] = os.path.join(ROOT, "tools", "scripts", names[0] if role == "host" else names[1])
     else:
         cmd += ["--slot", "0"]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)

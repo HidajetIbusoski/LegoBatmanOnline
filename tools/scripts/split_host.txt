@@ -1,0 +1,9 @@
+# Trennungstest: Host-Menue wie net_host.txt, danach laeuft Spieler 1 nach links, dann nach vorn
+F 3271 3300 0 1000 0 0 0 0 0 0
+F 4101 4120 0 1000 0 0 0 0 0 0
+F 4661 4680 0 1000 0 0 0 0 0 0
+F 4801 4820 0 0001 0 0 0 0 0 0
+F 5301 5320 0 1000 0 0 0 0 0 0
+F 6201 6220 0 1000 0 0 0 0 0 0
+F 7500 8100 0 0000 0 0 -30000 0 0 0
+F 8400 9000 0 0000 0 0 0 30000 0 0

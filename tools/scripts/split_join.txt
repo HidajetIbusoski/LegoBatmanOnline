@@ -1,0 +1,4 @@
+# Trennungstest: Spieler 2 steigt ein, laeuft nach rechts, dann nach hinten
+F 7300 7320 1 0010 0 0 0 0 0 0
+F 7500 8100 1 0000 0 0 30000 0 0 0
+F 8400 9000 1 0000 0 0 0 -30000 0 0

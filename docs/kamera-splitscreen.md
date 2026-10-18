@@ -1,40 +1,66 @@
-# Eigene Kamera pro Spieler / Splitscreen: Befund (18.10.2026)
+# Eigene Kamera pro Spieler (Splitscreen-Ersatz)
 
-## Ziel
+Stand 18.10.2026. Online hat jeder Spieler seinen eigenen Bildschirm. Statt eines geteilten Bildes bekommt deshalb jeder PC eine eigene Kamera, die der eigenen Figur folgt. In der App heißt der Schalter „Eigene Kamera für meine Figur“ (`LBO_OWNCAM=5`), er ist standardmäßig an.
 
-Jeder Spieler sieht auf seinem PC die eigene Figur. Die Spieler sollen sich weit voneinander entfernen können. LEGO Batman (2008) hat keinen Splitscreen: Beide teilen eine Kamera, und das Spiel hält beide Figuren im Bild.
+## Warum nicht einfach die Kamera des Spiels ändern
 
-## Was gefunden wurde
+LEGO Batman (2008) hat nur eine gemeinsame Kamera, und die Spiellogik hängt davon ab, was sie sieht. Figuren erscheinen zum Beispiel abhängig vom Bild. Bei allen Eingriffen in die Spielkamera liefen die Spiele im Lockstep auseinander:
 
-| Stelle | Inhalt |
+| Versuch | Ergebnis |
 |---|---|
-| `*(0x95f624)` | Spielkamera. Skriptbefehle `ResetGameCamera` (`0x460ec0`) und `JudderGameCamera` (`0x460ca0`) aus der Befehlstabelle bei `0x93c0b4`. |
-| Kamera+`0xB8` | 4×4-Weltmatrix der Kamera, Zeilen 0–2 Drehung, Zeile 3 Augenposition (gemessen mit `LBO_CAMLOG`). |
-| `0x6f1e80(m)` | Übergibt die Kamera-Weltmatrix an den Renderer (`0x72ffc0`) und berechnet die View-Projection in `0x9a7050`/`0x9a7010`. Aufgerufen von 30 Stellen, im Level zweimal pro Frame mit der Matrix der Spielkamera. |
-| `0x4af2bb` | Kopiert Kamera+`0xB8` nach `*(0xa96128)` und ruft `0x6f1e80`. Das allein bestimmt das Hauptbild nicht. |
+| Kamera im Logik-Update ersetzen (Haken an `0x6f1e80`) | Desync ab Frame 6572: Beim Host erscheint eine Figur mehr |
+| Kamera nur während des Zeichnens am Frame-Ende setzen (`0x6fb1c0`) | wirkungslos, die Zeichenlisten enthalten fertige Matrizen; zusätzliche Aufrufe störten die Logik |
+| Doppelt zeichnen nur auf einer Seite | Desync: Das Zeichnen hat Nebenwirkungen auf die Logik |
+| Doppelt zeichnen auf beiden Seiten | synchron, aber ohne Wirkung auf das Bild (siehe oben) |
 
-## Versuch
+Achtung: Bis zum 18.10. fand `write_shot` per `FindWindowA` bei zwei Spielen auf einem PC dasselbe Fenster, Bildvergleiche aus dieser Zeit sind wertlos. Jetzt sucht es das Fenster des eigenen Prozesses.
 
-`LBO_OWNCAM=1` hakt sich am Anfang von `0x6f1e80` ein. Ist die Matrix die der Spielkamera, wird die Augenposition um die halbe Differenz zur eigenen Figur verschoben. Getestet wurde mit zwei Instanzen online (`tools/test_config.py --skript`, Spieler 2 tritt bei); nur der Gast bekam die eigene Kamera.
+## Lösung: Kamera auf dem Weg zur Grafikkarte tauschen
 
-| Modus | Ergebnis |
+`render.c` hängt sich in `IDirect3DDevice9::SetVertexShaderConstantF` ein. Die Shader bekommen:
+
+| Register | Inhalt |
 |---|---|
-| 9: Haken ohne Wirkung | 9000 Frames synchron |
-| 8: alles berechnen, nichts ersetzen | synchron |
-| 1: Matrix ersetzen (ab Frame 6544 im Level) | Desync ab Frame 6572: Beim Host erscheint eine Figur mehr (6 statt 5) |
+| `c0`–`c3` | View-Projection der Kamera, transponiert |
+| `c12`–`c15` | View-Matrix, transponiert |
+| `c16`–`c19` | Weltmatrix des Objekts |
 
-**Ergebnis:** Die Spiellogik hängt davon ab, was die Kamera sieht. Figuren erscheinen abhängig vom Bild, z. B. dürfen Gegner nur außerhalb des Bildes auftauchen. Mit unterschiedlichen Kameras auf beiden PCs laufen die Spiele deshalb sofort auseinander. Eine eigene Kamera nur für die Darstellung reicht nicht.
+Ermittelt wurde das mit `LBO_RENDERTRACE`, einem Aufruf-Trace eines ganzen Frames. Ablauf pro Frame:
 
-## Mögliche Wege (nicht umgesetzt)
+1. **Am Anfang des Frame-Endes**, vor dem Zeichnen, wird die View-Projection der Spielkamera (`0x9a7050`) festgehalten. Der Schatten-Durchgang überschreibt diese globale Matrix später mit der Lichtkamera.
+2. **`c0`:** Ein Upload, der genau dieser Matrix entspricht, wird durch `M · VP` ersetzt. Die Lichtkamera und andere Matrizen bleiben unverändert.
+3. **`c12`:** Der direkt davor hochgeladene Block mit letzter Zeile `0 0 0 1` ist die View der Spielkamera. Er und alle gleichen Uploads danach werden durch die eigene View ersetzt.
 
-1. **Echter Splitscreen auf beiden PCs.** Beide PCs zeichnen pro Frame beide Ansichten in derselben Reihenfolge. Damit sieht die Logik auf beiden Seiten denselben Zustand. Dazu muss die Szenenzeichnung gefunden und zweimal mit eigenem Viewport ausgeführt werden. Das ist ein großes Reverse-Engineering-Vorhaben mit offenem Ausgang, und die Grafiklast verdoppelt sich.
-2. **Darstellung auf Direct3D-Ebene ändern.** Die Logik behält die gemeinsame Kamera, nur die Matrizen beim Zeichnen werden nachträglich umgerechnet, z. B. in `SetVertexShaderConstantF`. Riskant: Man muss genau wissen, welche Register welche Matrix enthalten.
-3. **Sichtbarkeits-Abfragen der Logik finden und auf die gemeinsame Kamera umbiegen.** Die Stellen sind unbekannt, und es sind wahrscheinlich viele (Spawns, KI, Effekte).
+Die Spiellogik sieht davon nichts, der Lockstep bleibt synchron. Das ist mit zwei Instanzen geprüft, mit eigener Kamera auf einer und auf beiden Seiten: 0 Desyncs, Frames bitgleich.
 
-Die Grenze, die beide Figuren im Bild hält, ist nicht gefunden. Der Positionswächter (`LBO_WATCHPOS`, Hardware-Haltepunkt auf die Position von Spieler 1) fand im normalen Spiel nur einen Schreiber (`0x42198e`). Für die Grenze müsste man die Spieler gezielt auseinanderlaufen lassen.
+## Wie die eigene Kamera entsteht (`update_view_shift` in `lbo.c`)
 
-## Nebenbefund: Desync durch den Wachhund (behoben)
+- **Ausgangspunkt:** die Kamera-Weltmatrix `C` der Spielkamera (Kamera-Objekt `*(0x95f624)` + `0xB8`). Zeilen 0–2 sind die Basis, Zeile 2 ist die Blickrichtung, Zeile 3 die Augenposition `E`.
+- **Folgt die Spielkamera den Spielern?** Die Mitte beider Figuren muss innerhalb von etwa 25° der Blickrichtung liegen. Sonst, etwa bei Zwischensequenzen, der Levelauswahl oder festen Kameras, wird nichts verändert. Ein- und Ausblenden laufen weich über `g_alpha`.
+- **Drehung:** Die Basis wird um das Auge gedreht (Rodrigues), sodass die eigene Figur an fester Bildposition steht: Mitte, leicht unterhalb, wie das Spiel sie rahmt.
+- **Heranfahren:** Die Kamera fährt auf der Sichtlinie bis zum Normalabstand heran. Der wird gelernt, solange beide Figuren nah beieinander stehen. Die Sichtlinie ist frei, weil die Spielkamera beide Figuren sieht, deshalb landet die Kamera nicht in Wänden.
+- **Matrizen:** `V' = C'^{-1}` und `M = V' · C`.
+- **Kontrolle:** Mit `LBO_CAMLOG` wird protokolliert, wo die eigene Figur im eigenen Bild steht. Gemessen wurden x = 0,00 und y = −0,12 bei Abstand 3,5.
 
-Bei einem der Versuche lief das Spiel ohne Kamera-Änderung auseinander. Der Host hatte bei Frame 2078 eine zusätzliche Wachhund-Auftauung. Der Hauptthread hing dabei in der Geräteerkennung von DirectInput (Stack `0x528xxx`) und wartete nicht auf den Lade-Thread. Der aufgetaute Lade-Thread lief dann parallel zur Simulation. Dasselbe Muster zeigt die echte Sitzung vom 18.10. bei Frame 25060 und 25144, dort ohne Folgen.
+## Bekannte Grenzen
 
-In keinem protokollierten Fall hat der Hauptthread auf den Lade-Thread gewartet. Die Schwelle liegt jetzt bei 10 s statt 500 ms (`BG_WATCHDOG_MS`). In allen Tests danach gab es 0 Auftauungen und 0 Desyncs.
+- **Verdeckung:** Die eigene Figur kann von Geländern oder Gittern verdeckt sein, die die Spielkamera nicht stören.
+- **Sichtbarkeitsprüfung:** Das Spiel prüft weiter mit der gemeinsamen Kamera, was gezeichnet wird. Was nur die eigene Kamera sehen würde, kann am Bildrand fehlen.
+- **Abstandsgrenze:** Ob und wo das Spiel die Spieler bei großem Abstand stoppt, ist nicht gefunden. Im Test in der Bathöhle trennten sie sich auf über 10 Einheiten ohne Grenze. Der beobachtete Teleport von Spieler 2 war ein Sturz ins Wasser mit Wiedereinstieg (`0x43b970` → `0x5beb00`).
+- **Zusätzliche Szenen:** Der Spiegel bzw. die Reflexion und HUD-Markierungen über Figuren werden mit der Spielkamera berechnet.
+
+## Werkzeuge
+
+| Variable | Wirkung |
+|---|---|
+| `LBO_OWNCAM=5` | eigene Kamera (Modi 1–4, 8, 9 waren Versuche, siehe oben) |
+| `LBO_RENDERTRACE=F` | Direct3D-Aufrufe in Frame F mit Aufrufkette und Shader-Konstanten |
+| `LBO_RENDERSTATS=N` | alle N Frames eine Zusammenfassung |
+| `LBO_CAMLOG=N` | Kameramatrix, Spielerpositionen und Lage der eigenen Figur |
+| `LBO_CAMTRACE=F` | alle Aufrufe von `0x72ffc0` (Kamera an den Renderer) in Frame F |
+| `LBO_WATCHPOS=1\|2` | Hardware-Haltepunkt auf die Position von Spieler 1 bzw. 2; zählt die schreibenden Codeadressen |
+| `LBO_OWNCAM_SHIFT=x` | zusätzliche Verschiebung zur Sichtkontrolle |
+
+Skripte:
+- `tools/test_config.py --skripte split_host.txt split_join.txt`: Trennungsszenario, Spieler 2 tritt bei, dann laufen beide auseinander.
+- `tools/test_cam.py`: Einzelspiel in der Bathöhle. Achtung: Der Start im Einzelspiel ist nicht reproduzierbar, Läufe lassen sich dort nicht direkt vergleichen.

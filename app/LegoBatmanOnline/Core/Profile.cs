@@ -27,8 +27,6 @@ public sealed class Profile
     public string? GamePath { get; set; }
     public int LastSlot { get; set; }
     public bool ShortcutsCreated { get; set; }
-    public bool OwnCamera { get; set; } = true;   // eigene Kamera pro Spieler (nur Darstellung)
-
     private string _path = "";
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
 

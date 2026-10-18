@@ -170,12 +170,8 @@
                                            Foreground="{StaticResource Muted}" FontSize="12" TextWrapping="Wrap" Margin="0,0,16,0"/>
                             </StackPanel>
                         </DockPanel>
-                        <CheckBox DockPanel.Dock="Top" IsChecked="{Binding AutoLoad}" Margin="0,10,0,4"
+                        <CheckBox DockPanel.Dock="Top" IsChecked="{Binding AutoLoad}" Margin="0,10,0,12"
                                   Content="Beim Zusammenspielen den Spielstand automatisch laden"/>
-                        <CheckBox DockPanel.Dock="Top" IsChecked="{Binding OwnCamera}" Margin="0,4,0,12"
-                                  ToolTip="Jeder sieht seine eigene Figur in der Bildmitte, auch wenn ihr euch trennt. Betrifft nur dein Bild; dein Freund entscheidet für sich.">
-                            <TextBlock TextWrapping="Wrap">Eigene Kamera für meine Figur <Run Foreground="{StaticResource Muted}" Text="(Splitscreen-Ersatz, experimentell)"/></TextBlock>
-                        </CheckBox>
                         <Grid>
                             <TextBlock Text="Noch keine Welt. Füge einen Freund hinzu und erstelle mit „+ Neue Welt“ eure erste."
                                        Foreground="{StaticResource Muted}" TextWrapping="Wrap" FontSize="13">

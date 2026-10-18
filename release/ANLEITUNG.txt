@@ -52,13 +52,6 @@ Zusammen (beide online):
    wird automatisch geladen.
 3. Der Eingeladene drueckt START, sobald ihr im Spiel seid, und steigt ein.
 
-Eigene Kamera (Schalter "Eigene Kamera fuer meine Figur", experimentell):
-Jeder sieht seine eigene Figur in der Bildmitte, auch wenn ihr euch trennt -
-wie ein Splitscreen, nur dass jeder seinen eigenen Bildschirm hat. Der Schalter
-betrifft nur dein eigenes Bild; dein Freund entscheidet fuer sich. Bei
-Zwischensequenzen und festen Kameras zeigt das Spiel automatisch das normale
-Bild. Steht deine Figur hinter einem Gelaender, kann sie teilweise verdeckt sein.
-
 Alleine (Freund offline oder keine Zeit):
 1. Bei der Welt "Alleine spielen" druecken.
 2. Im Spiel unter "Load Game" den Spielstand laden. Du siehst dort nur die

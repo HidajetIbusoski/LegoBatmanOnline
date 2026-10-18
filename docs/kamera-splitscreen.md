@@ -1,6 +1,8 @@
 # Eigene Kamera pro Spieler (Splitscreen-Ersatz)
 
-Stand 18.10.2026. Online hat jeder Spieler seinen eigenen Bildschirm. Statt eines geteilten Bildes bekommt deshalb jeder PC eine eigene Kamera, die der eigenen Figur folgt. In der App heißt der Schalter „Eigene Kamera für meine Figur“ (`LBO_OWNCAM=5`), er ist standardmäßig an.
+Stand 18.10.2026. Online hat jeder Spieler seinen eigenen Bildschirm. Statt eines geteilten Bildes bekommt deshalb jeder PC eine eigene Kamera, die der eigenen Figur folgt (`LBO_OWNCAM=5`).
+
+**Auf Wunsch des Users wieder aus der App entfernt (18.10.2026).** Der Code in der DLL bleibt, ist aber nur noch per Umgebungsvariable `LBO_OWNCAM=5` erreichbar.
 
 ## Warum nicht einfach die Kamera des Spiels ändern
 

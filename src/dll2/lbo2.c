@@ -18,6 +18,13 @@
 //                  im ersten Level: Auftrag 0x7d48c0 wartet auf Ladevorgaenge anderer Threads)
 //   LBO_RNGRESET   Frame, an dem alle Zufallszustaende auf feste Werte gesetzt werden (Test ohne Host)
 //   LBO_NOMOVIES   1 = Videos (.fmv) ueberspringen: Ihr dt laeuft nach der Videouhr, also nach Echtzeit
+//   LBO_LOADSYNC   1 = Frame-Ende wartet, bis alle gewuenschten Streaming-Eintraege geladen sind
+//   LBO_VIDEODT    1 = dt waehrend Videos nicht durch die Videouhr ersetzen (bleibt 1/60)
+//   LBO_RENDERRNG  1 = Zufallsaufrufe beim Zeichnen (0x5e0d52, 0x5e0db8, 0x598619) und im Musiktakt
+//                  (0x94cdf0) auf eigene Zustaende
+//   LBO_WATCHLCG   1 = Hardware-Haltepunkt auf den LCG 0x11a1844: Schreibstellen im LBO_TRACERNG-Fenster
+//   LBO_VCLOCK     1 = virtuelle Uhr: Der Spiel-Timer liefert im Hauptthread Frame x 1/60 statt Echtzeit
+//   LBO_TRACERNG   von,bis: Aufrufer von 0x51a1d0 (rng_a) je Frame nach rngtrace.txt
 //   LBO_WINDOWED   1 = Fenstermodus erzwingen (Direct3D Windowed=1)
 #define COBJMACROS
 #include <windows.h>
@@ -26,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <tlhelp32.h>
 
 // --- Spieladressen (LEGO Batman 2) ---------------------------------------------------
 #define ADDR_FRAME_END      0x005528C0   // sub esp,40h / push ebx / push edi (5 Bytes)
@@ -36,6 +44,7 @@
 #define IAT_CREATEFILEW     0x00C550C0
 #define IAT_DELETEFILEA     0x00C55244
 #define IAT_MOVEFILEA       0x00C55240
+#define IAT_QPC             0x00C551AC   // nur der Spiel-Timer 0x521840/0x5218c0 (und CRT-Init) liest QPC
 #define G_DT                (*(volatile float *)0x011CF0DC)   // gemessenes dt dieses Frames
 #define G_DT_OVERRIDE       (*(volatile float *)0x011CF0F8)   // != 0: ersetzt dt
 #define G_FRAMECOUNT        (*(volatile int *)0x011CF0E4)
@@ -63,6 +72,17 @@
 #define G_RNG_C             (*(volatile unsigned *)0x01195B30) // Setter 0x77d040
 #define FMV_FIND_CALL       0x0062C0EF   // in NuFMVPlayV 0x62be30: call 0x628d60 (Videodatei suchen)
 #define FMV_FIND            0x00628D60
+// Streaming-Eintraege (Laden/Entladen von Levelteilen), abgearbeitet in 0x7eb950 (NuBgProc-Auftrag 0x7d48c0)
+#define G_LOADLIST          (*(int *volatile *)0x011BE084)    // [0] erster Eintrag, [2] Anzahl
+#define LOADLIST_CS         ((LPCRITICAL_SECTION)0x0138B9F8)
+#define G_LOADFILTER_ON     (*(volatile char *)0x01199108)
+#define G_LOADFILTER_ID     (*(volatile int *)0x0119910C)
+// Eintrag: [2] naechster, [5] Zustand (1 leer, 2 laedt, 3/4 geladen, 5 entlaedt), Byte +0x1c gewuenscht, [8] Gruppe
+#define VIDEO_DT_STORE      0x00552B89   // fstp [0x11cf0dc]: dt = Videouhr (0x5bb230)
+#define G_POLL_COUNTDOWN    (*(volatile int *)0x01154400)    // Frames bis zur naechsten Abfrage
+#define G_POLL_DEVICE       (*(volatile short *)0x013666C8)  // naechstes Geraet (0-3 XInput, 4-13 DirectInput)
+#define G_POLL_RESTART      (*(volatile char *)0x013655A7)
+#define FN_RNG_A            0x0051A1D0   // float-Zufall aus 0x11be45c: push ecx / mov eax,[0x11be45c]
 #define FN_GETPTD           0x00BDA791                        // CRT _getptd (rand-Zustand bei +0x14)
 
 // --- XInput-Typen ----------------------------------------------------------------------
@@ -76,7 +96,13 @@ typedef HANDLE (WINAPI *CreateMutexAFn)(LPSECURITY_ATTRIBUTES, BOOL, LPCSTR);
 typedef struct { char dom; int from, to, pad; PAD p; } LINE;
 enum { MODE_OFF, MODE_SCRIPT };
 
-static long g_bg_waits, g_bg_timeouts;
+static long g_bg_waits, g_bg_timeouts, g_load_waits, g_load_timeouts;
+static int g_loadsync, g_videodt, g_render_rng;
+static int g_trace_from, g_trace_to, g_watch_lcg;
+#define LW_MAX (1 << 20)
+static struct { long f; DWORD eip, tid; } g_lw[LW_MAX];
+static volatile LONG g_nlw;
+static FILE *g_trace;
 static int g_bgsync, g_devchange, g_rng_reset, g_no_movies;
 static int g_mode, g_fixed_dt, g_fps_cap, g_max_frames, g_shot_every, g_multi;
 static char g_dir[MAX_PATH], g_live[MAX_PATH];
@@ -519,6 +545,61 @@ static BOOL WINAPI hook_movefile(LPCSTR from, LPCSTR to)
     return real_movefile(from, to);
 }
 
+// Leere Ordner SavedGames\SlotN zeigt das Spiel als "beschaedigt" an. Im Schutzmodus werden sie deshalb
+// gar nicht erst angelegt (Erfolg melden, nichts tun).
+typedef BOOL (WINAPI *CreateDirectoryAFn)(LPCSTR, LPSECURITY_ATTRIBUTES);
+typedef int (WINAPI *SHCreateDirectoryExAFn)(HWND, LPCSTR, const SECURITY_ATTRIBUTES *);
+static CreateDirectoryAFn real_createdir;
+static SHCreateDirectoryExAFn real_shcreatedir;
+
+static int is_save_dir(const char *path)
+{
+    char low[MAX_PATH];
+    size_t i;
+    if (!path || g_allow_save) return 0;
+    for (i = 0; path[i] && i < MAX_PATH - 1; i++) low[i] = (char)tolower((unsigned char)path[i]);
+    low[i] = 0;
+    return strstr(low, "lego batman 2\\savedgames") != NULL;
+}
+
+static BOOL WINAPI hook_createdir(LPCSTR path, LPSECURITY_ATTRIBUTES sa)
+{
+    if (is_save_dir(path)) { logf_("Ordner nicht angelegt: %s", path); return TRUE; }
+    return real_createdir(path, sa);
+}
+
+static int WINAPI hook_shcreatedir(HWND w, LPCSTR path, const SECURITY_ATTRIBUTES *sa)
+{
+    if (is_save_dir(path)) { logf_("Ordner nicht angelegt: %s", path); return ERROR_SUCCESS; }
+    return real_shcreatedir(w, path, sa);
+}
+
+// --- Virtuelle Uhr --------------------------------------------------------------------------------
+// Effekte beim Zeichnen (z. B. 0x59861e, 0x5e0470) ziehen je nach gemessener Zeit unterschiedlich oft
+// Zufallszahlen. Mit LBO_VCLOCK liefert QPC im Hauptthread: Start + Frame x Frequenz/60 + 1 Tick je Aufruf
+// im Frame (damit Schleifen, die auf Zeit warten, weiterkommen). Andere Threads sehen die Echtzeit.
+typedef BOOL (WINAPI *QpcFn)(LARGE_INTEGER *);
+static QpcFn real_qpc;
+static int g_vclock;
+static volatile DWORD g_main_tid;
+static LONGLONG g_vbase, g_vfreq;
+static long g_vframe = -1, g_vcalls;
+
+static BOOL WINAPI hook_qpc(LARGE_INTEGER *out)
+{
+    if (!g_vclock || !g_main_tid || GetCurrentThreadId() != g_main_tid) return real_qpc(out);
+    if (!g_vbase) {
+        LARGE_INTEGER f, n;
+        QueryPerformanceFrequency(&f);
+        real_qpc(&n);
+        g_vfreq = f.QuadPart;
+        g_vbase = n.QuadPart - (LONGLONG)g_F * (g_vfreq / 60);
+    }
+    if (g_vframe != g_F) { g_vframe = g_F; g_vcalls = 0; }
+    out->QuadPart = g_vbase + (LONGLONG)g_F * (g_vfreq / 60) + ++g_vcalls;
+    return TRUE;
+}
+
 static void patch_iat(DWORD slot, void *fn, void **orig)
 {
     DWORD old;
@@ -566,7 +647,12 @@ static void reset_rng(void)
     G_RNG_B = 0x5678;
     G_RNG_C = 0x9ABC;
     if (crt) *crt = 1;
-    logf_("Zufallszustaende zurueckgesetzt");
+    // Eingabe-Takt (0x63bcd0): pro Frame wird nur ein Geraet gelesen, reihum. Die Phase stammt aus der
+    // Startphase und muss wie die Zufallszustaende auf beiden Seiten gleich sein.
+    G_POLL_COUNTDOWN = 1;
+    G_POLL_DEVICE = 0;
+    G_POLL_RESTART = 0;
+    logf_("Zufallszustaende und Eingabe-Takt zurueckgesetzt");
 }
 
 static unsigned crt_rand_state(void)
@@ -685,6 +771,229 @@ static void bg_wait_idle(void)
     if (waited) g_bg_waits++;
 }
 
+// Zaehlt Streaming-Eintraege, die gewuenscht, aber noch nicht geladen sind. Eintraege einer anderen Gruppe ueberspringt auch 0x7eb950.
+static int loads_in_flight(int *first_state)
+{
+    int *list, *it, n = 0, guard = 0;
+    *first_state = -1;
+    __try {
+        list = G_LOADLIST;
+        if (!list) return 0;
+        EnterCriticalSection(LOADLIST_CS);
+        for (it = (int *)list[0]; it && guard < 4096; it = (int *)it[2], guard++) {
+            int st = it[5];
+            char want = *((char *)it + 0x1c);
+            if (G_LOADFILTER_ON && G_LOADFILTER_ID != -1 && it[8] != G_LOADFILTER_ID) continue;
+            // Nur Laden zaehlt: Entladen (5) wartet auf das Zeichnen im Hauptthread und aendert keine Spiellogik
+            if (!want || st == 3 || st == 4 || st == 5 || st == 0) continue;
+            if (!n) *first_state = st * 2 + (want != 0);
+            n++;
+        }
+        LeaveCriticalSection(LOADLIST_CS);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return n;
+}
+
+// LBO_LOADSYNC: Laden und Entladen werden innerhalb des Frames fertig, in dem die Spiellogik sie anfordert.
+// So erscheinen Figuren und Levelteile an festen Frames, unabhaengig von der Ladezeit.
+static void wait_loads(void)
+{
+    DWORD t0 = GetTickCount();
+    int n, st, waited = 0;
+    while ((n = loads_in_flight(&st)) > 0) {
+        if (GetTickCount() - t0 > 30000) {   // erstes Laden beim Start dauert mehrere Sekunden
+            g_load_timeouts++;
+            logf_("Laden: Zeitgrenze, %d Eintraege offen (erster Zustand %d, gewuenscht %d)", n, st / 2, st & 1);
+            break;
+        }
+        waited = 1;
+        Sleep(0);
+    }
+    if (waited) g_load_waits++;
+}
+
+// Aufrufer der Zufallsgeneratoren mitschreiben (Diagnose: wer zieht unterschiedlich oft?)
+// a = 0x51a1d0 (rng_a), c = CRT rand 0xbd1c9d
+static void __stdcall rng_trace(DWORD caller, DWORD tag)
+{
+    if (g_trace && g_F >= g_trace_from && g_F <= g_trace_to)
+        fprintf(g_trace, "%ld %c %08lx %s\n", g_F, (char)tag, caller,
+                GetCurrentThreadId() == GetThreadId(g_main_thread) ? "main" : "thread");
+}
+
+__declspec(naked) static void stub_rng_a(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push 'a'
+        push dword ptr [esp + 40]   // Ruecksprungadresse
+        call rng_trace
+        popfd
+        popad
+        push ecx                    // ueberschriebener Anfang von 0x51a1d0
+        mov eax, dword ptr ds:[011BE45Ch]
+        push 0051A1D6h
+        ret
+    }
+}
+
+// LBO_RENDERRNG: Diese Aufrufer beim Zeichnen ziehen je nach Effekt-Takt unterschiedlich oft Zufallszahlen
+// (zur Laufzeit per LBO_TRACERNG ermittelt). Mit eigenen Zustaenden verschieben sie die Folgen der Spiellogik
+// (CRT rand, rng_a 0x11be45c) nicht mehr. ecx/edx bleiben wie beim Original erhalten.
+static unsigned g_rr_crt = 1, g_rr_a = 0x1234;
+// Der Musik-/Zustandswechsel 0x94cdf0 (Objekt 0x11ad524, ausgeloest ueber 0x9edb10) laeuft im Takt der
+// Musik, also in Echtzeit, und zieht dabei aus dem Logik-LCG 0x11a1844. Er und seine Schwesterfunktionen
+// 0x94cbc0 und 0x94d110 (gleiches Muster) bekommen je einen eigenen Zustand.
+static unsigned g_rr_music_lcg = 12345, g_rr_music_lcg2 = 23456, g_rr_music_lcg3 = 34567;
+
+static int patch_abs32(DWORD at, DWORD expect, void *to)
+{
+    DWORD old;
+    if (*(DWORD *)at != expect) return 0;
+    VirtualProtect((void *)at, 4, PAGE_EXECUTE_READWRITE, &old);
+    *(DWORD *)at = (DWORD)to;
+    VirtualProtect((void *)at, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void *)at, 4);
+    return 1;
+}
+
+__declspec(naked) static void render_rand(void)
+{
+    __asm {
+        mov eax, g_rr_crt
+        imul eax, eax, 343FDh
+        add eax, 269EC3h
+        mov g_rr_crt, eax
+        shr eax, 16
+        and eax, 7FFFh
+        ret
+    }
+}
+
+__declspec(naked) static void render_rng_a(void)
+{
+    __asm {
+        push ecx
+        mov eax, g_rr_a
+        imul eax, eax, 19660Dh
+        add eax, 3C6EF35Fh
+        mov g_rr_a, eax
+        and eax, 7FFFFFh
+        or eax, 3F800000h
+        mov dword ptr [esp], eax
+        fld dword ptr [esp]
+        fld1
+        fsubp st(1), st
+        fstp dword ptr [esp]
+        fld dword ptr [esp]
+        pop ecx
+        ret
+    }
+}
+
+// LBO_WATCHLCG: DR0 auf 0x11a1844 (Schreiben, 4 Byte) im Hauptthread. Der Handler merkt sich nur Frame
+// und Codeadresse; geschrieben wird am Ende des Fensters.
+static LONG CALLBACK lcg_watch_handler(EXCEPTION_POINTERS *e)
+{
+    LONG i;
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(e->ContextRecord->Dr6 & 1))
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (g_F >= g_trace_from && g_F <= g_trace_to && (i = InterlockedIncrement(&g_nlw) - 1) < LW_MAX) {
+        g_lw[i].f = g_F;
+        g_lw[i].eip = e->ContextRecord->Eip;
+        g_lw[i].tid = GetCurrentThreadId();
+    }
+    e->ContextRecord->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Setzt DR0 in allen Threads des Spiels (ausser dem eigenen) und wiederholt das alle 2 s fuer neue Threads
+static DWORD WINAPI lcg_watch_set(void *arg)
+{
+    (void)arg;
+    AddVectoredExceptionHandler(1, lcg_watch_handler);
+    for (;;) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 te;
+        int n = 0;
+        te.dwSize = sizeof te;
+        if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
+            do {
+                HANDLE t;
+                CONTEXT c;
+                if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+                t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+                if (!t) continue;
+                if (SuspendThread(t) != (DWORD)-1) {
+                    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                    if (GetThreadContext(t, &c) && c.Dr0 != 0x011A1844) {
+                        c.Dr0 = 0x011A1844;
+                        c.Dr7 = (c.Dr7 & ~0x000F0003u) | 1u | (1u << 16) | (3u << 18);
+                        if (SetThreadContext(t, &c)) n++;
+                    }
+                    ResumeThread(t);
+                }
+                CloseHandle(t);
+            } while (Thread32Next(snap, &te));
+        }
+        if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+        if (n) logf_("LCG-Waechter in %d Threads gesetzt", n);
+        Sleep(2000);
+    }
+}
+
+// Diagnose (LBO_WATCHLCG): Wer ruft den 723-Frame-Ausloeser 0x94cdf0 auf? Stack einmal protokollieren.
+static void __stdcall trig_trace(DWORD *sp, DWORD obj)
+{
+    static int logged;
+    char line[600];
+    int i, n = 0, len;
+    if (logged++ > 2) return;
+    len = snprintf(line, sizeof line, "0x94cdf0 Objekt %08lx Stack:", obj);
+    for (i = 0; i < 256 && n < 16; i++)
+        if (sp[i] >= 0x00401000 && sp[i] < 0x00C55000) { len += snprintf(line + len, sizeof line - len, " %08lx", sp[i]); n++; }
+    logf_("%s", line);
+}
+
+__declspec(naked) static void stub_trig(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push ecx
+        lea eax, [esp + 40]
+        push eax
+        call trig_trace
+        popfd
+        popad
+        push esi                    // ueberschriebener Anfang von 0x94cdf0 (7 Bytes)
+        mov esi, ecx
+        push edi
+        mov edi, dword ptr [esi + 10h]
+        push 0094CDF7h
+        ret
+    }
+}
+
+// CRT rand 0xbd1c9d beginnt mit call _getptd (0xbda791)
+__declspec(naked) static void stub_crt_rand(void)
+{
+    __asm {
+        pushad
+        pushfd
+        push 'c'
+        push dword ptr [esp + 40]
+        call rng_trace
+        popfd
+        popad
+        mov eax, 00BDA791h
+        call eax
+        push 00BD1CA2h
+        ret
+    }
+}
+
 static void __cdecl on_frame_end(void)
 {
     CHARSNAP cs;
@@ -693,6 +1002,14 @@ static void __cdecl on_frame_end(void)
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_main_thread,
                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0);
         CreateThread(NULL, 0, stall_watch, NULL, 0, NULL);
+        g_main_tid = GetCurrentThreadId();
+        if (g_watch_lcg) CreateThread(NULL, 0, lcg_watch_set, NULL, 0, NULL);
+    }
+    if (g_watch_lcg && g_trace && F == g_trace_to + 2) {
+        LONG i, n = g_nlw < LW_MAX ? g_nlw : LW_MAX;
+        for (i = 0; i < n; i++)
+            fprintf(g_trace, "%ld l %08lx %s\n", g_lw[i].f, g_lw[i].eip, g_lw[i].tid == g_main_tid ? "main" : "thread");
+        fflush(g_trace);
     }
     g_last_frame_tick = GetTickCount();
     flush_shot();
@@ -701,6 +1018,8 @@ static void __cdecl on_frame_end(void)
     // Ohne Fensterfokus haelt das Spiel an (0x5bc170). Im Skriptmodus soll es trotzdem weiterlaufen.
     if (g_mode == MODE_SCRIPT) G_WINDOW_ACTIVE = 1;
     if (g_bgsync == 2) bg_wait_idle();
+    if (g_loadsync) wait_loads();
+    if (F % 3000 == 0 && g_loadsync) logf_("Laden: %ld Wartephasen, %ld Zeitgrenzen", g_load_waits, g_load_timeouts);
     if (F % 3000 == 0 && g_bgsync == 2) logf_("NuBgProc: %ld Wartephasen, %ld Zeitgrenzen", g_bg_waits, g_bg_timeouts);
     if (g_bgsync == 1 && G_BGPROC && !G_BGPROC[BGPROC_SYNC]) {
         G_BGPROC[BGPROC_SYNC] = 1;
@@ -716,6 +1035,7 @@ static void __cdecl on_frame_end(void)
                     cs.p1[0], cs.p1[1], cs.p1[2], cs.p2[0], cs.p2[1], cs.p2[2], GetTickCount() - g_t0);
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         if (F % 60 == 0) fflush(g_csv);
+        if (g_trace && F == g_trace_to + 1) fflush(g_trace);
     }
     g_polls = 0;
     if (F % 10 == 0) {
@@ -772,10 +1092,12 @@ static DWORD WINAPI installer(void *arg)
     void *mutex_fn = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "CreateMutexA");
     DWORD start = GetTickCount();
     void *file_fn = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "CreateFileA");
+    static const unsigned char vdt_orig[6] = { 0xD9, 0x1D, 0xDC, 0xF0, 0x1C, 0x01 };
+    int vdt_done = !g_videodt, rng_done = !g_trace_to, rrng_done = !g_render_rng;
     int mutex_done = !g_multi, frame_done = 0, xinput_done = 0, d3d_done = 0, file_done = 0, fmv_done = !g_no_movies;
     (void)arg;
     // Eng pollen: Die Importtabelle wird von der Huelle befuellt, der Mutex kurz danach angelegt
-    while ((!mutex_done || !frame_done || !xinput_done || !d3d_done || !file_done || !fmv_done) && GetTickCount() - start < 120000) {
+    while ((!mutex_done || !frame_done || !xinput_done || !d3d_done || !file_done || !fmv_done || !vdt_done || !rng_done || !rrng_done) && GetTickCount() - start < 120000) {
         __try {
             if (!mutex_done && *(void **)IAT_CREATEMUTEXA == mutex_fn) {
                 patch_iat(IAT_CREATEMUTEXA, (void *)hook_createmutex, (void **)&real_createmutex);
@@ -786,6 +1108,9 @@ static DWORD WINAPI installer(void *arg)
                 patch_iat(IAT_CREATEFILEW, (void *)hook_createfilew, (void **)&real_createfilew);
                 patch_iat(IAT_DELETEFILEA, (void *)hook_deletefile, (void **)&real_deletefile);
                 patch_iat(IAT_MOVEFILEA, (void *)hook_movefile, (void **)&real_movefile);
+                patch_iat(IAT_QPC, (void *)hook_qpc, (void **)&real_qpc);
+                patch_iat(0x00C551C0, (void *)hook_createdir, (void **)&real_createdir);        // CreateDirectoryA
+                patch_iat(0x00C5526C, (void *)hook_shcreatedir, (void **)&real_shcreatedir);    // SHCreateDirectoryExA
                 file_done = 1;
             }
             if (!xinput_done && (DWORD)*(void **)IAT_XINPUT_GETSTATE > 0x10000000) {
@@ -796,7 +1121,36 @@ static DWORD WINAPI installer(void *arg)
             if (!frame_done && !memcmp((void *)ADDR_FRAME_END, pro_frame, 5))
                 frame_done = patch_jmp(ADDR_FRAME_END, (void *)stub_frame_end, pro_frame);
             if (!d3d_done) d3d_done = patch_call(D3DCREATE9_CALL, D3DCREATE9_THUNK, (void *)h_create9);
+            if (!rng_done) {
+                static const unsigned char pro_rng[6] = { 0x51, 0xA1, 0x5C, 0xE4, 0x1B, 0x01 };
+                static const unsigned char pro_rand[5] = { 0xE8, 0xEF, 0x8A, 0x00, 0x00 };
+                static const unsigned char pro_trig[5] = { 0x56, 0x8B, 0xF1, 0x57, 0x8B };
+                if (!memcmp((void *)FN_RNG_A, pro_rng, 6) && !memcmp((void *)0x00BD1C9D, pro_rand, 5))
+                    rng_done = (!g_watch_lcg || patch_jmp(0x0094CDF0, (void *)stub_trig, pro_trig)) &&
+                               patch_jmp(FN_RNG_A, (void *)stub_rng_a, pro_rng) &&
+                               patch_jmp(0x00BD1C9D, (void *)stub_crt_rand, pro_rand);
+            }
+            if (!rrng_done)
+                rrng_done = patch_call(0x005E0D52, 0x00BD1C9D, (void *)render_rand) &&
+                            patch_call(0x005E0DB8, 0x00BD1C9D, (void *)render_rand) &&
+                            patch_call(0x00598619, 0x0051A1D0, (void *)render_rng_a) &&
+                            patch_abs32(0x0094CEC4, 0x011A1844, &g_rr_music_lcg) &&
+                            patch_abs32(0x0094CED5, 0x011A1844, &g_rr_music_lcg) &&
+                            patch_abs32(0x0094CC92, 0x011A1844, &g_rr_music_lcg2) &&
+                            patch_abs32(0x0094CCA3, 0x011A1844, &g_rr_music_lcg2) &&
+                            patch_abs32(0x0094D201, 0x011A1844, &g_rr_music_lcg3) &&
+                            patch_abs32(0x0094D212, 0x011A1844, &g_rr_music_lcg3);
             if (!fmv_done) fmv_done = patch_call(FMV_FIND_CALL, FMV_FIND, (void *)no_movie_find);
+            if (!vdt_done && !memcmp((void *)VIDEO_DT_STORE, vdt_orig, 6)) {
+                // fstp [0x11cf0dc] -> fstp st(0) + 4 x nop
+                static const unsigned char vdt_new[6] = { 0xDD, 0xD8, 0x90, 0x90, 0x90, 0x90 };
+                DWORD old;
+                VirtualProtect((void *)VIDEO_DT_STORE, 6, PAGE_EXECUTE_READWRITE, &old);
+                memcpy((void *)VIDEO_DT_STORE, vdt_new, 6);
+                VirtualProtect((void *)VIDEO_DT_STORE, 6, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), (void *)VIDEO_DT_STORE, 6);
+                vdt_done = 1;
+            }
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         if (mutex_done && file_done) Sleep(1); else SwitchToThread();
     }
@@ -825,6 +1179,13 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_ALLOWSAVE", buf, sizeof buf)) g_allow_save = atoi(buf);
     if (GetEnvironmentVariableA("LBO_BGSYNC", buf, sizeof buf)) g_bgsync = atoi(buf);
     if (GetEnvironmentVariableA("LBO_NOMOVIES", buf, sizeof buf)) g_no_movies = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_LOADSYNC", buf, sizeof buf)) g_loadsync = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_VIDEODT", buf, sizeof buf)) g_videodt = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_VCLOCK", buf, sizeof buf)) g_vclock = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_WATCHLCG", buf, sizeof buf)) g_watch_lcg = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_RENDERRNG", buf, sizeof buf)) g_render_rng = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_TRACERNG", buf, sizeof buf) && sscanf(buf, "%d,%d", &g_trace_from, &g_trace_to) == 2)
+        g_trace = open_out("rngtrace.txt", "w");
     if (GetEnvironmentVariableA("LBO_RNGRESET", buf, sizeof buf)) g_rng_reset = atoi(buf);
     if (g_mode == MODE_SCRIPT && GetEnvironmentVariableA("LBO_SCRIPT", buf, sizeof buf)) load_script(buf);
     if (GetEnvironmentVariableA("LBO_LIVE", g_live, sizeof g_live)) {
@@ -837,7 +1198,8 @@ static void init(void)
     if (g_csv) fprintf(g_csv, "F,game_frame,dt,rng_pm_seed,rng_lcg16,rng_pm_default,rng_a,rng_b,rng_c,crt_rand,polls,chars,char_hash,p1x,p1y,p1z,p2x,p2y,p2z,ms\n");
     logf_("Modus %d, festes dt %d, fps %d, max Frames %d, Screenshot alle %d, Mehrfach %d", g_mode, g_fixed_dt,
           g_fps_cap, g_max_frames, g_shot_every, g_multi);
-    logf_("NuBgProc synchron %d, ohne Videos %d, Zufalls-Reset bei Frame %d", g_bgsync, g_no_movies, g_rng_reset);
+    logf_("NuBgProc synchron %d, ohne Videos %d, Zufalls-Reset bei Frame %d, Lade-Sync %d, Video-dt fest %d, virtuelle Uhr %d", g_bgsync,
+          g_no_movies, g_rng_reset, g_loadsync, g_videodt, g_vclock);
     CreateThread(NULL, 0, installer, NULL, 0, NULL);
 }
 

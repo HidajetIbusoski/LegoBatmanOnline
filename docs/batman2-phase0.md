@@ -157,9 +157,43 @@ Ursachen:
 
 Die Bewegung selbst war in beiden Instanzen gleich: Spieler 1 stand nach dem Levelstart in beiden Läufen bei (−0,0361; −0,3564; −5,6282). Die Figurenphysik ist also vermutlich deterministisch. Belegt ist das erst, wenn das Laden synchronisiert ist.
 
+## Lade-Synchronisation und Abgleich (19.10.2026)
+
+Ursachen für Abweichungen und was die DLL dagegen tut:
+
+| Ursache | Fund | Gegenmittel (`lbo2.dll`) |
+|---|---|---|
+| Streaming-Laden | `0x7eb950` (Auftrag `0x7d48c0`) ist eine **Dauerschleife** über die Eintragsliste `*0x11be084` (kritischer Abschnitt `0x138b9f8`). Eintrag: `+8` nächster, `+0x14` Zustand (1 leer, 2 lädt, 3/4 geladen, 5 entlädt), Byte `+0x1c` gewünscht, `+0x20` Gruppe (Filter `0x1199108`/`0x119910c`). Deshalb lief „warten bis NuBgProc leer“ immer in die Zeitgrenze. | `LBO_LOADSYNC=1`: Das Frame-Ende wartet, bis kein gewünschter Eintrag mehr lädt. Entladen (5) zählt nicht, es braucht das Zeichnen im Hauptthread. |
+| Video-dt | `0x5528c0` setzt dt bei `0x552b89` auf die Videouhr (Echtzeit) | `LBO_VIDEODT=1`: Dieser Speicherbefehl wird zu `fstp st(0)`, dt bleibt 1/60. Danach startet das neue Spiel in beiden Instanzen im selben Frame (vorher 36 Frames Versatz). |
+| Gemessene Zeit | Effekte nutzen den Spiel-Timer (QPC nur in `0x521840`/`0x5218c0`) | `LBO_VCLOCK=1`: QPC liefert im Hauptthread Start + Frame × 1/60 (+1 Tick je Aufruf) |
+| Zufall beim Zeichnen | CRT-`rand` aus `0x5e0470` (Aufrufe `0x5e0d52`, `0x5e0db8`) und `rng_a` (`0x598619`) im Effekt-Takt | `LBO_RENDERRNG=1`: Diese Aufrufe gehen an eigene Generatoren |
+| Musik-Takt | `0x94cdf0` (Objekt `0x11ad524`, über `0x9edb10`) zieht alle 723 Frames aus dem Logik-LCG `0x11a1844`, gesteuert von der Musik in Echtzeit; dasselbe Muster haben `0x94cbc0` und `0x94d110` | ebenfalls `LBO_RENDERRNG`: Die Adressen `0x11a1844` in diesen drei Funktionen zeigen auf eigene Zustände |
+| Eingabe-Takt | `0x63bcd0` liest pro Frame nur ein Gerät, reihum (Countdown `0x1154400`, Gerät `0x13666c8`, Flag `0x13655a7`). Jedes Pad wird alle 5 Frames gelesen. | Diese drei Werte gehören zum Abgleich (`LBO_RNGRESET`) |
+| Programmstart | Das erste Laden (132 Einträge, Frame ~10) braucht den Hauptthread; Zufallszustände laufen ab Frame 6 auseinander | Abgleichpunkt nötig: online übernimmt der Gast die Zustände vom Host, lokal `LBO_RNGRESET=<Frame>` |
+
+Diagnose-Hilfen: `LBO_TRACERNG=von,bis` schreibt die Aufrufer von `rng_a` und CRT-`rand` je Frame nach `rngtrace.txt`. `LBO_WATCHLCG=1` setzt zusätzlich in allen Threads einen Hardware-Haltepunkt auf den LCG (Schreibzugriffe mit Codeadresse und Thread).
+
+Leere Ordner `SavedGames\SlotN` zeigt das Spiel als „beschädigt“ an und fragt dann nach einem Speicherplatz. Im Schutzmodus legt die DLL sie deshalb gar nicht erst an (`CreateDirectoryA`, `SHCreateDirectoryExA`). Ohne diese Umleitung blieben drei Testpaare im Speichermenü stehen; ihre scheinbar gleichen Ergebnisse waren deshalb wertlos.
+
+**Ergebnis (Lauf d11):** zwei Instanzen gleichzeitig, `LBO_LOADSYNC=1 LBO_VIDEODT=1 LBO_VCLOCK=1 LBO_RENDERRNG=1 LBO_RNGRESET=4000`, Skript `b2_det.txt`, 30.000 Frames. **Noch nicht deterministisch, aber deutlich näher dran:**
+
+| | d1 (ohne alles) | d11 |
+|---|---|---|
+| Start „Neues Spiel“ | 36 Frames Versatz | gleicher Frame (5273) |
+| CRT-`rand`, Park-Miller, Eingabe-Takt nach dem Abgleich | weichen ab | gleich über 26.000 Frames |
+| Ende Nachrichten-Video | – | 2 Frames Versatz (6511/6513) |
+| Levelstart | 30 Frames Versatz | 4 Frames Versatz (20510/20514) |
+| Figuren beim Levelstart | 3/8/9/11/12/13 bei +0/+1/+2/+3/+49/+73 bzw. 3/8/10/11/12/13 bei +0/+1/+3/+11/+65/+69 | 3/8/10/11/12/13 bei +0/+1/+3/+12/+55/+66 bzw. 3/8/11/12/13 bei +0/+1/+3/+40/+58 |
+| LCG `0x11a1844` | ab Frame 11 | ab Frame 5034 (ein zusätzlicher Zug in einer Instanz) |
+
+Offene Quellen:
+1. **Video-Ende:** Das Nachrichten-Video endet trotz festem dt nicht im selben Frame. Vermutlich entscheidet die Decoderzeit (`NuFmvStream`, `0x5ba670`), wann es fertig ist.
+2. **Weitere Ladewege:** Figuren erscheinen weiterhin nach Ladezeit. Die Streaming-Liste deckt nicht alles ab: NuBgProc-Aufträge (`DoDynamicLoad`, `CutsceneResourcePacket::DoLoad`, `SampleLoader`) und `m_readThread` laufen weiter frei.
+3. **LCG ab Frame 5034:** Im Trace von d7 war `0x94ced9` die einzige zeitabhängige Schreibstelle; die ist jetzt umgeleitet. Der verbleibende Zug ist noch nicht gefunden (nächster Schritt: `LBO_WATCHLCG` in einem Lauf mit Spielgeschehen).
+
 ## Zufallsgeneratoren
 
-Neben `0x11a1840` (Park-Miller-Startwert), `0x11a1844` (16-Bit-LCG, 615 Zugriffe) und `0x102b358` (Park-Miller-Standardzustand) gibt es drei weitere Zustände mit Settern: `0x11be45c` (`0x51a170`), `0x1195b50` (`0x77f280`) und `0x1195b30` (`0x77d040`). Dazu kommt der CRT-`rand`-Zustand des Hauptthreads (`_getptd()+0x14`). Sie laufen schon im Intro auseinander (CRT ab Frame 3, LCG ab Frame 11). Online müssen sie wie bei Batman 1 beim Levelstart vom Host übernommen werden. Lokal setzt `LBO_RNGRESET=<Frame>` sie zu einem festen Frame auf feste Werte.
+Neben `0x11a1840` (Park-Miller-Startwert), `0x11a1844` (16-Bit-LCG, 615 Zugriffe) und `0x102b358` (Park-Miller-Standardzustand) gibt es drei weitere Zustände mit Settern: `0x11be45c` (`0x51a170`), `0x1195b50` (`0x77f280`) und `0x1195b30` (`0x77d040`). Dazu kommt der CRT-`rand`-Zustand des Hauptthreads (`_getptd()+0x14`). Sie laufen schon im Intro auseinander (CRT ab Frame 3, LCG ab Frame 11). Online müssen sie wie bei Batman 1 beim Levelstart vom Host übernommen werden. Lokal setzt `LBO_RNGRESET=<Frame>` sie zu einem festen Frame auf feste Werte, zusammen mit dem Eingabe-Takt.
 
 ## Erste Einschätzung
 
@@ -169,7 +203,7 @@ Neben `0x11a1840` (Park-Miller-Startwert), `0x11a1844` (16-Bit-LCG, 615 Zugriffe
 
 ## Nächste Schritte
 
-1. **Laden deterministisch machen.** Statt auf leere Warteschlangen zu warten, die Stelle finden, an der der Hauptthread fertig geladene Einträge übernimmt (Liste in `0x7eb950`/`0x7e90b0`, Zustand `+0x14`), und dort nur an Frames übernehmen, an denen beide Seiten fertig sind. Alternative: Spielschritt anhalten, bis der Ladezustand passt, und dabei nur rendern.
-2. **Videos:** klären, worauf das Spiel ohne Video 23.600 Frames wartet, oder Videos laufen lassen und ihr dt (`0x5bb230`) auf 1/60 festhalten.
-3. **Test mit Levelanker:** Eingaben ab Levelstart relativ zählen und die Zufallszustände dort zurücksetzen. Dann lässt sich die reine Spiellogik prüfen, auch solange die Menüphase noch nicht synchron ist.
-4. Danach wie bei Batman 1: Netzcode und App-Anbindung für Batman 2.
+1. **Restliche Ladewege und Video-Ende** synchronisieren (siehe „Offene Quellen“), dann d11 wiederholen, bis Figuren und Positionen gleich bleiben.
+2. **Abgleichpunkt für online:** Beim Start des Levels (bzw. beim Verlassen des Hauptmenüs) überträgt der Host Zufallszustände, Eingabe-Takt und ggf. weitere Zähler an den Gast; danach Lockstep wie bei Batman 1.
+3. Netzcode und App-Anbindung für Batman 2 (Adresstabelle pro Spiel).
+4. Längere Tests in weiteren Levels (Fahrzeuge, Charakterwechsel, Speichern ist im Test umgeleitet).

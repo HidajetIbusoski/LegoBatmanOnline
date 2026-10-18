@@ -93,9 +93,13 @@ der Gast gibt dann bei 4 die oeffentliche IP des Hosts ein.
 Wichtig waehrend des Spiels
 ---------------------------
 - Beide Spiele laufen im Gleichschritt. Hakt es bei einem, wartet der andere.
-- Fenster nicht schliessen oder minimieren. Beendet ihr das Spiel bei einem,
-  bleibt es beim anderen stehen.
+- Das Spiel startet immer im Vollbild. Beendet ihr es bei einem, bleibt es
+  beim anderen stehen.
 - Die App waehrend des Spiels offen lassen.
+- Erscheint "Eure Spiele laufen nicht mehr synchron": Der Einladende speichert
+  (falls gewuenscht), beide beenden das Spiel und starten in der App neu mit
+  "Zusammen spielen". Die App schickt die Fehlerdaten automatisch an den
+  Mitspieler - bitte die App danach noch eine Minute offen lassen.
 
 
 Datenschutz

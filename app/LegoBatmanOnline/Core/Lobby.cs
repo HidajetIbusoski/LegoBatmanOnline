@@ -584,6 +584,7 @@ public sealed class Lobby : Bindable
         if (_opt.Test)
         {
             env["LBO_MULTI"] = "1";
+            env["LBO_WINDOWED"] = "1";
             env["LBO_ALLOWSAVE"] = "0";
             if (_opt.MaxFrames > 0) env["LBO_MAXFRAMES"] = _opt.MaxFrames.ToString();
         }
@@ -668,6 +669,9 @@ public sealed class Lobby : Bindable
                     await PlayAsync(peerEp);
                 }
                 break;
+            case "diag":
+                if (known?.State == FriendState.Friend) OnDiag(name, c);
+                break;
             case "go":
                 if ((string?)c["sid"] != _sid || _isHost || _peer?.Id != from || _myEp == null) break;
                 {
@@ -705,13 +709,121 @@ public sealed class Lobby : Bindable
         var sid = _sid;
         SessionText = "Verbinde …";
         string? saveDir = _isHost && _world != null ? SavesDir(_world) : null;
+        var peer = _peer;
+        _logDir = null;
+        _desyncShown = false;
+        _ = WatchDesyncAsync(sid);
         var code = await GameBridge.ConnectAndPlayAsync(_launcher!, _isHost, _myEp!, peerEp, _sessionSlot, saveDir,
             line => _ui.BeginInvoke(() => OnLauncherLine(line)), TestEnv(), _sessionCts.Token);
-        if (_sid == sid) EndSession(code == 0 ? "Spiel beendet." : "Verbindung fehlgeschlagen.");
+        var logDir = _logDir;
+        if (_sid == sid)
+            EndSession(_desyncShown ? "Das Spiel war nicht mehr synchron. Die Fehlerdaten gehen an deinen Mitspieler."
+                     : code == 0 ? "Spiel beendet." : "Verbindung fehlgeschlagen.");
+        if (peer != null && logDir != null) await SendDiagAsync(peer, logDir);
+    }
+
+    // --- Desync: Hinweis und Fehlerdaten -------------------------------------------------
+    private string? _logDir;
+    private bool _desyncShown;
+
+    /// <summary>Waehrend des Spiels das Log der Mod beobachten und einen Desync sofort anzeigen.</summary>
+    private async Task WatchDesyncAsync(string? sid)
+    {
+        while (_sid == sid && SessionActive)
+        {
+            await Task.Delay(2000);
+            if (_logDir == null || _desyncShown) continue;
+            try
+            {
+                var log = ReadShared(Path.Combine(_logDir, "lbo.log"));
+                if (!log.Contains("NICHT SYNCHRON")) continue;
+                _desyncShown = true;
+                SessionText = "⚠ Eure Spiele sind nicht mehr synchron. Speichert (Einladender) und beendet das Spiel, dann neu starten.";
+                AddLog("Desync erkannt – die Spiele laufen auseinander");
+                AlertRequested?.Invoke();
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>Wird ausgeloest, wenn die App den Spieler deutlich warnen soll (Fenster nach vorn).</summary>
+    public event Action? AlertRequested;
+
+    private static string ReadShared(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var r = new StreamReader(fs, System.Text.Encoding.Latin1);
+        return r.ReadToEnd();
+    }
+
+    /// <summary>Nach einem Desync: Log-Auszug und frames.csv rund um die erste Abweichung an den Partner.</summary>
+    private async Task SendDiagAsync(FriendItem peer, string logDir)
+    {
+        try
+        {
+            var log = ReadShared(Path.Combine(logDir, "lbo.log"));
+            var m = System.Text.RegularExpressions.Regex.Match(log, @"DESYNC bei Frame (\d+)");
+            if (!m.Success || PubOf(peer.Id) is not { } pub) return;
+            int f0 = int.Parse(m.Groups[1].Value);
+            var csvLines = ReadShared(Path.Combine(logDir, "frames.csv")).Split('\n');
+            var rows = new List<string> { csvLines[0].TrimEnd('\r') };
+            foreach (var l in csvLines.Skip(1))
+            {
+                var comma = l.IndexOf(',');
+                if (comma > 0 && int.TryParse(l[..comma], out var f) && f >= f0 - 300 && f <= f0 + 60) rows.Add(l.TrimEnd('\r'));
+            }
+            var logLines = log.Split('\n').Select(l => l.TrimEnd('\r'));
+            var excerpt = logLines.Where(l => !l.Contains("DESYNC")).Take(300)
+                .Concat(logLines.Where(l => l.Contains("DESYNC")).Take(5));
+            string cfg = "", cpu = "";
+            try { cfg = File.ReadAllText(Path.Combine(Path.GetDirectoryName(GameBridge.SaveDir)!, "pcconfig.txt")); } catch { }
+            try
+            {
+                cpu = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                    "ProcessorNameString", "") as string ?? "";
+            }
+            catch { }
+            var doc = new JsonObject
+            {
+                ["frame"] = f0, ["dir"] = Path.GetFileName(logDir),
+                ["log"] = string.Join("\n", excerpt), ["csv"] = string.Join("\n", rows),
+                ["cfg"] = cfg, ["sys"] = $"{cpu.Trim()} | {Environment.ProcessorCount} Threads | {Environment.OSVersion}",
+            };
+            using var ms = new MemoryStream();
+            using (var gz = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionLevel.SmallestSize))
+                gz.Write(System.Text.Encoding.UTF8.GetBytes(doc.ToJsonString()));
+            await _msg.SendAsync(peer.Id, pub, new JsonObject { ["t"] = "diag", ["d"] = Convert.ToBase64String(ms.ToArray()) });
+            AddLog($"Fehlerdaten (Desync ab Frame {f0}) an {peer.Name} geschickt");
+        }
+        catch (Exception e) { AddLog("Fehlerdaten konnten nicht gesendet werden: " + e.Message); }
+    }
+
+    private void OnDiag(string fromName, JsonObject c)
+    {
+        try
+        {
+            using var gz = new System.IO.Compression.GZipStream(new MemoryStream(Convert.FromBase64String((string)c["d"]!)),
+                System.IO.Compression.CompressionMode.Decompress);
+            using var outMs = new MemoryStream();
+            gz.CopyTo(outMs);
+            var doc = JsonNode.Parse(outMs.ToArray())!.AsObject();
+            var dir = Path.Combine(Profile.BaseDir, "logs", $"{DateTime.Now:yyyyMMdd-HHmmss}-partner");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "partner_lbo.log"), (string?)doc["log"] ?? "");
+            File.WriteAllText(Path.Combine(dir, "partner_frames.csv"), (string?)doc["csv"] ?? "");
+            File.WriteAllText(Path.Combine(dir, "partner_pcconfig.txt"), (string?)doc["cfg"] ?? "");
+            File.WriteAllText(Path.Combine(dir, "info.txt"),
+                $"Von: {fromName}\nErster Desync bei Frame: {(int?)doc["frame"]}\nLog-Ordner beim Partner: {(string?)doc["dir"]}\n" +
+                $"System des Partners: {(string?)doc["sys"]}\n");
+            AddLog($"Fehlerdaten von {fromName} gespeichert: {dir}");
+        }
+        catch { }
     }
 
     private void OnLauncherLine(string line)
     {
+        var logs = line.IndexOf("(Logs: ", StringComparison.Ordinal);
+        if (logs >= 0 && line.EndsWith(")")) _logDir = line[(logs + 7)..^1].Trim();
         if (line.StartsWith("STATUS "))
         {
             if (_solo) return;  // Text fuer Solo steht schon

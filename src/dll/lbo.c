@@ -22,6 +22,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <mmsystem.h>
+#include <xmmintrin.h>
 #include "net.h"
 #include "input.h"
 
@@ -63,6 +64,8 @@ static int g_net;            // 1 = Lockstep ueber UDP aktiv (net.c)
 static PAD g_net_pad[2];     // synchronisierte Eingaben des aktuellen Frames
 static int g_fixed_dt;
 static int g_max_frames;
+static int g_stutter_every, g_stutter_ms;
+static long g_fake_desync;
 static int g_shot_every;
 static char g_dir[MAX_PATH];
 static FILE *g_log, *g_csv, *g_rec, *g_liveout;
@@ -600,14 +603,89 @@ static void sync_background(void)
             Sleep(1);
         }
     }
-    if (g_sync_bg >= 2 && G_BG_FREEZE) {
+}
+
+// Worker einfrieren, bevor das Spiel weiterrechnet. Erst ganz am Ende von on_frame_end: Unsere
+// eigenen Wartezeiten (Netz, Bildratenbremse) zaehlen so nicht fuer den Wachhund. Sonst taute eine
+// Ping-Spitze ueber 500 ms den Worker auf, und er liefe parallel zur Simulation weiter.
+static void bg_freeze(void)
+{
+    if (g_sync_bg >= 2 && G_BG_FREEZE && G_BG_QUEUE) {
         ResetEvent(G_BG_FREEZE);
         InterlockedExchange(&g_frozen_since, (LONG)GetTickCount() | 1);
     }
 }
 
+// --- Rechengenauigkeit (Netzmodus) -----------------------------------------------------
+// Direct3D 9 stellt die x87-FPU beim Anlegen des Geraets auf 24 Bit. Ob das auf jedem PC gleich
+// passiert (Treiber, Herstellervorgaben des Spiels, eingeklinkte Overlays), ist nicht sicher; eine
+// andere Genauigkeit liesse die Physik nach einigen Sekunden auseinanderlaufen. Daher setzen beide
+// Seiten vor jedem Weltupdate und am Frame-Ende denselben Zustand.
+static int g_fpu_fixes;
+
+static void enforce_fpu(const char *where)
+{
+    unsigned short cw, want = 0x007F;   // 24 Bit, runden zum Naechsten, alle Ausnahmen maskiert
+    unsigned int csr = _mm_getcsr();
+    __asm fnstcw cw
+    if (cw != want || (csr & 0xFFC0) != 0x1F80) {
+        if (g_fpu_fixes++ < 5)
+            logf_("FPU korrigiert (%s): x87 %04x -> %04x, MXCSR %08x -> %08x", where, cw, want, csr, (csr & 0x3F) | 0x1F80);
+        __asm fldcw want
+        _mm_setcsr((csr & 0x3F) | 0x1F80);
+    }
+}
+
+// --- Hinweis bei Desync ----------------------------------------------------------------
+static int g_no_dialog;
+
+static DWORD WINAPI desync_notice(void *arg)
+{
+    (void)arg;
+    MessageBeep(MB_ICONEXCLAMATION);
+    if (g_no_dialog) return 0;
+    MessageBoxW(NULL,
+        L"Eure Spiele laufen nicht mehr synchron.\n\n"
+        L"Ab jetzt seht ihr unterschiedliche Spielst\u00e4nde, Eingaben des Mitspielers wirken falsch.\n\n"
+        L"So geht es weiter: Der Einladende speichert (falls gew\u00fcnscht) und beendet das Spiel, "
+        L"der andere beendet es ebenfalls. Dann in der App erneut \"Zusammen spielen\".\n\n"
+        L"Die App schickt die Fehlerdaten automatisch an deinen Mitspieler.",
+        L"LEGO Batman Online \u2013 nicht mehr synchron",
+        MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL);
+    return 0;
+}
+
 // Wachhund: Wartet der Hauptthread mitten im Frame selbst auf einen Job, kaeme er nie zum
 // Frame-Ende. Dann tauen wir den Worker nach 500 ms auf.
+static HANDLE g_main_thread;
+
+// Diagnose: Wo steht der Hauptthread, wenn der Wachhund auftauen muss? Schreibt EIP und die
+// Ruecksprungadressen im Spielcode vom Stack ins Log.
+static void log_main_stack(void)
+{
+    CONTEXT c;
+    DWORD i, n = 0, words[256];
+    char line[600];
+    int len;
+    if (!g_main_thread || SuspendThread(g_main_thread) == (DWORD)-1) return;
+    c.ContextFlags = CONTEXT_CONTROL;
+    if (GetThreadContext(g_main_thread, &c)) {
+        len = snprintf(line, sizeof line, "Wachhund: Hauptthread EIP=%08lx Stack:", c.Eip);
+        if (ReadProcessMemory(GetCurrentProcess(), (void *)c.Esp, words, sizeof words, NULL) ||
+            ReadProcessMemory(GetCurrentProcess(), (void *)c.Esp, words, 512, NULL)) {
+            for (i = 0; i < 256 && n < 14; i++)
+                if (words[i] >= 0x00401000 && words[i] < 0x00850000) {
+                    len += snprintf(line + len, sizeof line - len, " %08lx", words[i]);
+                    n++;
+                }
+        }
+        ResumeThread(g_main_thread);
+        logf_("%s", line);
+        return;
+    }
+    ResumeThread(g_main_thread);
+}
+
 static DWORD WINAPI bg_watchdog(void *arg)
 {
     (void)arg;
@@ -615,6 +693,7 @@ static DWORD WINAPI bg_watchdog(void *arg)
         LONG since = g_frozen_since;
         Sleep(50);
         if (since && g_frozen_since == since && GetTickCount() - (DWORD)since > 500 && G_BG_FREEZE) {
+            log_main_stack();
             InterlockedExchange(&g_frozen_since, 0);
             SetEvent(G_BG_FREEZE);
             g_bg_unfreezes++;
@@ -626,16 +705,38 @@ static void __cdecl on_frame_end(void)
 {
     SNAP s;
     long F = InterlockedIncrement(&g_F);
+    if (!g_main_thread)
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_main_thread,
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0);
     sync_background();
     cap_frame_rate();
     if (F % 3000 == 0 && g_sync_bg)
         logf_("Hintergrund-Sync: %ld Wartephasen, %ld Timeouts, %ld Wachhund-Auftauungen", g_bg_waits, g_bg_timeouts, g_bg_unfreezes);
+    if (F == 1 || F == 1500 || F % 3000 == 0) {
+        unsigned short cw;
+        unsigned int csr = _mm_getcsr();
+        __asm fnstcw cw
+        logf_("FPU: x87-Steuerwort %04x, MXCSR %08x", cw, csr);
+    }
     if (g_fixed_dt) G_DT_OVERRIDE = 1.0f / 60.0f;
     if (g_mode == MODE_SCRIPT) fix_input_slots();
     if (g_net) net_exchange(F);
+    // Testhilfe LBO_STUTTER="N MS": alle N Frames MS Millisekunden haengen (wie eine Netz-Spitze)
+    if (g_stutter_every > 0 && F % g_stutter_every == 0) Sleep(g_stutter_ms);
 
     snapshot(&s);
-    if (g_net && F % 60 == 0) net_checksum((int)F, s.chars ^ s.rng);
+    if (g_net && F % 60 == 0) {
+        static int notified;
+        long stalls, desyncs;
+        // Testhilfe LBO_FAKEDESYNC=F: ab Frame F eine falsche Pruefsumme melden
+        net_checksum((int)F, (s.chars ^ s.rng) ^ (g_fake_desync && F >= g_fake_desync ? 1 : 0));
+        net_stats(&stalls, &desyncs);
+        if (desyncs > 0 && !notified) {
+            notified = 1;
+            logf_("NICHT SYNCHRON: Hinweis an den Spieler");
+            CreateThread(NULL, 0, desync_notice, NULL, 0, NULL);
+        }
+    }
     if (g_csv) {
         fprintf(g_csv, "%ld,%ld,%d,%.6f,%d,%016llx,%016llx,%d,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%d,%lu,%08x,%08x,%08x,%08x,%08x,%08x,%s\n",
                 F, g_W, G_FRAMECOUNT, G_DT_GAME, s.nchars, s.chars, s.rng,
@@ -664,12 +765,15 @@ static void __cdecl on_frame_end(void)
         g_csv = g_rec = NULL;
         TerminateProcess(GetCurrentProcess(), 0);
     }
+    if (g_net) enforce_fpu("Frame-Ende");
+    bg_freeze();
 }
 
 static void __cdecl on_world_update(void)
 {
     long W = InterlockedIncrement(&g_W);
     if (W == 1) logf_("erstes Weltupdate");
+    if (g_net) enforce_fpu("Weltupdate");
 }
 
 __declspec(naked) static void stub_frame_end(void)
@@ -774,6 +878,9 @@ static int is_protected(const char *path)
 // Spielstands, Lesen wie Schreiben. So laden beide Spiele exakt denselben Stand, und der eigene
 // Spielstand des Gastes bleibt unberuehrt.
 static char g_savedir[MAX_PATH];
+// LBO_PCCONFIG: pcconfig.txt (Grafik-/Toneinstellungen) aus dieser Datei statt aus dem Spielordner
+// des Benutzers. Im Netzmodus muessen beide Spiele dieselben spielrelevanten Einstellungen haben.
+static char g_pcconfig[MAX_PATH];
 typedef DWORD (WINAPI *GetFileAttributesAFn)(LPCSTR);
 typedef HANDLE (WINAPI *FindFirstFileAFn)(LPCSTR, LPWIN32_FIND_DATAA);
 static GetFileAttributesAFn real_getattr;
@@ -783,10 +890,16 @@ static const char *map_guest(const char *path, char *buf)
 {
     char low[MAX_PATH];
     const char *hit;
-    size_t i;
-    if (!g_savedir[0] || !path) return path;
+    size_t i, n;
+    if (!path) return path;
     for (i = 0; path[i] && i < MAX_PATH - 1; i++) low[i] = (char)tolower((unsigned char)path[i]);
     low[i] = 0;
+    n = strlen(low);
+    if (g_pcconfig[0] && n >= 13 && !strcmp(low + n - 13, "\\pcconfig.txt")) {
+        snprintf(buf, MAX_PATH, "%s", g_pcconfig);
+        return buf;
+    }
+    if (!g_savedir[0]) return path;
     hit = strstr(low, "\\saved games");
     if (!hit) return path;
     snprintf(buf, MAX_PATH, "%s%s", g_savedir, path + (hit - low) + strlen("\\saved games"));
@@ -893,6 +1006,9 @@ static void init(void)
     }
     if (GetEnvironmentVariableA("LBO_FIXEDDT", buf, sizeof buf)) g_fixed_dt = atoi(buf);
     if (GetEnvironmentVariableA("LBO_MAXFRAMES", buf, sizeof buf)) g_max_frames = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_STUTTER", buf, sizeof buf)) sscanf(buf, "%d %d", &g_stutter_every, &g_stutter_ms);
+    if (GetEnvironmentVariableA("LBO_FAKEDESYNC", buf, sizeof buf)) g_fake_desync = atol(buf);
+    if (GetEnvironmentVariableA("LBO_NODIALOG", buf, sizeof buf)) g_no_dialog = atoi(buf);
     if (GetEnvironmentVariableA("LBO_SHOT_EVERY", buf, sizeof buf)) g_shot_every = atoi(buf);
     if (g_mode == MODE_SCRIPT && GetEnvironmentVariableA("LBO_SCRIPT", buf, sizeof buf)) load_script(buf);
     if (g_net && GetEnvironmentVariableA("LBO_AUTOLOAD", buf, sizeof buf)) make_autoload_script(atoi(buf));
@@ -917,12 +1033,16 @@ static void init(void)
     patch_iat(IAT_CREATEFILEA, (void *)hook_createfile, (void **)&real_createfile);
     patch_iat(IAT_DELETEFILEA, (void *)hook_deletefile, (void **)&real_deletefile);
     logf_("Spielstand-Schutz %s", g_allow_save ? "AUS (LBO_ALLOWSAVE)" : "aktiv");
-    if (GetEnvironmentVariableA("LBO_SAVEDIR", g_savedir, sizeof g_savedir)) {
+    GetEnvironmentVariableA("LBO_SAVEDIR", g_savedir, sizeof g_savedir);
+    if (GetEnvironmentVariableA("LBO_PCCONFIG", g_pcconfig, sizeof g_pcconfig))
+        logf_("Einstellungen (pcconfig.txt) aus %s", g_pcconfig);
+    if (g_savedir[0] || g_pcconfig[0]) {
         void **slot;
         patch_iat(0x02A178F4, (void *)hook_getattr, (void **)&real_getattr);
         slot = find_iat_slot(GetProcAddress(GetModuleHandleA("kernel32.dll"), "FindFirstFileA"));
         if (slot) patch_iat((DWORD)slot, (void *)hook_findfirst, (void **)&real_findfirst);
-        logf_("Spielstand-Ordner umgeleitet nach %s (FindFirstFileA %s)", g_savedir, slot ? "umgeleitet" : "nicht gefunden");
+        if (g_savedir[0])
+            logf_("Spielstand-Ordner umgeleitet nach %s (FindFirstFileA %s)", g_savedir, slot ? "umgeleitet" : "nicht gefunden");
     }
     input_init((void *)real_getstate, logf_);
     if (GetEnvironmentVariableA("LBO_MULTI", buf, sizeof buf)) g_multi = atoi(buf);

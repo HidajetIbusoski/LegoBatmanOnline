@@ -138,6 +138,14 @@ static void press_enter(void)
 
 static int run_session(ONLINE *o, const char *game, const char *dll, int autoload_slot, const char *host_saves);
 
+// Immer Vollbild (unabhaengig von der Einstellung im Spiel). Nur Tests mit zwei Spielen auf
+// einem PC laufen im Fenster (LBO_WINDOWED=1).
+static const char *window_mode(void)
+{
+    char b[8];
+    return GetEnvironmentVariableA("LBO_WINDOWED", b, sizeof b) && b[0] == '1' ? "-Windowed" : "-Fullscreen";
+}
+
 static int online_menu(void)
 {
     char game[MAX_PATH], dll[MAX_PATH], line[128], code[40];
@@ -295,7 +303,8 @@ static int run_session(ONLINE *o_, const char *game, const char *dll, int autolo
     printf("%s\n", o.role ? "Warte im Spiel, bis der Host den Spielstand geladen hat. Dann Start druecken, um einzusteigen."
                           : "Du bedienst die Menues. Dein Mitspieler steigt mit Start ein.");
     printf("STATUS spiel\n");
-    launch(game, dll, "-Windowed", 1);
+    // Immer Vollbild; nur Tests mit zwei Spielen auf einem PC laufen im Fenster (LBO_WINDOWED=1)
+    launch(game, dll, window_mode(), 1);
     printf("STATUS beendet\n");
     return 0;
 }
@@ -332,7 +341,7 @@ static int solo_mode(const char *savedir)
     // Spielstaende landen ohnehin in savedir; so bleiben auch Einstellungen (pcconfig.txt) erhalten
     { char b[8]; if (!GetEnvironmentVariableA("LBO_ALLOWSAVE", b, sizeof b)) SetEnvironmentVariableA("LBO_ALLOWSAVE", "1"); }
     printf("STATUS spiel\n");
-    launch(game, dll, "", 1);
+    launch(game, dll, window_mode(), 1);
     printf("STATUS beendet\n");
     return 0;
 }

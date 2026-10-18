@@ -24,7 +24,24 @@ public partial class MainWindow : Window
             Loaded += (_, _) => NameBox.Focus();
         }
         Loaded += async (_, _) => await _lobby.StartAsync();
+        // Desync: Taskleistensymbol blinken lassen (das Spiel zeigt selbst eine Meldung)
+        _lobby.AlertRequested += () =>
+        {
+            var info = new FLASHWINFO
+            {
+                cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf<FLASHWINFO>(),
+                hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle,
+                dwFlags = 3 | 12,   // Titel und Taskleiste, bis das Fenster vorne ist
+            };
+            FlashWindowEx(ref info);
+        };
     }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool FlashWindowEx(ref FLASHWINFO info);
 
     private void SaveName_Click(object sender, RoutedEventArgs e)
     {

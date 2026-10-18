@@ -13,7 +13,7 @@ CODE_RE = re.compile(r"Dein Code:\s+([A-Z2-9-]+)")
 
 def start(role, script, maxframes):
     env = dict(os.environ)
-    env.update(LBO_MULTI="1", LBO_ALLOWSAVE="0", LBO_MAXFRAMES=str(maxframes), LBO_SHOT_EVERY="3000")
+    env.update(LBO_MULTI="1", LBO_WINDOWED="1", LBO_ALLOWSAVE="0", LBO_MAXFRAMES=str(maxframes), LBO_SHOT_EVERY="3000")
     if script:  # ohne Skript: echte Controller/Tastatur (zum Pruefen der Geraeteerkennung)
         env["LBO_SCRIPT"] = os.path.join(ROOT, "tools", "scripts", script)
     p = subprocess.Popen([LAUNCHER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

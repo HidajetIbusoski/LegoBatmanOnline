@@ -65,6 +65,12 @@ B      lbo-launch --connect join ... [--slot N]
 
 Alleine spielen: `lbo-launch --solo --savedir <welt>\spielstand`. Ohne Netz und ohne automatisches Laden. Im Menü sind nur die Spielstände der Welt sichtbar.
 
+## Desync und Fehlerdaten
+
+Läuft das Spiel auseinander (Prüfsummen weichen ab), zeigt die Mod in beiden Spielen ein Meldungsfenster. Die App liest den Log-Ordner aus der Launcher-Ausgabe (`(Logs: …)`), erkennt dort „NICHT SYNCHRON“ und lässt ihr Fenster blinken. Nach dem Spiel schickt sie dem Partner per Inbox `diag {d}` mit gzip und Base64. Die Nachricht enthält `frames.csv` von 300 Frames vor bis 60 Frames nach der ersten Abweichung, einen Log-Auszug, die eigene `pcconfig.txt` sowie CPU und Windows-Version. Der Empfänger legt sie unter `logs\<zeit>-partner\` ab. Hintergrund: [desync-2026-10-18.md](desync-2026-10-18.md).
+
+Das Spiel startet immer im Vollbild (`-Fullscreen`). Im Testbetrieb (`--test`) läuft es im Fenster (`LBO_WINDOWED=1`).
+
 ## Testen
 
 `tools/test_worlds.py [exe] [teile]` mit zwei Instanzen und den Profilen `wA` und `wB`:

@@ -20,7 +20,7 @@ def stun():
 h, g = stun(), stun()
 print("Host", h)
 print("Gast", g)
-env = dict(os.environ, LBO_MULTI="1", LBO_ALLOWSAVE="0", LBO_MAXFRAMES=maxframes, LBO_SHOT_EVERY="1500")
+env = dict(os.environ, LBO_MULTI="1", LBO_WINDOWED="1", LBO_ALLOWSAVE="0", LBO_MAXFRAMES=maxframes, LBO_SHOT_EVERY="1500")
 
 
 def run(name, args):

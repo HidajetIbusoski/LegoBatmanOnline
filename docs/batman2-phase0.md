@@ -196,11 +196,44 @@ Leere Ordner `SavedGames\SlotN` zeigt das Spiel als „beschädigt“ an und fra
 - **k1 (Levelanker, `LBO_ANCHOR=1`, Skript `b2_anchor.txt`):** Der Anker liegt bei 20509 bzw. 20516. Ab dem Anker weicht schon bei +3 die Streaming-Liste ab (3 bzw. 11 Einträge), bei +26 die Figurenzahl, ab +1147 die Position von Spieler 1. Das Level lädt beim Anker noch nach, ein Abgleich direkt beim ersten Erscheinen der Figuren ist zu früh.
 - **k2 (zusätzlich `LBO_IOWAIT=1`):** Das Frame-Ende wartet, bis `m_readThread`, `m_decodeThread` und `TextureDecode` ruhen (`QueryThreadCycleTime`). Sie waren in 6000 Frames nur 8-mal aktiv, der Menü-Versatz wurde nicht kleiner (6474 bzw. 6511). **Datei-I/O ist nicht die Ursache.**
 
-**Stand:** Die Abweichungen gehen auf das Ton-Timing zurück. Menü- und Szenenwechsel sowie das Freigeben und Nachladen von Samples hängen daran, wann XAudio2 einen Sound tatsächlich zu Ende gespielt hat.
+**Zwischenstand nach k2:** Die Abweichungen gehen auf das Ton-Timing zurück.
 
-Nächster Schritt:
-- Den Ton von der Echtzeit entkoppeln: die XAudio2-Quellstimmen hooken (`GetState`: `SamplesPlayed`, `BuffersQueued`; Rückrufe `OnBufferEnd`/`OnStreamEnd`) und das Abspielende nach Frames melden, also Samples = Frame × Abtastrate / 60.
-- Erst danach den Levelanker später setzen (wenn Streaming-Liste und Figurenzahl ruhen) und k1 wiederholen.
+### Virtueller Ton (`LBO_VAUDIO=1`) – Determinismus erreicht
+
+Das Spiel nutzt XAudio2 nur für wenige Stream-Stimmen (PCM 44,1 kHz, `WAVE_FORMAT_EXTENSIBLE`). Erzeugt wird es in `0x612930` per `CoCreateInstance(IID_IXAudio2)`. Die Effekte mischt das Spiel selbst (NuSoundDecodeThread) und reicht das Ergebnis als Puffer ein. Es reagiert auf die Rückrufe `OnBufferStart`, `OnBufferEnd` und `OnStreamEnd` (eine Rückrufklasse, Vtable `0xd3923c`, im Ton-Thread) und fragt einmal pro Frame `GetState` ab (`0x6145f0`).
+
+Die DLL hakt `CoCreateInstance`, `CreateSourceVoice` und die Stimmen-Methoden:
+- `SubmitSourceBuffer`, `Start`, `Stop`, `FlushSourceBuffers`, `ExitLoop`, `SetFrequencyRatio`, `GetState`, `DestroyVoice`.
+
+So arbeitet `LBO_VAUDIO`:
+- Je Stimme führt die DLL eine eigene Warteschlange mit der Länge jedes Puffers in Samples.
+- Am Frame-Ende spielt sie genau Abtastrate × Frequenzverhältnis / 60 Samples ab.
+- Die dabei fälligen Rückrufe ruft sie im Hauptthread auf. Die echten Rückrufe von XAudio2 hält sie zurück.
+- Danach wartet sie bis zu 50 ms, bis NuSoundDecodeThread und NuSoundStreamerWorkerThread darauf reagiert haben.
+- `GetState` meldet den virtuellen Stand.
+
+Das Abspielende hängt damit nur noch an Frames. Der echte Ton läuft weiter über XAudio2.
+
+`LBO_AUDIOLOG=1` zählt Methoden, Rückrufe und `GetState`-Aufrufer mit (alle 600 Frames im Log).
+
+**Ergebnis (Lauf v1):**
+- **Aufbau:** zwei Instanzen gleichzeitig, `LBO_LOADSYNC=1 LBO_VIDEODT=1 LBO_VCLOCK=1 LBO_RENDERRNG=1 LBO_VAUDIO=1 LBO_ANCHOR=1`, Skript `b2_anchor.txt`, 31.000 Frames.
+- **Gleicher Ablauf:**
+  - Menü- und Szenenwechsel in beiden Instanzen im selben Frame (5273, 6557, 7839).
+  - Levelstart im selben Frame (20620).
+  - Figuren erscheinen identisch (3/8/10/11/12/13 bei +0/+1/+3/+10/+74/+84).
+- **Ab dem Levelanker 10.381 Frames lang alle Spielwerte gleich:**
+  - Figuren und Positions-Prüfsumme,
+  - Positionen von Spieler 1 (in 1.270 Frames bewegt, gesprungen) und Spieler 2 (Beitritt bei +3082, in 1.073 Frames bewegt),
+  - alle sieben Zufallszustände, CRT-`rand`, Eingabe-Takt.
+- **Absolut ab Frame 1:** Alles ist gleich außer dem LCG. Der kippt beim ersten Laden in Frame 10 und wird am Anker abgeglichen.
+- **Unterschiede ohne Wirkung:** Nur interne Ladezeitpunkte (`bg_job`, `ll_n`, `ll_loading`) weichen ab. Sie wirken sich nicht auf den Spielzustand aus.
+
+**Batman 2 ist damit unter diesen Schaltern deterministisch.** Für den Online-Lockstep reicht derselbe Ansatz wie bei Batman 1: Zustände am Levelstart vom Host übernehmen und dann nur Eingaben austauschen.
+
+Noch nicht geprüft:
+- Wie sich `LBO_VAUDIO` anhört. Der echte Ton kann bei Wartephasen kurz aussetzen.
+- Ob der Abgleich am ersten Frame mit mehr als 2 Figuren auch in anderen Levels und beim Laden eines Spielstands passt.
 
 ## Zufallsgeneratoren
 
@@ -209,12 +242,12 @@ Neben `0x11a1840` (Park-Miller-Startwert), `0x11a1844` (16-Bit-LCG, 615 Zugriffe
 ## Erste Einschätzung
 
 - **Zeitschritt:** Das Frame-Ende misst dt mit dem Timer. Die Überschreibung `0x11cf0f8 = 1/60` wirkt wie bei Batman 1 und ist zur Laufzeit bestätigt.
-- **Hauptrisiko bestätigt:** Ladeaufträge (NuBgProc, Streaming) arbeiten über mehrere Frames mit dem Hauptthread zusammen. Einfaches Festhalten am Frame-Ende wie bei Batman 1 reicht nicht.
+- **Hauptrisiko bestätigt und gelöst:** Der Nichtdeterminismus kam vor allem vom Ton. Das Abspielende in Echtzeit steuerte das Freigeben und Nachladen von Samples und damit Szenenwechsel und Figuren. Dazu kamen Video-dt, Zeichen-Zufall, Musik-Takt und Streaming. Mit virtuellem Ton und den übrigen Schaltern ist der Ablauf gleich.
 - **Splitscreen:** Batman 2 hat eingebauten dynamischen Splitscreen. Online zeichnen beide PCs dasselbe Bild, das ist für den Lockstep unkritisch.
 
 ## Nächste Schritte
 
-1. **Ton von der Echtzeit entkoppeln** (XAudio2-Stimmen nach Frames melden, siehe „Weitere Messungen“), dann d11/k1 wiederholen, bis Figuren und Positionen gleich bleiben.
+1. **Ton anhören** mit `LBO_VAUDIO=1` (Aussetzer?) und den Test in weiteren Levels sowie mit geladenem Spielstand wiederholen.
 2. **Abgleichpunkt für online:** Beim Start des Levels (bzw. beim Verlassen des Hauptmenüs) überträgt der Host Zufallszustände, Eingabe-Takt und ggf. weitere Zähler an den Gast; danach Lockstep wie bei Batman 1.
 3. Netzcode und App-Anbindung für Batman 2 (Adresstabelle pro Spiel).
 4. Längere Tests in weiteren Levels (Fahrzeuge, Charakterwechsel, Speichern ist im Test umgeleitet).

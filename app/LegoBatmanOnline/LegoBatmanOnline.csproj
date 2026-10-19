@@ -26,6 +26,7 @@
   <ItemGroup>
     <EmbeddedResource Include="..\..\build\lbo-launch.exe" LogicalName="lbo-launch.exe" />
     <EmbeddedResource Include="..\..\build\lbo.dll" LogicalName="lbo.dll" />
+    <EmbeddedResource Include="..\..\build\lbo2.dll" LogicalName="lbo2.dll" />
   </ItemGroup>
 
 </Project>

@@ -235,6 +235,51 @@ Noch nicht geprüft:
 - Wie sich `LBO_VAUDIO` anhört. Der echte Ton kann bei Wartephasen kurz aussetzen.
 - Ob der Abgleich am ersten Frame mit mehr als 2 Figuren auch in anderen Levels und beim Laden eines Spielstands passt.
 
+## Netzmodus (19.10.2026)
+
+`lbo2.dll` nutzt denselben Lockstep wie Batman 1 (`src/dll/net.c`, `src/dll/input.c`, mit in die DLL gelinkt). Mit `LBO_NET=host|join` setzt die DLL alle Determinismus-Schalter selbst:
+- `FIXEDDT`, `LOADSYNC`, `VIDEODT`, `VCLOCK`, `RENDERRNG`, `VAUDIO`, `ANCHOR`, 60 fps.
+
+Eingaben:
+- Das Spiel sieht nur Pad 0 (Host) und Pad 1 (Gast) aus dem Austausch.
+- Die eigene Eingabe kommt aus `input_read` (Controller oder Tastatur der App) bzw. im Test aus dem Skript (Zeilen des eigenen Pads).
+- DirectInput-Geräte und die Tastatur des Spiels (Gerät 4–13) sind aus: Die Aufrufe von `0x63b6f0` bei `0x63bd59`, `0x63d608` und `0x63d8ee` melden für Gerät ≥ 4 keine Eingabe.
+- Spielstände werden im Netzmodus auch beim Lesen umgeleitet: Beide sehen leere Plätze, der Host wählt „Neues Spiel“ und „Ohne zu speichern fortfahren“.
+
+Abgleich:
+1. **Frame 30** (nach dem ersten Laden): Der Host schickt die sieben Zufallszustände und den Eingabe-Takt (`net_send_sync`, `net_wait_sync`).
+2. **Levelstart** (erster Frame mit mehr als 2 Figuren): Schranke `net_barrier`. Wer zuerst ankommt, wartet und verlängert dabei seine Eingaben mit neutralen Pads, damit der andere bis zur Schranke weiterläuft. Der Gast übernimmt den Zustand des Hosts. Danach zählen beide den Lockstep ab dem Anker neu (Epoche 1; ältere Pakete werden verworfen).
+3. **Prüfsummen** (Figuren-Hash, Figurenzahl, LCG, `rng_a`, Park-Miller, CRT) alle 60 Frames ab dem Anker. Vorher sind kleine Frame-Versätze erlaubt.
+
+Was im Netz zusätzlich nötig war (lokale Netztests n1–n14, Host und Gast auf einem PC):
+- **Erstes Laden:** Dort bearbeitet der Hauptthread die Streaming-Liste selbst. `wait_loads` wartet deshalb nur, wenn die Lade-Schleife `0x7d48c0` läuft oder eingereiht ist (vorher 30-s-Zeitgrenzen und 3 Frames Versatz).
+- **Startphase:** Bis Frame 300 wartet das Frame-Ende auf alle NuBgProc-Aufträge außer der Streaming-Schleife.
+- **Nach dem Frame-Ende:** Ein zweiter Haken (Aufrufe von `0x5528c0` bei `0x7e6e03` und `0x7e6f98`) greift nach dem Zeichnen und vor der Logik. Solange Einträge im Übergang sind, wartet er zwei Durchläufe der Lade-Schleife ab (Zähler über den Aufruf `0x557850` bei `0x7ebb90`). Bei leerer Liste wartet er, bis sich der Auftrag beendet hat.
+- **Verlangsamung:** In den ersten 900 Frames dauert jeder Frame 50 ms länger (`LBO_SLOWSTART`). Danach dauert er 40 ms länger, solange ein Ladeauftrag läuft (`LBO_LOADSLOW`). Logos, Intro-Animationen und `StreamingLevel::Unload` (`0x7ddc60`, räumt über `0x7ebef0` die Liste ab) starten bzw. enden, sobald Daten da sind. Mit der Pause sind sie praktisch immer im selben Frame fertig. Ohne sie gab es in einem von zwei bis drei Läufen 1 Frame Versatz.
+- **Diagnose:**
+  - `LBO_PROBE=Adr,…` (`*Zeiger+Versatz` möglich) schreibt Adressen je Frame nach `probes.csv`.
+  - `LBO_BREAKAT=Adr` protokolliert beim ersten Treffer den Aufrufstapel.
+  - Das Hauptthread-Handle braucht `THREAD_SET_CONTEXT`, sonst greifen Hardware-Haltepunkte nicht.
+
+Launcher und App:
+- `lbo-launch --connect … --b2` sucht `LEGOBatman2.exe` und lädt `lbo2.dll`.
+- Er setzt `SteamAppId=213330` (Steam muss laufen) und lässt den Spielstand-Austausch weg.
+- In der App steht beim Freund der Knopf „Batman 2“. Die Einladung trägt `game=b2`.
+- Testoption `--auto-b2` (mit `--auto-invite`).
+
+**Ergebnis (Stand 19.10.2026): Verbindung, Abgleich, Schranke und Lockstep funktionieren. Deterministisch ist der Netzmodus noch nicht.**
+
+| Lauf | Aufbau | Ergebnis |
+|---|---|---|
+| n7, n10, n11, z1–z4 | 400–1500 Frames | identisch |
+| n9, w1–w4, x3/x4, y1 | 400–1500 Frames | 1 Frame Versatz um Frame 280 (Intro). Mit `LBO_SLOWSTART` behoben |
+| n12, n13 | 31.000 Frames, mit Verlangsamung | erste Abweichung erst beim Start des neuen Spiels (5278) bzw. in Menü und Zwischensequenz (4266/6564) |
+| n14 | 31.000 Frames, mit Schranke am Levelstart | Schranke passiert. Danach weicht die Streaming-Liste ab +17 ab, die Figurenzahl ab +51, dann folgt Desync |
+
+Der lokale Paartest ohne Netz (v1) war über 10.381 Frames ab dem Anker identisch. Im Netz unterscheidet sich vor allem das Timing, weil Host und Gast unterschiedlich lange aufeinander warten. Ladevorgänge, die über mehrere Frames mit dem Hauptthread zusammenarbeiten, enden dann in verschiedenen Frames. Betroffen sind das Nachladen der Level-Figuren, `StreamingLevel::Unload` und Intro-Animationen. Warten und Verlangsamen senkt die Häufigkeit, schließt diese Wettläufe aber nicht sicher aus.
+
+**Nächster Ansatz:** Den Hintergrund-Thread NuBgProc und die Lade-Threads frame-gebunden laufen lassen. Sie dürfen nur im Fenster nach dem Frame-Ende arbeiten, bis sie blockieren oder fertig sind, und sind während Logik und Zeichnen angehalten. Dabei darf kein Thread angehalten werden, während er einen kritischen Abschnitt hält, den der Hauptthread braucht. Alternative: den Anker auf den Zeitpunkt legen, an dem das Level fertig geladen ist (Liste leer, Figurenzahl stabil), und dort zusätzlich die Figurenzustände übertragen.
+
 ## Zufallsgeneratoren
 
 Neben `0x11a1840` (Park-Miller-Startwert), `0x11a1844` (16-Bit-LCG, 615 Zugriffe) und `0x102b358` (Park-Miller-Standardzustand) gibt es drei weitere Zustände mit Settern: `0x11be45c` (`0x51a170`), `0x1195b50` (`0x77f280`) und `0x1195b30` (`0x77d040`). Dazu kommt der CRT-`rand`-Zustand des Hauptthreads (`_getptd()+0x14`). Sie laufen schon im Intro auseinander (CRT ab Frame 3, LCG ab Frame 11). Online müssen sie wie bei Batman 1 beim Levelstart vom Host übernommen werden. Lokal setzt `LBO_RNGRESET=<Frame>` sie zu einem festen Frame auf feste Werte, zusammen mit dem Eingabe-Takt.
@@ -247,7 +292,6 @@ Neben `0x11a1840` (Park-Miller-Startwert), `0x11a1844` (16-Bit-LCG, 615 Zugriffe
 
 ## Nächste Schritte
 
-1. **Ton anhören** mit `LBO_VAUDIO=1` (Aussetzer?) und den Test in weiteren Levels sowie mit geladenem Spielstand wiederholen.
-2. **Abgleichpunkt für online:** Beim Levelstart überträgt der Host die sieben Zufallszustände und den Eingabe-Takt an den Gast (wie `LBO_ANCHOR`). Danach folgt der Lockstep wie bei Batman 1.
-3. Netzcode und App-Anbindung für Batman 2 (Adresstabelle pro Spiel).
-4. Längere Tests in weiteren Levels (Fahrzeuge, Charakterwechsel, Speichern ist im Test umgeleitet).
+1. **Laden im Netz deterministisch machen** (siehe „Netzmodus“, nächster Ansatz).
+2. **Ton anhören** mit `LBO_VAUDIO=1` (Aussetzer?).
+3. Längere Tests in weiteren Levels (Fahrzeuge, Charakterwechsel, Speichern ist im Test umgeleitet).

@@ -66,6 +66,22 @@ Tipp: Die App waehrend des Spiels offen lassen, sonst wird erst beim
 naechsten Start abgeglichen.
 
 
+LEGO Batman 2 (neu, Testphase)
+------------------------------
+Beide brauchen LEGO Batman 2: DC Super Heroes auf Steam. Steam muss hier
+LAUFEN (das Spiel prueft das beim Start).
+1. In der Freundesliste beim Freund "Batman 2" druecken, der andere
+   "Annehmen und spielen".
+2. Das Spiel startet bei beiden. Die erste Minute (Logos, Titelbild) laeuft
+   absichtlich langsam, das haelt beide Spiele im Gleichschritt.
+3. Der Einladende bedient die Menues: "Neues Spiel", dann "Ohne zu speichern
+   fortfahren". Spielstaende gibt es bei Batman 2 noch nicht.
+4. Im Level drueckt der Eingeladene START und steigt als Robin ein.
+Waehrend des Ladens laufen die Spiele kurz langsamer, auch das ist gewollt.
+Nur Controller oder die Tastatur der App werden uebertragen; die Tastatur
+des Spiels selbst ist im Online-Modus aus.
+
+
 Steuerung ohne Controller (Tastatur)
 ------------------------------------
 Bewegen: WASD oder Pfeiltasten     Springen: Leertaste

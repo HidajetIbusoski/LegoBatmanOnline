@@ -11,3 +11,4 @@ dist/
 app/**/bin/
 app/**/obj/
 dist-neu/
+dist-b2/

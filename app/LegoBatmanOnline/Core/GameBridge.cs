@@ -72,13 +72,16 @@ public static class GameBridge
         }
         var exe = Read("lbo-launch.exe");
         var dll = Read("lbo.dll");
-        var ver = Convert.ToHexString(SHA256.HashData(exe.Concat(dll).ToArray()))[..12];
+        var dll2 = Read("lbo2.dll");
+        var ver = Convert.ToHexString(SHA256.HashData(exe.Concat(dll).Concat(dll2).ToArray()))[..12];
         var dir = Path.Combine(Profile.BaseDir, "bin", ver);
         Directory.CreateDirectory(dir);
         var exePath = Path.Combine(dir, "lbo-launch.exe");
         if (!File.Exists(exePath)) File.WriteAllBytes(exePath, exe);
         var dllPath = Path.Combine(dir, "lbo.dll");
         if (!File.Exists(dllPath)) File.WriteAllBytes(dllPath, dll);
+        var dll2Path = Path.Combine(dir, "lbo2.dll");
+        if (!File.Exists(dll2Path)) File.WriteAllBytes(dll2Path, dll2);
         return exePath;
     }
 
@@ -103,12 +106,13 @@ public static class GameBridge
     /// (z. B. "STATUS verbunden", "ERROR ..."). Kehrt zurueck, wenn das Spiel beendet ist.
     /// </summary>
     public static Task<int> ConnectAndPlayAsync(string launcher, bool host, Endpoint me, Endpoint peer,
-        int slot, string? saveDir, Action<string> onLine, IDictionary<string, string>? extraEnv, CancellationToken ct)
+        int slot, string? saveDir, bool batman2, Action<string> onLine, IDictionary<string, string>? extraEnv, CancellationToken ct)
     {
         var psi = new ProcessStartInfo(launcher);
         foreach (var a in new[] { "--connect", host ? "host" : "join", "--port", me.Port.ToString(), "--key", me.Key.ToString(),
                      "--peer-key", peer.Key.ToString(), "--peer-public", peer.Public, "--peer-local", peer.Local })
             psi.ArgumentList.Add(a);
+        if (batman2) psi.ArgumentList.Add("--b2");
         if (slot >= 0) { psi.ArgumentList.Add("--slot"); psi.ArgumentList.Add(slot.ToString()); }
         if (saveDir != null) { psi.ArgumentList.Add("--savedir"); psi.ArgumentList.Add(saveDir); }
         return RunAsync(psi, onLine, extraEnv, ct);

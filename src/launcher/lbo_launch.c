@@ -13,6 +13,9 @@
 #include <string.h>
 #include "online.h"
 
+// --b2: LEGO Batman 2 statt LEGO Batman (eigene DLL lbo2.dll, siehe docs/batman2-phase0.md)
+static int g_b2;
+
 static int fail(const char *what)
 {
     fprintf(stderr, "lbo-launch: %s fehlgeschlagen (Fehler %lu)\n", what, GetLastError());
@@ -23,7 +26,8 @@ static int fail(const char *what)
 static int try_game(const char *lib, char *out)
 {
     char p[MAX_PATH];
-    snprintf(p, sizeof p, "%s\\steamapps\\common\\Lego Batman\\LEGOBatman.exe", lib);
+    snprintf(p, sizeof p, g_b2 ? "%s\\steamapps\\common\\LEGO Batman 2\\LEGOBatman2.exe"
+                               : "%s\\steamapps\\common\\Lego Batman\\LEGOBatman.exe", lib);
     if (GetFileAttributesA(p) == INVALID_FILE_ATTRIBUTES) return 0;
     strcpy(out, p);
     return 1;
@@ -119,7 +123,7 @@ static void dll_next_to_exe(char *dll)
     char *slash;
     GetModuleFileNameA(NULL, dll, MAX_PATH);
     slash = strrchr(dll, '\\');
-    strcpy(slash ? slash + 1 : dll, "lbo.dll");
+    strcpy(slash ? slash + 1 : dll, g_b2 ? "lbo2.dll" : "lbo.dll");
 }
 
 // --- Online-Menue -----------------------------------------------------------------------
@@ -249,7 +253,10 @@ static int run_session(ONLINE *o_, const char *game, const char *dll, int autolo
     CreateDirectoryA(logdir, NULL);
 
     printf("STATUS spielstand\n");
-    if (o.role == 0) {
+    // LEGO Batman 2: noch kein Spielstand-Austausch. Beide starten ohne Spielstaende (die DLL leitet
+    // Lesen und Schreiben im Netzmodus um), der Host waehlt "Neues Spiel".
+    if (g_b2) {
+    } else if (o.role == 0) {
         if (!online_send_saves(&o, save_dir)) { printf("ERROR Spielstand konnte nicht gesendet werden.\n"); online_close(); return 1; }
     } else {
         strcat(guest_saves, "\\gast-spielstand");
@@ -282,6 +289,19 @@ static int run_session(ONLINE *o_, const char *game, const char *dll, int autolo
     SetEnvironmentVariableA("LBO_PEER", peer);
     // Beide muessen dieselbe Verzoegerung nutzen; der Gast hat den Wert des Hosts uebernommen.
     snprintf(buf, sizeof buf, "%d", delay); SetEnvironmentVariableA("LBO_DELAY", buf);
+    if (g_b2) {
+        // Alle Determinismus-Schalter setzt lbo2.dll im Netzmodus selbst
+        SetEnvironmentVariableA("SteamAppId", "213330");
+        SetEnvironmentVariableA("LBO_FPSCAP", "60");
+        SetEnvironmentVariableA("LBO_ALLOWSAVE", "0");
+        printf("\nStarte LEGO Batman 2 ... (Logs: %s)\n", logdir);
+        printf("%s\n", o.role ? "Der Host bedient die Menues (Neues Spiel). Im Level mit Start einsteigen."
+                              : "Du bedienst die Menues: Neues Spiel, ohne zu speichern fortfahren. Dein Mitspieler steigt mit Start ein.");
+        printf("STATUS spiel\n");
+        launch(game, dll, "", 1);
+        printf("STATUS beendet\n");
+        return 0;
+    }
     SetEnvironmentVariableA("LBO_FIXEDDT", "1");
     SetEnvironmentVariableA("LBO_FPSCAP", "60");
     SetEnvironmentVariableA("LBO_SYNCBG", "2");
@@ -368,6 +388,7 @@ static int app_mode(int argc, char **argv)
         else if (!strcmp(argv[i], "--slot") && i + 1 < argc) slot = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--savedir") && i + 1 < argc) savedir = argv[++i];
         else if (!strcmp(argv[i], "--solo")) solo = 1;
+        else if (!strcmp(argv[i], "--b2")) g_b2 = 1;
     }
     if (solo) return solo_mode(savedir);
     if (!online_prepare(&o, code)) { printf("ERROR UDP-Port nicht verfuegbar\n"); return 1; }
@@ -379,7 +400,7 @@ static int app_mode(int argc, char **argv)
         online_close();
         return 0;
     }
-    if (!find_game(game)) { printf("ERROR LEGOBatman.exe nicht gefunden\n"); online_close(); return 1; }
+    if (!find_game(game)) { printf("ERROR %s nicht gefunden\n", g_b2 ? "LEGOBatman2.exe" : "LEGOBatman.exe"); online_close(); return 1; }
     dll_next_to_exe(dll);
     online_sha256_file(game, hash);
     online_set_keys(key, peer_key);

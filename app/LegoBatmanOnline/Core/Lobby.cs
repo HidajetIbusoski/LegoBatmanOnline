@@ -89,7 +89,11 @@ public sealed class Invitation
     public string Sid { get; init; } = "";
     public FriendItem From { get; init; } = null!;
     public string? WorldName { get; init; }
-    public string Text => WorldName != null
+    /// <summary>"b2" = LEGO Batman 2, sonst LEGO Batman</summary>
+    public string? Game { get; init; }
+    public string Text => Game == "b2"
+        ? $"{From.Name} lädt dich zu LEGO Batman 2 ein"
+        : WorldName != null
         ? $"{From.Name} möchte mit dir in „{WorldName}“ spielen"
         : $"{From.Name} lädt dich ein";
 }
@@ -116,6 +120,7 @@ public sealed class Lobby : Bindable
     private bool _isHost;
     private bool _solo;
     private WorldItem? _world;
+    private bool _batman2;   // Sitzung mit LEGO Batman 2 (ohne Welt und Spielstand)
 
     // Abgleich der Welten
     private readonly Dictionary<string, WorldVersion> _pending = new();   // wartet aufs Spielende
@@ -476,6 +481,7 @@ public sealed class Lobby : Bindable
         _peer = f;
         _isHost = true;
         _solo = false;
+        _batman2 = false;
         _world = w;
         TakeLocalChanges(w);
         _sessionSlot = AutoLoad ? WorldStore.NewestSlot(SavesDir(w)) : -1;
@@ -486,6 +492,33 @@ public sealed class Lobby : Bindable
         {
             ["t"] = "invite", ["sid"] = _sid, ["slot"] = _sessionSlot, ["world"] = w.Info.Id, ["wname"] = w.Info.Name,
         });
+        _ = TimeoutAsync(_sid, 120, "Keine Antwort auf die Einladung.");
+    }
+
+    /// <summary>
+    /// LEGO Batman 2 zusammen spielen. Noch ohne Welten und Spielstaende: Beide starten ohne Spielstand,
+    /// der Host waehlt "Neues Spiel", der Gast steigt im Level mit Start ein.
+    /// </summary>
+    public async Task PlayBatman2Async(FriendItem f)
+    {
+        if (SessionActive || _launcher == null) return;
+        if (!f.IsFriend || PubOf(f.Id) is not { } pub) return;
+        if (f.Presence != "on")
+        {
+            Hint = f.Busy ? $"{f.Name} spielt gerade." : $"{f.Name} ist offline.";
+            return;
+        }
+        _sid = RandomNumberGenerator.GetHexString(8);
+        _peer = f;
+        _isHost = true;
+        _solo = false;
+        _batman2 = true;
+        _world = null;
+        _sessionSlot = -1;
+        SessionActive = true;
+        SessionText = $"Warte auf {f.Name} …";
+        AddLog($"Einladung zu LEGO Batman 2 an {f.Name} gesendet");
+        await _msg.SendAsync(f.Id, pub, new JsonObject { ["t"] = "invite", ["sid"] = _sid, ["slot"] = -1, ["game"] = "b2" });
         _ = TimeoutAsync(_sid, 120, "Keine Antwort auf die Einladung.");
     }
 
@@ -511,12 +544,13 @@ public sealed class Lobby : Bindable
     public async Task AcceptInviteAsync()
     {
         var inv = Incoming;
-        if (inv == null || !CheckReady()) return;
+        if (inv == null || (inv.Game != "b2" && !CheckReady()) || _launcher == null) return;
         Incoming = null;
         _sid = inv.Sid;
         _peer = inv.From;
         _isHost = false;
         _solo = false;
+        _batman2 = inv.Game == "b2";
         _world = null;  // der Gast spielt mit der Kopie des Hosts, sein Weltordner bleibt unberuehrt
         SessionActive = true;
         SessionText = "Ermittle deine Adresse …";
@@ -644,7 +678,11 @@ public sealed class Lobby : Bindable
                     break;
                 }
                 var f = Friends.First(x => x.Id == from);
-                Incoming = new Invitation { Sid = (string)c["sid"]!, From = f, WorldName = Messenger.Clean((string?)c["wname"]) is { Length: > 0 } wn ? wn : null };
+                Incoming = new Invitation
+                {
+                    Sid = (string)c["sid"]!, From = f, Game = (string?)c["game"] == "b2" ? "b2" : null,
+                    WorldName = Messenger.Clean((string?)c["wname"]) is { Length: > 0 } wn ? wn : null,
+                };
                 AddLog(Incoming.Text);
                 if (_opt.AutoAccept) await AcceptInviteAsync();
                 break;
@@ -707,12 +745,12 @@ public sealed class Lobby : Bindable
         _sessionCts = new CancellationTokenSource();
         var sid = _sid;
         SessionText = "Verbinde …";
-        string? saveDir = _isHost && _world != null ? SavesDir(_world) : null;
+        string? saveDir = _isHost && _world != null && !_batman2 ? SavesDir(_world) : null;
         var peer = _peer;
         _logDir = null;
         _desyncShown = false;
         _ = WatchDesyncAsync(sid);
-        var code = await GameBridge.ConnectAndPlayAsync(_launcher!, _isHost, _myEp!, peerEp, _sessionSlot, saveDir,
+        var code = await GameBridge.ConnectAndPlayAsync(_launcher!, _isHost, _myEp!, peerEp, _sessionSlot, saveDir, _batman2,
             line => _ui.BeginInvoke(() => OnLauncherLine(line)), TestEnv(), _sessionCts.Token);
         var logDir = _logDir;
         if (_sid == sid)
@@ -872,6 +910,13 @@ public sealed class Lobby : Bindable
     private bool _autoPlayed;
     private void TryAutoPlay()
     {
+        if (_opt.AutoB2 && !_autoPlayed && !SessionActive && _opt.AutoInvite != null)
+        {
+            // Test: LEGO Batman 2 mit dem Freund aus --auto-invite starten, sobald er online ist
+            var f = Friends.FirstOrDefault(x => x.Id == Identity.ParseCode(_opt.AutoInvite) && x.IsFriend);
+            if (f is { Presence: "on" }) { _autoPlayed = true; _ = PlayBatman2Async(f); }
+            return;
+        }
         if (!_opt.AutoPlay || _autoPlayed || SessionActive || _opt.AutoWorld == null) return;
         var w = Worlds.FirstOrDefault(x => x.Name == _opt.AutoWorld);
         if (w is not { CanPlayTogether: true }) return;
@@ -894,6 +939,7 @@ public sealed class AppOptions
     public string? AutoInvite { get; set; }
     public string? AutoWorld { get; set; }
     public bool AutoPlay { get; set; }
+    public bool AutoB2 { get; set; }
     public string? Name { get; set; }
     public int MaxFrames { get; set; }
     public int Slot { get; set; } = -1;
@@ -911,6 +957,7 @@ public sealed class AppOptions
                 case "--auto-invite" when i + 1 < args.Length: o.AutoInvite = args[++i]; break;
                 case "--auto-world" when i + 1 < args.Length: o.AutoWorld = args[++i]; break;
                 case "--auto-play": o.AutoPlay = true; break;
+                case "--auto-b2": o.AutoB2 = true; break;
                 case "--name" when i + 1 < args.Length: o.Name = args[++i]; break;
                 case "--slot" when i + 1 < args.Length: o.Slot = int.Parse(args[++i]); break;
                 case "--max-frames" when i + 1 < args.Length: o.MaxFrames = int.Parse(args[++i]); break;

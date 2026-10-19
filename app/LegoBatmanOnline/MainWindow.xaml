@@ -125,6 +125,10 @@
                                                             <Button Content="Annehmen" Style="{StaticResource Primary}" Margin="0,0,4,0" Padding="10,5"
                                                                     Click="AcceptFriend_Click"
                                                                     Visibility="{Binding IsIncoming, Converter={StaticResource BoolVis}}"/>
+                                                            <Button Content="Batman 2" Margin="0,0,4,0" Padding="10,5"
+                                                                    ToolTip="Zusammen LEGO Batman 2 spielen (neues Spiel, noch ohne Spielstand)"
+                                                                    Click="PlayBatman2_Click" IsEnabled="{Binding Online}"
+                                                                    Visibility="{Binding IsFriend, Converter={StaticResource BoolVis}}"/>
                                                             <Button Content="✕" Style="{StaticResource Quiet}" ToolTip="Entfernen"
                                                                     Click="RemoveFriend_Click"/>
                                                         </StackPanel>

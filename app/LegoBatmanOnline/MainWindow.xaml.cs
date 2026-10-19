@@ -128,6 +128,9 @@ public partial class MainWindow : Window
     private async void PlaySolo_Click(object sender, RoutedEventArgs e) =>
         await _lobby.PlaySoloAsync(ItemOf<WorldItem>(sender));
 
+    private async void PlayBatman2_Click(object sender, RoutedEventArgs e) =>
+        await _lobby.PlayBatman2Async(ItemOf<FriendItem>(sender));
+
     private void OpenBackups_Click(object sender, RoutedEventArgs e)
     {
         var dir = _lobby.BackupFolder(ItemOf<WorldItem>(sender));

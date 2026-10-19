@@ -296,12 +296,38 @@ Der lokale Paartest ohne Netz (v1) war über 10.381 Frames ab dem Anker identisc
 - **Zu langsam:** Ton- und Video-Threads (14, 16, 17) fragen ständig ab und ruhen nie. Mit ihnen läuft jedes Fenster in die Zeitgrenze, und das Spiel schafft nur etwa 3 Frames/s.
 - **Wirkung:** Je 4 kurze Paare (600 Frames, schnell gegen verzögert) mit Gating 2 Abweichungen bei Frame 284, ohne Gating 0. Der Wettlauf ist also selten und liegt nicht in NuBgProc oder m_readThread.
 
-**Stand:** Ein Ablauf, der unabhängig von der Rechnergeschwindigkeit gleich bleibt, ist für Batman 2 noch nicht erreicht. Gelöst sind Ton, Videos, Zeichen-Zufall, Musik-Takt, die Streaming-Liste und der Eingabe-Takt. Übrig sind seltene Wettläufe an Szenen- und Ladeübergängen, deren Thread noch nicht gefunden ist. `LBO_GATE` ist im Netzmodus deshalb nicht eingeschaltet.
+`LBO_GATE` bleibt experimentell und ist im Netzmodus aus. Den Ersatz beschreibt der nächste Abschnitt.
 
-Mögliche Wege:
-1. **Weitersuchen:** pro Übergang den auslösenden Zustand finden (`LBO_PROBE`, `LBO_BREAKAT`), mit mehreren Läufen pro Variante, weil die Fehler selten sind.
-2. **Weicher Abgleich:** Der Host schickt regelmäßig, etwa alle 30 Frames, Zufallszustände und die Positionen der Spielerfiguren, und der Gast übernimmt sie. Das gleicht kleine Abweichungen aus. Gegner und Objekte können dabei aber auseinanderlaufen.
-3. Batman 2 zurückstellen und andere Spiele der Reihe prüfen.
+### Wettlaufsuche mit dem Paartest (19.10.2026, Fortsetzung)
+
+Methode: Paare bis ins Level (31.000 Frames), schnelle Instanz (`LBO_FPSCAP=0`) gegen verzögerte (`LBO_JITTER=30`), beide mit `LBO_RNGRESET=30`. Erste Abweichung per `tools/compare_b2.py`, dann Speicherabzüge (`LBO_MEMDUMP=von,bis` + `tools/memdiff_b2.py`), Schreib-Wächter (`LBO_WATCHADDR`, schreibt Codeadresse und Aufrufer je Frame nach `rngtrace.txt`) oder Schreib-Haltepunkt (`LBO_BREAKW`, `LBO_BREAKFROM`).
+
+Gefundene und behobene Wettläufe:
+
+| Stelle | Ursache | Lösung |
+|---|---|---|
+| Streaming-Schleife `0x7eb950` | dreht im NuBgProc-Thread ohne Takt und ändert die Ladeliste zu beliebigen Zeitpunkten | `LBO_LOOPGATE`: wartet am Schleifenanfang `0x7eb979` auf eine Freigabe. Nach dem Frame-Ende gibt `loop_window` einzelne Durchläufe frei, bis die Liste zwei Durchläufe lang gleich bleibt und nichts mehr lädt |
+| Aufräum-Schleife `0x7ebef0` (`StreamingLevel::Unload`) | endete je nach Tempo einen Frame früher oder später (Frame 7851) | gleiche Freigabe am Schleifenanfang `0x7ebf19`, ab Frame 300 (beim Start wartet der Hauptthread selbst auf sie) |
+| andere NuBgProc-Aufträge (SampleLoader `0x7359b0`, Lade-Auftrag beim ersten Laden) | liefen in den nächsten Spielschritt hinein (Frame 284, Anker +2) | `bg_settle` nach dem Frame-Ende ab Frame 30: warten, bis NuBgProc nichts tut, an einer Freigabe steht, auf einen Frame wartet oder 5 ms lang weder rechnet noch liest |
+| Lese-Pipeline (`m_readThread`) | wartet auf die Platte, rechnet dabei nicht, die CPU-Ruhe täuscht | `stream_busy` in `wait_io`: Leser wartet auf sein Ereignis und keine Anfrage ist offen |
+| Maus und Tastatur per DirectInput (`0x633860`, `0x6338f0`) | ob Poll/Acquire gelingt, hängt am Fensterfokus; jeder Erfolg schaltet Puffer um (`0x13658bc`, `0x13655a4`) | Abschalt-Bits des Spiels `0x136555c` (1 Maus, 2 Tastatur), `LBO_NODINPUT=1`, im Netz immer |
+| Speicher-Thread `SaveCore` (`0x540f70`) | schaut nur alle 100 ms in seinen Auftragsring und hält „Speichern…“ eine Mindestzeit in Echtzeit. Der Spielstand-Bildschirm erschien bei Frame 4842 oder 4879, danach griff ein Tastendruck im Menü oder nicht | mit `LBO_IOWAIT`: Pause 1 ms (`0x5410c2`), Mindestzeit übersprungen (`0x540e2b` jnp → jmp), Frame-Ende wartet auf leeren Ring (`0x102cab8`/`0x102cabc`) und `0x11cc19a = 0` |
+
+Ein Versuch, SaveCore ganz frame-gebunden laufen zu lassen (eigene Freigabe statt Sleep, virtuelle Uhr für seinen Thread), hing an anderen Wartestellen und wurde verworfen.
+
+Zwei weitere Quellen, behoben:
+- **Nullpunkt der virtuellen Uhr:** Er lag beim ersten QPC-Aufruf, also um einen zufälligen Echtzeit-Betrag gegen den Startwert der Spieluhr (`0x11c2d60`) verschoben. Jetzt gilt Spielzeit = (Frame + D)/60 s, D auf volle 3600 Frames aufgerundet (Sprung nur vorwärts).
+- **Ton-Nachlieferung:** Gestreamte Stimmen bekommen ihren nächsten Puffer erst nach BufferEnd. Kam er nach dem nächsten `va_tick`, lief die virtuelle Stimme leer. `va_tick` wartet jetzt, bis jede BufferEnd ohne Stream-Ende mit einem Submit beantwortet ist (höchstens 200 ms; 325 Wartephasen und 5 Zeitgrenzen in 30.000 Frames).
+
+**Ergebnis (Paare F7, F9):** Start, Intro-Video, Menü mit Spielstand-Bildschirm, „Neues Spiel“ und beide Zwischensequenzen sind in beiden Instanzen identisch. Vorher lief es spätestens bei Frame 284 oder im Menü auseinander.
+
+Noch offen:
+1. **Frame 13349 (lange Zwischensequenz):** `rng_b` (`0x1195b50`, `0x51a190`) zieht dort ein Partikel-Emitter (`0x7ae7d0` → `0x79eab0` → `0x790500`, sechs Zufallszahlen pro Partikel). In der verzögerten Instanz fällt ein Partikel aus. Das ist reproduzierbar (R1, R2, R4, Q2, F9; einmal schon bei 12495). Kurz vorher (13321) weichen Werte der Render-Ansichten (`0x11e1730`, Abstand `0x1650` je Ansicht) in der letzten Bitstelle ab, wahrscheinlich schneidet der Emitter nach Kameraabstand weg. Ausgeschlossen: QPC-Aufrufe pro Frame (gleich), Partikel-Zeitschritt `0x1195b58` und dt (konstant), Rausch-Array `0x1352ae0` (nur Shader).
+2. **Frame 284, selten (etwa 2 von 12 Läufen):** Die schnelle Instanz legt die erste Musikstimme (Hauptthread, `0x61df30` über `0x614150`) erst bei 284 statt 283 an, das Intro startet einen Frame später. Die Bereitschaftsprüfung der Stream-Quelle (`+0xc` bei `0x61df71`) ist es nicht (ein Warte-Haken dort griff nie). Die Entscheidung fällt früher.
+
+Die Zählung nach dem Anker taugt erst, wenn der Vorlauf gleich ist: Mit unterschiedlichem Vorlauf weichen auch nach dem Rücksetzen der Zufallszustände die geladenen Daten ab.
+
+Im Netzmodus sind `LOOPGATE` und `IOWAIT` noch nicht eingeschaltet (dort gilt weiter `LBO_SLOWSTART`/`LBO_LOADSLOW`). Maus und Tastatur sind dort schon aus.
 
 ## Zufallsgeneratoren
 

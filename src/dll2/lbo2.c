@@ -105,7 +105,7 @@ static int g_loadsync, g_videodt, g_render_rng;
 static int g_trace_from, g_trace_to, g_watch_lcg;
 static DWORD g_watch_addr = 0x011A1844;   // LBO_WATCHADDR=Adresse: anderer Wert statt des LCG
 #define LW_MAX (1 << 20)
-static struct { long f; DWORD eip, tid; } g_lw[LW_MAX];
+static struct { long f; DWORD eip, tid, st[4]; } g_lw[LW_MAX];
 static volatile LONG g_nlw;
 static FILE *g_trace;
 static int g_bgsync, g_devchange, g_rng_reset, g_no_movies;
@@ -622,11 +622,22 @@ static BOOL WINAPI hook_qpc(LARGE_INTEGER *out)
 {
     if (!g_vclock || !g_main_tid || GetCurrentThreadId() != g_main_tid) return real_qpc(out);
     if (!g_vbase) {
+        // Nullpunkt an den Startwert der Spieluhr binden (0x11c2d60, einmal per QPC in 0x521840 gesetzt):
+        // Spielzeit = (Frame + D) / 60 s mit D auf volle 3600 Frames aufgerundet (Sprung nur vorwaerts).
+        // Vorher lag der Nullpunkt beim ersten Aufruf hier, also um einen zufaelligen Echtzeit-Betrag
+        // verschoben; was mit absoluter Zeit rechnet (0x5da210, 24-Hz-Raster in 0x5e0470), kippte dann in
+        // jedem Lauf an anderen Frames (Paartest: Kamera ab 13321, rng_b ab 13349).
         LARGE_INTEGER f, n;
+        LONGLONG game0 = *(volatile LONGLONG *)0x011C2D60, fpf;
         QueryPerformanceFrequency(&f);
         real_qpc(&n);
         g_vfreq = f.QuadPart;
-        g_vbase = n.QuadPart - (LONGLONG)g_F * (g_vfreq / 60);
+        fpf = g_vfreq / 60;
+        if (game0 && n.QuadPart > game0) {
+            LONGLONG d = ((n.QuadPart - game0) / fpf - g_F) / 3600 * 3600 + 3600;
+            g_vbase = game0 + d * fpf;
+            logf_("Virtuelle Uhr: Spielzeit = (Frame + %I64d) / 60 s", d);
+        } else g_vbase = n.QuadPart - (LONGLONG)g_F * fpf;
     }
     if (g_vframe != g_F) { g_vframe = g_F; g_vcalls = 0; }
     out->QuadPart = g_vbase + (LONGLONG)g_F * (g_vfreq / 60) + ++g_vcalls;
@@ -682,6 +693,7 @@ typedef struct {
     UINT32 rate, align, channels, tag, spb;   // spb: Samples je Block (ADPCM)
     float ratio;
     int running, n, head;
+    int owed;   // BufferEnd ohne Stream-Ende ausgeliefert, Nachlieferung (Submit) steht noch aus
     double pos;
     UINT64 played;
     VA_BUF q[64];
@@ -740,6 +752,7 @@ static HRESULT STDMETHODCALLTYPE a_submit(void *v, const XA_BUFFER *b, const voi
     if (g_vaudio && b) {
         EnterCriticalSection(&g_va_cs);
         if ((a = va_find(v)) != NULL) {
+            if (a->owed > 0) a->owed--;
             if (a->n < 64) {
                 VA_BUF *e = &a->q[(a->head + a->n) % 64];
                 e->samples = va_samples(a, b, w);
@@ -895,8 +908,9 @@ static HRESULT STDMETHODCALLTYPE h_create_src(void *xa, void **out, const WAVEFO
                 a->spb = (fmt->wFormatTag == 2 && fmt->cbSize >= 2) ? *(const WORD *)((const BYTE *)fmt + 20) : 0;
                 a->ratio = 1.0f;
                 if (g_a_voices <= 20)
-                    logf_("Ton: Stimme %p Format %u, %u Hz, %u Kanaele, Block %u, Rueckruf %p", *out, a->tag, a->rate,
-                          a->channels, a->align, cb);
+                    logf_("Ton: Stimme %p Format %u, %u Hz, %u Kanaele, Block %u, Rueckruf %p (%s, Aufruf %08lx)", *out, a->tag, a->rate,
+                          a->channels, a->align, cb, GetCurrentThreadId() == g_main_tid ? "Hauptthread" : "anderer Thread",
+                          (DWORD)_ReturnAddress());
             }
             LeaveCriticalSection(&g_va_cs);
         }
@@ -932,6 +946,41 @@ static ULONG64 sound_cycles(void)
     return sum;
 }
 
+// Gestreamte Stimmen (Musik, Sprache) bekommen ihren naechsten Puffer erst nach BufferEnd, vom Ton-Streamer
+// in Echtzeit, oft nach einem Plattenzugriff (dabei rechnet der Thread nicht, die Ruhe-Pruefung oben greift
+// nicht). Kam er nach dem naechsten va_tick, lief die Stimme leer und ihre Position (SamplesPlayed) blieb
+// stehen; die lange Zwischensequenz lief dann minimal anders (Paartest: rng_b ab Frame 12495 bzw. 13349).
+// Deshalb hier warten, bis jede BufferEnd ohne Stream-Ende mit einem Submit beantwortet ist (hoechstens
+// 200 ms; endet eine Stimme ohne Stream-Ende-Flag, verfaellt die Erwartung).
+static long g_va_refill_waits, g_va_refill_timeouts;
+
+static int va_owed(void)
+{
+    int i, n = 0;
+    EnterCriticalSection(&g_va_cs);
+    for (i = 0; i < 64; i++) if (g_va[i].voice && g_va[i].owed > 0) n += g_va[i].owed;
+    LeaveCriticalSection(&g_va_cs);
+    return n;
+}
+
+static void va_wait_refills(void)
+{
+    DWORD t0 = GetTickCount();
+    int i, waited = 0;
+    while (va_owed()) {
+        if (GetTickCount() - t0 > 200) {
+            g_va_refill_timeouts++;
+            EnterCriticalSection(&g_va_cs);
+            for (i = 0; i < 64; i++) g_va[i].owed = 0;
+            LeaveCriticalSection(&g_va_cs);
+            break;
+        }
+        waited = 1;
+        Sleep(0);
+    }
+    if (waited) g_va_refill_waits++;
+}
+
 static void va_tick(void)
 {
     static VA_EVENT ev[1024];
@@ -952,6 +1001,7 @@ static void va_tick(void)
             if (rem > 0) { budget -= rem; a->played += (UINT64)rem; }
             ev[nev].cb = a->cb; ev[nev].kind = 4; ev[nev++].ctx = e->ctx;
             if (e->flags & 0x40) { ev[nev].cb = a->cb; ev[nev].kind = 2; ev[nev++].ctx = NULL; }   // END_OF_STREAM
+            else if (e->samples) a->owed++;
             a->head = (a->head + 1) % 64;
             a->n--;
             a->pos = 0;
@@ -981,6 +1031,7 @@ static void va_tick(void)
             prev = now;
         }
     }
+    va_wait_refills();
 }
 
 static void audio_log(void)
@@ -1974,6 +2025,12 @@ static LONG CALLBACK lcg_watch_handler(EXCEPTION_POINTERS *e)
         g_lw[i].f = g_F;
         g_lw[i].eip = e->ContextRecord->Eip;
         g_lw[i].tid = GetCurrentThreadId();
+        // Aufrufer: die ersten Code-Adressen auf dem Stapel
+        __try {
+            DWORD *sp = (DWORD *)e->ContextRecord->Esp, k, n = 0;
+            for (k = 0; k < 96 && n < 4; k++)
+                if (sp[k] >= 0x00401000 && sp[k] < 0x00C50000) g_lw[i].st[n++] = sp[k];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     e->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -2103,7 +2160,8 @@ static void __cdecl on_frame_end(void)
     if (g_watch_lcg && g_trace && F == g_trace_to + 2) {
         LONG i, n = g_nlw < LW_MAX ? g_nlw : LW_MAX;
         for (i = 0; i < n; i++)
-            fprintf(g_trace, "%ld l %08lx %s\n", g_lw[i].f, g_lw[i].eip, g_lw[i].tid == g_main_tid ? "main" : "thread");
+            fprintf(g_trace, "%ld l %08lx %s %08lx %08lx %08lx %08lx\n", g_lw[i].f, g_lw[i].eip, g_lw[i].tid == g_main_tid ? "main" : "thread",
+                    g_lw[i].st[0], g_lw[i].st[1], g_lw[i].st[2], g_lw[i].st[3]);
         fflush(g_trace);
     }
     g_last_frame_tick = GetTickCount();
@@ -2123,6 +2181,7 @@ static void __cdecl on_frame_end(void)
     if (g_net || g_nodinput) *(volatile BYTE *)0x0136555C |= 3;
     if (g_vaudio) va_tick();
     if (g_audiolog && F % 600 == 0) audio_log();
+    if (g_vaudio && F % 3000 == 0) logf_("Ton: %ld Nachlieferungen abgewartet, %ld Zeitgrenzen", g_va_refill_waits, g_va_refill_timeouts);
     if (g_iowait && F % 3000 == 0) logf_("Datei-Threads: %ld Wartephasen, %ld Zeitgrenzen; SaveCore: %ld Wartephasen, %ld Zeitgrenzen",
                                          g_io_waits, g_io_timeouts, g_save_waits, g_save_timeouts);
     if (F % 3000 == 0 && g_loadsync) logf_("Laden: %ld Wartephasen, %ld Zeitgrenzen; nach Frame-Ende %ld Wartephasen, %ld Zeitgrenzen, %ld verlangsamte Frames", g_load_waits, g_load_timeouts, g_post_waits, g_post_timeouts, g_slow_frames);
@@ -2170,12 +2229,12 @@ static void __cdecl on_frame_end(void)
             unsigned char *q = G_BGPROC;
             int *cur = (int *)G_BGPROC_CURRENT;
             fprintf(g_csv, "%ld,%d,%.6f,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%d,%d,%08x,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-                    "%d,%d,%d,%d,%d,%d,%ld,%08x,%d,%d,%ld,%lu\n", F, G_FRAMECOUNT,
+                    "%d,%d,%d,%d,%d,%d,%ld,%08x,%d,%d,%ld,%lu,%ld,%08lx\n", F, G_FRAMECOUNT,
                     G_DT, G_RNG_PM_SEED, G_RNG_LCG16, G_RNG_PM_DEFAULT, G_RNG_A, G_RNG_B, G_RNG_C, crt_rand_state(), g_polls, cs.n, cs.hash,
                     cs.p1[0], cs.p1[1], cs.p1[2], cs.p2[0], cs.p2[1], cs.p2[2],
                     *(int *)0x011CF178, *(int *)0x0131356C, *(int *)0x01313574, *(int *)0x0131359C, *(int *)0x013135B0,
                     *(int *)0x01313568, q ? *(LONG *)(q + BGPROC_PENDING) : -1, cur ? cur[2] : 0, ll ? ll[2] : -1, inflight,
-                    g_anchor < 0 ? -1L : F - g_anchor, GetTickCount() - g_t0);
+                    g_anchor < 0 ? -1L : F - g_anchor, GetTickCount() - g_t0, g_vcalls, *(DWORD *)0x011CF0D8);
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         if (F % 60 == 0) fflush(g_csv);
         if (g_trace && F == g_trace_to + 1) fflush(g_trace);
@@ -2418,7 +2477,7 @@ static void init(void)
     }
     logf_("Spielstand-Schutz %s", g_allow_save ? "AUS (LBO_ALLOWSAVE)" : "aktiv");
     g_csv = open_out("frames.csv", "w");
-    if (g_csv) fprintf(g_csv, "F,game_frame,dt,rng_pm_seed,rng_lcg16,rng_pm_default,rng_a,rng_b,rng_c,crt_rand,polls,chars,char_hash,p1x,p1y,p1z,p2x,p2y,p2z,vid,fmv_a,fmv_b,fmv_c,fmv_d,fmv_frame,bg_pend,bg_job,ll_n,ll_loading,rel,ms\n");
+    if (g_csv) fprintf(g_csv, "F,game_frame,dt,rng_pm_seed,rng_lcg16,rng_pm_default,rng_a,rng_b,rng_c,crt_rand,polls,chars,char_hash,p1x,p1y,p1z,p2x,p2y,p2z,vid,fmv_a,fmv_b,fmv_c,fmv_d,fmv_frame,bg_pend,bg_job,ll_n,ll_loading,rel,ms,qpc,rawdt\n");
     logf_("Modus %d, festes dt %d, fps %d, max Frames %d, Screenshot alle %d, Mehrfach %d", g_mode, g_fixed_dt,
           g_fps_cap, g_max_frames, g_shot_every, g_multi);
     logf_("NuBgProc synchron %d, ohne Videos %d, Zufalls-Reset bei Frame %d, Lade-Sync %d, Video-dt fest %d, virtuelle Uhr %d", g_bgsync,

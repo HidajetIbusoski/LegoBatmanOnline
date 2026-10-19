@@ -248,6 +248,6 @@ Neben `0x11a1840` (Park-Miller-Startwert), `0x11a1844` (16-Bit-LCG, 615 Zugriffe
 ## Nächste Schritte
 
 1. **Ton anhören** mit `LBO_VAUDIO=1` (Aussetzer?) und den Test in weiteren Levels sowie mit geladenem Spielstand wiederholen.
-2. **Abgleichpunkt für online:** Beim Start des Levels (bzw. beim Verlassen des Hauptmenüs) überträgt der Host Zufallszustände, Eingabe-Takt und ggf. weitere Zähler an den Gast; danach Lockstep wie bei Batman 1.
+2. **Abgleichpunkt für online:** Beim Levelstart überträgt der Host die sieben Zufallszustände und den Eingabe-Takt an den Gast (wie `LBO_ANCHOR`). Danach folgt der Lockstep wie bei Batman 1.
 3. Netzcode und App-Anbindung für Batman 2 (Adresstabelle pro Spiel).
 4. Längere Tests in weiteren Levels (Fahrzeuge, Charakterwechsel, Speichern ist im Test umgeleitet).

@@ -702,7 +702,9 @@ typedef struct {
     UINT32 rate, align, channels, tag, spb;   // spb: Samples je Block (ADPCM)
     float ratio;
     int running, n, head;
-    int owed;   // BufferEnd ohne Stream-Ende ausgeliefert, Nachlieferung (Submit) steht noch aus
+    int pend_be;     // BufferEnd ohne Stream-Ende im letzten va_tick ausgeliefert
+    int streaming;   // hat schon einmal im selben Frame nachgeliefert (Musik, Sprache)
+    int owed;        // ausstehende Nachlieferungen eines Streams
     double pos;
     UINT64 played;
     VA_BUF q[64];
@@ -761,6 +763,7 @@ static HRESULT STDMETHODCALLTYPE a_submit(void *v, const XA_BUFFER *b, const voi
     if (g_vaudio && b) {
         EnterCriticalSection(&g_va_cs);
         if ((a = va_find(v)) != NULL) {
+            if (a->pend_be > 0) { a->pend_be--; a->streaming = 1; }
             if (a->owed > 0) a->owed--;
             if (a->n < 64) {
                 VA_BUF *e = &a->q[(a->head + a->n) % 64];
@@ -960,12 +963,13 @@ static ULONG64 sound_cycles(void)
     return sum;
 }
 
-// Gestreamte Stimmen (Musik, Sprache) bekommen ihren naechsten Puffer erst nach BufferEnd, vom Ton-Streamer
-// in Echtzeit, oft nach einem Plattenzugriff (dabei rechnet der Thread nicht, die Ruhe-Pruefung oben greift
-// nicht). Kam er nach dem naechsten va_tick, lief die Stimme leer und ihre Position (SamplesPlayed) blieb
-// stehen; die lange Zwischensequenz lief dann minimal anders (Paartest: rng_b ab Frame 12495 bzw. 13349).
-// Deshalb hier warten, bis jede BufferEnd ohne Stream-Ende mit einem Submit beantwortet ist (hoechstens
-// 200 ms; endet eine Stimme ohne Stream-Ende-Flag, verfaellt die Erwartung).
+// Gestreamte Stimmen (Musik, Sprache) bekommen ihren naechsten Puffer erst nach BufferEnd, vom Ton-Streamer in
+// Echtzeit. Kam er nach dem naechsten va_tick, lief die virtuelle Stimme leer. Ohne dieses Warten trat der
+// 1-Frame-Versatz der ersten Musikstimme (Frame 283/284) wieder auf, mit ihm in 15 Laeufen nicht.
+// Gewartet wird nur bei Musik-Streams: Stimmen mit 44,1 kHz und mindestens 2 Kanaelen, die schon einmal im
+// selben Frame nachgeliefert haben. Soundeffekte (22 kHz mono) liessen sonst im Level das Bild stocken
+// (Paartest: 322 Haenger von etwa 220 ms, mit fester 2-s-Grenze je 2 s). Hoechstens 200 ms; kommt
+// nichts, ist der Stream zu Ende und die Stimme gilt wieder als nicht gestreamt.
 static long g_va_refill_waits, g_va_refill_timeouts;
 
 static int va_owed(void)
@@ -982,15 +986,10 @@ static void va_wait_refills(void)
     DWORD t0 = GetTickCount();
     int i, waited = 0;
     while (va_owed()) {
-        if (GetTickCount() - t0 > 2000) {
+        if (GetTickCount() - t0 > 200) {
             g_va_refill_timeouts++;
             EnterCriticalSection(&g_va_cs);
-            for (i = 0; i < 64; i++)
-                if (g_va[i].voice && g_va[i].owed > 0) {
-                    logf_("Ton: Stimme %p (%u Hz, %u Kanaele) ohne Nachlieferung, %d offen, %I64u Samples gespielt",
-                          g_va[i].voice, g_va[i].rate, g_va[i].channels, g_va[i].n, g_va[i].played);
-                    g_va[i].owed = 0;
-                }
+            for (i = 0; i < 64; i++) if (g_va[i].owed > 0) { g_va[i].owed = 0; g_va[i].streaming = 0; }
             LeaveCriticalSection(&g_va_cs);
             break;
         }
@@ -1008,6 +1007,7 @@ static void va_tick(void)
     for (i = 0; i < 64; i++) {
         VA_VOICE *a = &g_va[i];
         double budget;
+        a->pend_be = 0;   // im letzten Frame nicht nachgeliefert: kein Stream-Muster
         if (!a->voice || !a->cb || !a->running) continue;
         budget = (double)a->rate * a->ratio / 60.0;
         while (a->n && nev < 1020) {
@@ -1020,7 +1020,7 @@ static void va_tick(void)
             if (rem > 0) { budget -= rem; a->played += (UINT64)rem; }
             ev[nev].cb = a->cb; ev[nev].kind = 4; ev[nev++].ctx = e->ctx;
             if (e->flags & 0x40) { ev[nev].cb = a->cb; ev[nev].kind = 2; ev[nev++].ctx = NULL; }   // END_OF_STREAM
-            else if (e->samples) a->owed++;
+            else if (e->samples) { a->pend_be++; if (a->streaming && a->rate >= 44100 && a->channels >= 2) a->owed++; }
             a->head = (a->head + 1) % 64;
             a->n--;
             a->pos = 0;
@@ -2207,7 +2207,7 @@ static void __cdecl on_frame_end(void)
     if (g_net || g_nodinput) *(volatile BYTE *)0x0136555C |= 3;
     if (g_vaudio) va_tick();
     if (g_audiolog && F % 600 == 0) audio_log();
-    if (g_vaudio && F % 3000 == 0) logf_("Ton: %ld Nachlieferungen abgewartet, %ld Zeitgrenzen", g_va_refill_waits, g_va_refill_timeouts);
+    if (g_vaudio && F % 3000 == 0) logf_("Ton: %ld Nachlieferungen abgewartet, %ld Stream-Enden", g_va_refill_waits, g_va_refill_timeouts);
     if (g_iowait && F % 3000 == 0) logf_("Datei-Threads: %ld Wartephasen, %ld Zeitgrenzen; SaveCore: %ld Wartephasen, %ld Zeitgrenzen",
                                          g_io_waits, g_io_timeouts, g_save_waits, g_save_timeouts);
     if (F % 3000 == 0 && g_loadsync) logf_("Laden: %ld Wartephasen, %ld Zeitgrenzen; nach Frame-Ende %ld Wartephasen, %ld Zeitgrenzen, %ld verlangsamte Frames", g_load_waits, g_load_timeouts, g_post_waits, g_post_timeouts, g_slow_frames);

@@ -278,7 +278,30 @@ Launcher und App:
 
 Der lokale Paartest ohne Netz (v1) war über 10.381 Frames ab dem Anker identisch. Im Netz unterscheidet sich vor allem das Timing, weil Host und Gast unterschiedlich lange aufeinander warten. Ladevorgänge, die über mehrere Frames mit dem Hauptthread zusammenarbeiten, enden dann in verschiedenen Frames. Betroffen sind das Nachladen der Level-Figuren, `StreamingLevel::Unload` und Intro-Animationen. Warten und Verlangsamen senkt die Häufigkeit, schließt diese Wettläufe aber nicht sicher aus.
 
-**Nächster Ansatz:** Den Hintergrund-Thread NuBgProc und die Lade-Threads frame-gebunden laufen lassen. Sie dürfen nur im Fenster nach dem Frame-Ende arbeiten, bis sie blockieren oder fertig sind, und sind während Logik und Zeichnen angehalten. Dabei darf kein Thread angehalten werden, während er einen kritischen Abschnitt hält, den der Hauptthread braucht. Alternative: den Anker auf den Zeitpunkt legen, an dem das Level fertig geladen ist (Liste leer, Figurenzahl stabil), und dort zusätzlich die Figurenzustände übertragen.
+### Frame-gebundene Lade-Threads (`LBO_GATE`, experimentell)
+
+**Nachstellungstest ohne Netz:**
+- Zwei Instanzen mit allen Schaltern, ungebremst (`LBO_FPSCAP=0`), eine mit `LBO_JITTER=30` (zufällige Pause bis 30 ms je Frame).
+- Die schnelle Instanz läuft anders: Neues Spiel bei 6833 statt 5273. Die verzögerte folgt fast genau dem normalen 60-fps-Ablauf.
+- Was im Hintergrund pro Frame fertig wird, hängt also an der Echtzeit.
+
+**`LBO_GATE=1`:**
+- Die Threads aus `LBO_GATESET` (Standard `2,15` = m_readThread, NuBgProc) laufen nur im Fenster nach dem Frame-Ende, bis sie 4 ms ruhen (höchstens 300 ms).
+- Während Logik und Zeichnen sind sie per `SuspendThread` angehalten.
+- Ein Wächter gibt sie frei, wenn der Hauptthread im Spielcode wartet: weniger als 300.000 Zyklen in 2 ms, oder 100 ms ohne Fortschritt bei aktivem Warten auf eine Sperre.
+- Gewollte Pausen (Bildratenbremse, Netz, Jitter) zählen nicht (`g_in_wait`).
+
+**Erfahrungen:**
+- **Hänger:** Gehören TextureDecode und m_decodeThread zum Takt, hängt der Hauptthread beim Zeichnen des Ladebildschirms (`0x5707c0` → `0x5e1830`, Grafiksperre). Eigene Diagnose-Zugriffe auf die Streaming-Liste blockierten am kritischen Abschnitt, den ein angehaltener Thread hielt; deshalb jetzt `TryEnterCriticalSection`. Mit `2,15` und dem verbesserten Wächter gibt es keine Hänger mehr (22 Freigaben in 6000 Frames).
+- **Zu langsam:** Ton- und Video-Threads (14, 16, 17) fragen ständig ab und ruhen nie. Mit ihnen läuft jedes Fenster in die Zeitgrenze, und das Spiel schafft nur etwa 3 Frames/s.
+- **Wirkung:** Je 4 kurze Paare (600 Frames, schnell gegen verzögert) mit Gating 2 Abweichungen bei Frame 284, ohne Gating 0. Der Wettlauf ist also selten und liegt nicht in NuBgProc oder m_readThread.
+
+**Stand:** Ein Ablauf, der unabhängig von der Rechnergeschwindigkeit gleich bleibt, ist für Batman 2 noch nicht erreicht. Gelöst sind Ton, Videos, Zeichen-Zufall, Musik-Takt, die Streaming-Liste und der Eingabe-Takt. Übrig sind seltene Wettläufe an Szenen- und Ladeübergängen, deren Thread noch nicht gefunden ist. `LBO_GATE` ist im Netzmodus deshalb nicht eingeschaltet.
+
+Mögliche Wege:
+1. **Weitersuchen:** pro Übergang den auslösenden Zustand finden (`LBO_PROBE`, `LBO_BREAKAT`), mit mehreren Läufen pro Variante, weil die Fehler selten sind.
+2. **Weicher Abgleich:** Der Host schickt regelmäßig, etwa alle 30 Frames, Zufallszustände und die Positionen der Spielerfiguren, und der Gast übernimmt sie. Das gleicht kleine Abweichungen aus. Gegner und Objekte können dabei aber auseinanderlaufen.
+3. Batman 2 zurückstellen und andere Spiele der Reihe prüfen.
 
 ## Zufallsgeneratoren
 

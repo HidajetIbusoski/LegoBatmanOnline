@@ -110,6 +110,9 @@ static int g_bgsync, g_devchange, g_rng_reset, g_no_movies;
 static int g_mode, g_fixed_dt, g_fps_cap, g_max_frames, g_shot_every, g_multi;
 static char g_dir[MAX_PATH], g_live[MAX_PATH];
 static FILE *g_log, *g_csv, *g_liveout, *g_probe;
+// 1 = Hauptthread wartet bewusst in unserem Code (Bildratenbremse, Netz, Jitter); siehe gate_watch
+static volatile LONG g_in_wait;
+static int g_gate;   // LBO_GATE, siehe gate_window
 static struct { DWORD base, off; int deref; } g_probes[32];
 static int g_nprobe;
 static long g_live_pos;
@@ -1006,17 +1009,23 @@ static void cap_frame_rate(void)
 {
     LARGE_INTEGER now;
     LONGLONG period;
-    if (g_F < g_slow_start) Sleep(50);
+    if (g_F < g_slow_start) { g_in_wait = 1; Sleep(50); g_in_wait = 0; }
     if (g_fps_cap <= 0) return;
+    g_in_wait = 1;
     period = g_qpf.QuadPart / g_fps_cap;
     QueryPerformanceCounter(&now);
-    if (!g_next.QuadPart || now.QuadPart - g_next.QuadPart > period * 4) { g_next.QuadPart = now.QuadPart + period; return; }
+    if (!g_next.QuadPart || now.QuadPart - g_next.QuadPart > period * 4) {
+        g_next.QuadPart = now.QuadPart + period;
+        g_in_wait = 0;
+        return;
+    }
     while (now.QuadPart < g_next.QuadPart) {
         LONGLONG left = (g_next.QuadPart - now.QuadPart) * 1000 / g_qpf.QuadPart;
         if (left > 2) Sleep((DWORD)(left - 1));
         QueryPerformanceCounter(&now);
     }
     g_next.QuadPart += period;
+    g_in_wait = 0;
 }
 
 static unsigned *crt_rand_ptr(void)
@@ -1078,7 +1087,10 @@ static void net_sync_point(long F, const char *what)
         sync_capture(&s);
         net_send_sync((int)F, &s, sizeof s);
     } else {
-        int got = net_wait_sync((int)F, &s, sizeof s, 60000);
+        int got;
+        g_in_wait = 1;
+        got = net_wait_sync((int)F, &s, sizeof s, 60000);
+        g_in_wait = 0;
         if (got) sync_apply(&s);
         if (got != F) logf_("Netz: Abgleich %s bei Frame %ld passt nicht (Host-Frame %d)", what, F, got);
     }
@@ -1118,7 +1130,9 @@ static void net_exchange(long F)
     } else {
         input_read(&local);
     }
+    g_in_wait = 1;
     net_frame((int)F, &local, both);
+    g_in_wait = 0;
     for (i = 0; i < 2; i++) {
         g_net_pad[i].wButtons = both[i].buttons;
         g_net_pad[i].bLeftTrigger = both[i].lt; g_net_pad[i].bRightTrigger = both[i].rt;
@@ -1256,7 +1270,8 @@ static int loads_in_flight(int *first_state)
     __try {
         list = G_LOADLIST;
         if (!list) return 0;
-        EnterCriticalSection(LOADLIST_CS);
+        if (g_gate) { if (!TryEnterCriticalSection(LOADLIST_CS)) return 0; }   // nie blockieren: Halter evtl. angehalten
+        else EnterCriticalSection(LOADLIST_CS);
         for (it = (int *)list[0]; it && guard < 4096; it = (int *)it[2], guard++) {
             int st = it[5];
             char want = *((char *)it + 0x1c);
@@ -1364,12 +1379,116 @@ static int bg_loader_active(void)
 // abwarten. Mit der Pause enden sie praktisch immer im selben Frame.
 static int g_load_slow;
 static long g_slow_frames;
+// LBO_JITTER=ms (Test): zufaellige Pause 0..ms nach jedem Frame-Ende. Ahmt die unterschiedlichen
+// Wartezeiten im Netz nach, damit sich Lade-Wettlaeufe lokal mit zwei Instanzen nachstellen lassen.
+static int g_jitter;
+static unsigned g_jitter_state;
+
+// --- Frame-gebundene Lade-Threads (LBO_GATE=1) ------------------------------------------------------
+// Die Lade-Threads (Tabelle 0x102dbe0: 2 m_readThread, 15 NuBgProc)
+// arbeiten nur im Fenster nach dem Frame-Ende: Dort laufen sie, bis sie 4 ms lang nicht gerechnet haben;
+// waehrend Spiellogik und Zeichnen sind sie angehalten. Wie viel sie pro Frame schaffen, haengt dann nicht
+// mehr von der Rechnergeschwindigkeit ab (Test: schnelle und verzoegerte Instanz liefen sonst verschieden).
+// Wartet der Hauptthread im Spielcode auf einen dieser Threads (z. B. beim Laden), gibt der Waechter sie
+// frei, bis der Hauptthread weiterrechnet.
+static volatile LONG g_gate_suspended;
+static long g_gate_windows, g_gate_timeouts, g_gate_assists;
+// LBO_GATESET=Indizes (Komma), Standard 2,15
+static int g_gate_idx[19] = { 2, 15 };
+static int g_gate_n = 2;
+#define GATE_N g_gate_n
+
+static HANDLE gate_handle(int i) { return *(HANDLE *)(0x0102DBE0 + g_gate_idx[i] * 0xB4 + 0xA8); }
+
+static ULONG64 gate_cycles(void)
+{
+    ULONG64 sum = 0, c;
+    int i;
+    for (i = 0; i < GATE_N; i++) { HANDLE h = gate_handle(i); if (h && QueryThreadCycleTime(h, &c)) sum += c; }
+    return sum;
+}
+
+static void gate_resume(void)
+{
+    int i;
+    if (!InterlockedExchange(&g_gate_suspended, 0)) return;
+    for (i = 0; i < GATE_N; i++) { HANDLE h = gate_handle(i); if (h) ResumeThread(h); }
+}
+
+static volatile DWORD g_gate_close_tick;
+
+static void gate_suspend(void)
+{
+    int i;
+    g_gate_close_tick = GetTickCount();
+    if (InterlockedExchange(&g_gate_suspended, 1)) return;
+    for (i = 0; i < GATE_N; i++) { HANDLE h = gate_handle(i); if (h) SuspendThread(h); }
+}
+
+// Fenster: Threads laufen lassen, bis sie 4 ms am Stueck ruhen (hoechstens 300 ms)
+static void gate_window(void)
+{
+    DWORD t0 = GetTickCount();
+    ULONG64 prev, now;
+    int idle = 0;
+    gate_resume();
+    g_gate_windows++;
+    prev = gate_cycles();
+    for (;;) {
+        Sleep(1);
+        now = gate_cycles();
+        if (now == prev) { if (++idle >= 4) break; }
+        else { idle = 0; prev = now; }
+        if (GetTickCount() - t0 > 300) { g_gate_timeouts++; break; }
+    }
+}
+
+static DWORD WINAPI gate_watch(void *arg)
+{
+    ULONG64 last = 0, c;
+    int idle = 0;
+    (void)arg;
+    for (;;) {
+        Sleep(2);
+        if (!g_gate || !g_main_thread || g_in_wait) { idle = 0; continue; }
+        if (!QueryThreadCycleTime(g_main_thread, &c)) continue;
+        // Freigeben, wenn der Hauptthread im Spielcode wartet: unter 300.000 Zyklen in 2 ms (auch
+        // Sleep-Schleifen wachen kurz auf), oder er kommt 100 ms lang nicht in unseren Haken an (aktives Warten
+        // auf eine Sperre, die ein angehaltener Thread haelt, z. B. StreamingLevel::Unload beim Zeichnen).
+        // Angehalten wird erst wieder am Ende des naechsten Fensters.
+        if (g_gate_suspended) {
+            if (c - last < 300000) idle++;
+            else idle = 0;
+            if (idle >= 5 || GetTickCount() - g_gate_close_tick > 100) {
+                gate_resume();
+                g_gate_assists++;
+                idle = 0;
+            }
+        }
+        last = c;
+    }
+}
+
+static void __cdecl post_frame_end_inner(void);
 
 static void __cdecl post_frame_end(void)
+{
+    if (g_gate && g_F > 30) gate_window();
+    post_frame_end_inner();
+    if (g_gate && g_F > 30) gate_suspend();
+}
+
+static void __cdecl post_frame_end_inner(void)
 {
     DWORD t0;
     LONG c0;
     int waited = 0;
+    if (g_jitter) {
+        g_jitter_state = g_jitter_state * 1103515245u + 12345u;
+        g_in_wait = 1;
+        Sleep((g_jitter_state >> 16) % (unsigned)(g_jitter + 1));
+        g_in_wait = 0;
+    }
     if (g_iowait) wait_io();   // nach dem Zeichnen: angestossene Shader- und Textur-Arbeit abwarten
     if (!g_loadsync || !G_BGPROC) return;
     if (g_load_slow) {
@@ -1695,7 +1814,11 @@ static void __cdecl on_frame_end(void)
         g_main_tid = GetCurrentThreadId();
         if (g_watch_lcg) CreateThread(NULL, 0, lcg_watch_set, NULL, 0, NULL);
         if (g_breakat) CreateThread(NULL, 0, break_set, NULL, 0, NULL);
+        if (g_gate) CreateThread(NULL, 0, gate_watch, NULL, 0, NULL);
     }
+    if (g_gate && F % 3000 == 0)
+        logf_("Lade-Threads: %ld Fenster, %ld Zeitgrenzen, %ld Freigaben fuer den Hauptthread", g_gate_windows,
+              g_gate_timeouts, g_gate_assists);
     if (g_watch_lcg && g_trace && F == g_trace_to + 2) {
         LONG i, n = g_nlw < LW_MAX ? g_nlw : LW_MAX;
         for (i = 0; i < n; i++)
@@ -1709,7 +1832,8 @@ static void __cdecl on_frame_end(void)
     // Ohne Fensterfokus haelt das Spiel an (0x5bc170). Im Skriptmodus soll es trotzdem weiterlaufen.
     if (g_mode == MODE_SCRIPT) G_WINDOW_ACTIVE = 1;
     if (g_bgsync == 2) bg_wait_idle();
-    if (g_loadsync) wait_loads();
+    // Mit LBO_GATE sind die Lade-Threads hier angehalten; gewartet wird im Fenster nach dem Frame-Ende
+    if (g_loadsync && !(g_gate && F > 30)) wait_loads();
     if (g_iowait) wait_io();
     if (g_vaudio) va_tick();
     if (g_audiolog && F % 600 == 0) audio_log();
@@ -1730,7 +1854,11 @@ static void __cdecl on_frame_end(void)
             // Der Gast uebernimmt den Zustand des Hosts, danach zaehlt der Lockstep ab dem Anker neu.
             SYNCSTATE s;
             if (net_role() == 0) sync_capture(&s);
-            if (net_barrier((int)F, &s, sizeof s, 120000) && net_role() == 1) sync_apply(&s);
+            int ok;
+            g_in_wait = 1;
+            ok = net_barrier((int)F, &s, sizeof s, 120000);
+            g_in_wait = 0;
+            if (ok && net_role() == 1) sync_apply(&s);
         } else reset_rng();
         logf_("Levelanker bei Frame %ld", F);
     }
@@ -1943,6 +2071,13 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_IOWAIT", buf, sizeof buf)) g_iowait = atoi(buf);
     if (GetEnvironmentVariableA("LBO_SLOWSTART", buf, sizeof buf)) g_slow_start = atoi(buf);
     if (GetEnvironmentVariableA("LBO_LOADSLOW", buf, sizeof buf)) g_load_slow = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_GATE", buf, sizeof buf)) g_gate = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_GATESET", buf, sizeof buf)) {
+        char *t = strtok(buf, ",");
+        g_gate_n = 0;
+        while (t && g_gate_n < 19) { g_gate_idx[g_gate_n++] = atoi(t); t = strtok(NULL, ","); }
+    }
+    if (GetEnvironmentVariableA("LBO_JITTER", buf, sizeof buf)) { g_jitter = atoi(buf); g_jitter_state = GetCurrentProcessId(); }
     if (GetEnvironmentVariableA("LBO_AUDIOLOG", buf, sizeof buf)) g_audiolog = atoi(buf);
     if (GetEnvironmentVariableA("LBO_VAUDIO", buf, sizeof buf)) g_vaudio = atoi(buf);
     if (GetEnvironmentVariableA("LBO_PROBE", buf, sizeof buf)) {

@@ -29,6 +29,7 @@
 //   LBO_WINDOWED   1 = Fenstermodus erzwingen (Direct3D Windowed=1)
 #define COBJMACROS
 #include <windows.h>
+#include <xmmintrin.h>
 #include <d3d9.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,8 +105,8 @@ static long g_bg_waits, g_bg_timeouts, g_load_waits, g_load_timeouts;
 static int g_loadsync, g_videodt, g_render_rng;
 static int g_trace_from, g_trace_to, g_watch_lcg;
 static DWORD g_watch_addr = 0x011A1844;   // LBO_WATCHADDR=Adresse: anderer Wert statt des LCG
-#define LW_MAX (1 << 20)
-static struct { long f; DWORD eip, tid, st[4]; } g_lw[LW_MAX];
+#define LW_MAX (1 << 18)
+static struct { long f; DWORD eip, tid, st[12]; } g_lw[LW_MAX];
 static volatile LONG g_nlw;
 static FILE *g_trace;
 static int g_bgsync, g_devchange, g_rng_reset, g_no_movies;
@@ -116,7 +117,7 @@ static FILE *g_log, *g_csv, *g_liveout, *g_probe;
 static volatile LONG g_in_wait;
 static int g_gate;   // LBO_GATE, siehe gate_window
 static FILE *g_memdump;
-static long g_memdump_from, g_memdump_to;
+static long g_memdump_from, g_memdump_to, g_memdump_step = 1;   // LBO_MEMDUMP=von,bis[,Schritt]
 static struct { DWORD base, off; int deref; } g_probes[32];
 static int g_nprobe;
 static long g_live_pos;
@@ -131,6 +132,14 @@ static CreateMutexAFn real_createmutex;
 static DWORD g_t0;
 static int g_polls;
 static HANDLE g_main_thread;
+
+// Diagnose: FPU-Zustand des Hauptthreads (CSV-Spalten fpucw, mxcsr)
+static unsigned fpu_cw(void)
+{
+    unsigned short w;
+    __asm fnstcw w
+    return w;
+}
 static volatile DWORD g_last_frame_tick;
 
 static void logf_(const char *fmt, ...)
@@ -682,7 +691,7 @@ static volatile LONG g_a_voices, g_a_cbvoices, g_a_start, g_a_stop, g_a_submit, 
 static volatile LONG g_a_cb[7], g_a_cb_main[7];
 static void *g_a_cbvt[8][7];
 static int g_a_ncbvt;
-static struct { DWORD ret; LONG n; } g_a_gs_callers[16];
+static struct { DWORD ret; LONG n; } g_a_gs_callers[16], g_a_gs_callers2[16];   // 2: Aufrufer von 0x6145f0 (+0x40000000 = Hauptthread)
 
 // Virtuelle Stimmen: Warteschlange der eingereichten Puffer mit ihrer Laenge in Samples. va_tick spielt
 // am Frame-Ende Abtastrate x Frequenzverhaeltnis / 60 Samples ab und liefert die faelligen Rueckrufe.
@@ -822,6 +831,11 @@ static void STDMETHODCALLTYPE a_getstate(void *v, XA_STATE *s)
     InterlockedIncrement(&g_a_getstate);
     for (i = 0; i < 16 && g_a_gs_callers[i].ret && g_a_gs_callers[i].ret != ret; i++) {}
     if (i < 16) { g_a_gs_callers[i].ret = ret; g_a_gs_callers[i].n++; }
+    if (g_audiolog && ret == 0x00614616) {
+        DWORD r2 = ((DWORD *)_AddressOfReturnAddress())[7] | (GetCurrentThreadId() == g_main_tid ? 0x40000000u : 0);
+        for (i = 0; i < 16 && g_a_gs_callers2[i].ret && g_a_gs_callers2[i].ret != r2; i++) {}
+        if (i < 16) { g_a_gs_callers2[i].ret = r2; g_a_gs_callers2[i].n++; }
+    }
     if (g_vaudio && s) {
         EnterCriticalSection(&g_va_cs);
         if ((a = va_find(v)) != NULL) {
@@ -968,10 +982,15 @@ static void va_wait_refills(void)
     DWORD t0 = GetTickCount();
     int i, waited = 0;
     while (va_owed()) {
-        if (GetTickCount() - t0 > 200) {
+        if (GetTickCount() - t0 > 2000) {
             g_va_refill_timeouts++;
             EnterCriticalSection(&g_va_cs);
-            for (i = 0; i < 64; i++) g_va[i].owed = 0;
+            for (i = 0; i < 64; i++)
+                if (g_va[i].voice && g_va[i].owed > 0) {
+                    logf_("Ton: Stimme %p (%u Hz, %u Kanaele) ohne Nachlieferung, %d offen, %I64u Samples gespielt",
+                          g_va[i].voice, g_va[i].rate, g_va[i].channels, g_va[i].n, g_va[i].played);
+                    g_va[i].owed = 0;
+                }
             LeaveCriticalSection(&g_va_cs);
             break;
         }
@@ -1049,6 +1068,10 @@ static void audio_log(void)
     len = snprintf(line, sizeof line, "Ton: GetState-Aufrufer");
     for (i = 0; i < 16 && g_a_gs_callers[i].ret; i++)
         len += snprintf(line + len, sizeof line - len, " %08lx:%ld", g_a_gs_callers[i].ret, g_a_gs_callers[i].n);
+    logf_("%s", line);
+    len = snprintf(line, sizeof line, "Ton: Aufrufer von 0x6145f0");
+    for (i = 0; i < 16 && g_a_gs_callers2[i].ret; i++)
+        len += snprintf(line + len, sizeof line - len, " %08lx:%ld", g_a_gs_callers2[i].ret, g_a_gs_callers2[i].n);
     logf_("%s", line);
 }
 
@@ -2028,7 +2051,7 @@ static LONG CALLBACK lcg_watch_handler(EXCEPTION_POINTERS *e)
         // Aufrufer: die ersten Code-Adressen auf dem Stapel
         __try {
             DWORD *sp = (DWORD *)e->ContextRecord->Esp, k, n = 0;
-            for (k = 0; k < 96 && n < 4; k++)
+            for (k = 0; k < 400 && n < 12; k++)
                 if (sp[k] >= 0x00401000 && sp[k] < 0x00C50000) g_lw[i].st[n++] = sp[k];
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
@@ -2141,17 +2164,17 @@ static void __cdecl on_frame_end(void)
     if (g_gate && F % 3000 == 0)
         logf_("Lade-Threads: %ld Fenster, %ld Zeitgrenzen, %ld Freigaben fuer den Hauptthread", g_gate_windows,
               g_gate_timeouts, g_gate_assists);
-    if (g_memdump && F >= g_memdump_from && F <= g_memdump_to) {
+    if (g_memdump && F >= g_memdump_from && F <= g_memdump_to && (F - g_memdump_from) % g_memdump_step == 0) {
         // LBO_MEMDUMP=von,bis (Diagnose): .data des Spiels (0x101f000, 0x38e7ec Byte) je Frame anhaengen;
         // tools/memdiff_b2.py findet den ersten globalen Wert, der zwischen zwei Laeufen auseinanderlaeuft
         // Erst im Speicher sammeln: Schreiben je Frame bremst genau das Fenster, in dem der Wettlauf passiert
         static unsigned char *buf;
-        if (!buf) buf = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)(g_memdump_to - g_memdump_from + 1) * 0x38E7EC,
+        if (!buf) buf = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)((g_memdump_to - g_memdump_from) / g_memdump_step + 1) * 0x38E7EC,
                                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        __try { if (buf) memcpy(buf + (SIZE_T)(F - g_memdump_from) * 0x38E7EC, (void *)0x0101F000, 0x38E7EC); }
+        __try { if (buf) memcpy(buf + (SIZE_T)((F - g_memdump_from) / g_memdump_step) * 0x38E7EC, (void *)0x0101F000, 0x38E7EC); }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
-        if (F == g_memdump_to) {
-            if (buf) fwrite(buf, 0x38E7EC, (size_t)(g_memdump_to - g_memdump_from + 1), g_memdump);
+        if (F + g_memdump_step > g_memdump_to) {
+            if (buf) fwrite(buf, 0x38E7EC, (size_t)((g_memdump_to - g_memdump_from) / g_memdump_step + 1), g_memdump);
             fclose(g_memdump);
             g_memdump = NULL;
             logf_("Speicherabzug fertig");
@@ -2159,9 +2182,12 @@ static void __cdecl on_frame_end(void)
     }
     if (g_watch_lcg && g_trace && F == g_trace_to + 2) {
         LONG i, n = g_nlw < LW_MAX ? g_nlw : LW_MAX;
-        for (i = 0; i < n; i++)
-            fprintf(g_trace, "%ld l %08lx %s %08lx %08lx %08lx %08lx\n", g_lw[i].f, g_lw[i].eip, g_lw[i].tid == g_main_tid ? "main" : "thread",
-                    g_lw[i].st[0], g_lw[i].st[1], g_lw[i].st[2], g_lw[i].st[3]);
+        for (i = 0; i < n; i++) {
+            int k;
+            fprintf(g_trace, "%ld l %08lx %s", g_lw[i].f, g_lw[i].eip, g_lw[i].tid == g_main_tid ? "main" : "thread");
+            for (k = 0; k < 12; k++) fprintf(g_trace, " %08lx", g_lw[i].st[k]);
+            fputc('\n', g_trace);
+        }
         fflush(g_trace);
     }
     g_last_frame_tick = GetTickCount();
@@ -2229,12 +2255,12 @@ static void __cdecl on_frame_end(void)
             unsigned char *q = G_BGPROC;
             int *cur = (int *)G_BGPROC_CURRENT;
             fprintf(g_csv, "%ld,%d,%.6f,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%d,%d,%08x,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-                    "%d,%d,%d,%d,%d,%d,%ld,%08x,%d,%d,%ld,%lu,%ld,%08lx\n", F, G_FRAMECOUNT,
+                    "%d,%d,%d,%d,%d,%d,%ld,%08x,%d,%d,%ld,%lu,%ld,%08lx,%04x,%08x\n", F, G_FRAMECOUNT,
                     G_DT, G_RNG_PM_SEED, G_RNG_LCG16, G_RNG_PM_DEFAULT, G_RNG_A, G_RNG_B, G_RNG_C, crt_rand_state(), g_polls, cs.n, cs.hash,
                     cs.p1[0], cs.p1[1], cs.p1[2], cs.p2[0], cs.p2[1], cs.p2[2],
                     *(int *)0x011CF178, *(int *)0x0131356C, *(int *)0x01313574, *(int *)0x0131359C, *(int *)0x013135B0,
                     *(int *)0x01313568, q ? *(LONG *)(q + BGPROC_PENDING) : -1, cur ? cur[2] : 0, ll ? ll[2] : -1, inflight,
-                    g_anchor < 0 ? -1L : F - g_anchor, GetTickCount() - g_t0, g_vcalls, *(DWORD *)0x011CF0D8);
+                    g_anchor < 0 ? -1L : F - g_anchor, GetTickCount() - g_t0, g_vcalls, *(DWORD *)0x011CF0D8, fpu_cw(), _mm_getcsr());
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         if (F % 60 == 0) fflush(g_csv);
         if (g_trace && F == g_trace_to + 1) fflush(g_trace);
@@ -2357,24 +2383,35 @@ static DWORD WINAPI installer(void *arg)
                 if (!memcmp((void *)0x007EBF19, pro_loop, 5) && !patch_jmp(0x007EBF19, (void *)stub_flush_top, pro_loop))
                     logf_("Aufraeum-Schleife: Haken bei 0x7ebf19 fehlgeschlagen");
             }
-            if (!post_done)
-                post_done = patch_call(0x007EBB90, 0x00557850, (void *)stub_bgloop) &&
-                            patch_call(0x007E6E03, 0x005528C0, (void *)stub_after_frame_end) &&
-                            patch_call(0x007E6F98, 0x005528C0, (void *)stub_after_frame_end);
-            if (!poll_done)
-                poll_done = patch_call(0x0063BD59, 0x0063B6F0, (void *)stub_poll_device) &&
-                            patch_call(0x0063D608, 0x0063B6F0, (void *)stub_poll_device) &&
-                            patch_call(0x0063D8EE, 0x0063B6F0, (void *)stub_poll_device);
-            if (!rrng_done)
-                rrng_done = patch_call(0x005E0D52, 0x00BD1C9D, (void *)render_rand) &&
-                            patch_call(0x005E0DB8, 0x00BD1C9D, (void *)render_rand) &&
-                            patch_call(0x00598619, 0x0051A1D0, (void *)render_rng_a) &&
-                            patch_abs32(0x0094CEC4, 0x011A1844, &g_rr_music_lcg) &&
-                            patch_abs32(0x0094CED5, 0x011A1844, &g_rr_music_lcg) &&
-                            patch_abs32(0x0094CC92, 0x011A1844, &g_rr_music_lcg2) &&
-                            patch_abs32(0x0094CCA3, 0x011A1844, &g_rr_music_lcg2) &&
-                            patch_abs32(0x0094D201, 0x011A1844, &g_rr_music_lcg3) &&
-                            patch_abs32(0x0094D212, 0x011A1844, &g_rr_music_lcg3);
+            // Jeder Patch einzeln: Die Huelle entschluesselt noch, waehrend hier geprueft wird. Frueher waren
+            // die Patches mit && verkettet; schlug einer fehl, scheiterte die Kette beim naechsten Durchlauf
+            // schon am ersten (bereits gepatchten) Eintrag, und der Rest wurde nie gesetzt (so fehlten die
+            // Musik-LCG-Umleitungen 0x94cec4 usw.).
+#define ONCE(flag, expr) ((flag) || ((flag) = (expr)))
+            if (!post_done) {
+                static int p[3];
+                post_done = ONCE(p[0], patch_call(0x007EBB90, 0x00557850, (void *)stub_bgloop)) &
+                            ONCE(p[1], patch_call(0x007E6E03, 0x005528C0, (void *)stub_after_frame_end)) &
+                            ONCE(p[2], patch_call(0x007E6F98, 0x005528C0, (void *)stub_after_frame_end));
+            }
+            if (!poll_done) {
+                static int p[3];
+                poll_done = ONCE(p[0], patch_call(0x0063BD59, 0x0063B6F0, (void *)stub_poll_device)) &
+                            ONCE(p[1], patch_call(0x0063D608, 0x0063B6F0, (void *)stub_poll_device)) &
+                            ONCE(p[2], patch_call(0x0063D8EE, 0x0063B6F0, (void *)stub_poll_device));
+            }
+            if (!rrng_done) {
+                static int p[9];
+                rrng_done = ONCE(p[0], patch_call(0x005E0D52, 0x00BD1C9D, (void *)render_rand)) &
+                            ONCE(p[1], patch_call(0x005E0DB8, 0x00BD1C9D, (void *)render_rand)) &
+                            ONCE(p[2], patch_call(0x00598619, 0x0051A1D0, (void *)render_rng_a)) &
+                            ONCE(p[3], patch_abs32(0x0094CEC4, 0x011A1844, &g_rr_music_lcg)) &
+                            ONCE(p[4], patch_abs32(0x0094CED5, 0x011A1844, &g_rr_music_lcg)) &
+                            ONCE(p[5], patch_abs32(0x0094CC92, 0x011A1844, &g_rr_music_lcg2)) &
+                            ONCE(p[6], patch_abs32(0x0094CCA3, 0x011A1844, &g_rr_music_lcg2)) &
+                            ONCE(p[7], patch_abs32(0x0094D201, 0x011A1844, &g_rr_music_lcg3)) &
+                            ONCE(p[8], patch_abs32(0x0094D212, 0x011A1844, &g_rr_music_lcg3)) ;
+            }
             if (!fmv_done) fmv_done = patch_call(FMV_FIND_CALL, FMV_FIND, (void *)no_movie_find);
             if (!vdt_done && !memcmp((void *)VIDEO_DT_STORE, vdt_orig, 6)) {
                 // fstp [0x11cf0dc] -> fstp st(0) + 4 x nop
@@ -2389,8 +2426,9 @@ static DWORD WINAPI installer(void *arg)
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         if (mutex_done && file_done) Sleep(1); else SwitchToThread();
     }
-    logf_("Haken: Frame-Ende %d, XInput %d, Mutex %d, D3D %d, Dateien %d (nach %lu ms)", frame_done, xinput_done, mutex_done, d3d_done, file_done,
-          GetTickCount() - start);
+    logf_("Haken: Frame-Ende %d, XInput %d, Mutex %d, D3D %d, Dateien %d, Videos %d, Video-dt %d, Zufall %d, Zeichen-Zufall %d, "
+          "Eingabe %d, Nach-Frame %d (nach %lu ms)", frame_done, xinput_done, mutex_done, d3d_done, file_done, fmv_done, vdt_done,
+          rng_done, rrng_done, poll_done, post_done, GetTickCount() - start);
     return 0;
 }
 
@@ -2431,7 +2469,7 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_GATE", buf, sizeof buf)) g_gate = atoi(buf);
     if (GetEnvironmentVariableA("LBO_LOOPGATE", buf, sizeof buf)) g_loopgate = atoi(buf);
     if (GetEnvironmentVariableA("LBO_NODINPUT", buf, sizeof buf)) g_nodinput = atoi(buf);
-    if (GetEnvironmentVariableA("LBO_MEMDUMP", buf, sizeof buf) && sscanf(buf, "%ld,%ld", &g_memdump_from, &g_memdump_to) == 2)
+    if (GetEnvironmentVariableA("LBO_MEMDUMP", buf, sizeof buf) && sscanf(buf, "%ld,%ld,%ld", &g_memdump_from, &g_memdump_to, &g_memdump_step) >= 2)
         g_memdump = open_out("memdump.bin", "wb");
     if (GetEnvironmentVariableA("LBO_GATESET", buf, sizeof buf)) {
         char *t = strtok(buf, ",");
@@ -2477,7 +2515,7 @@ static void init(void)
     }
     logf_("Spielstand-Schutz %s", g_allow_save ? "AUS (LBO_ALLOWSAVE)" : "aktiv");
     g_csv = open_out("frames.csv", "w");
-    if (g_csv) fprintf(g_csv, "F,game_frame,dt,rng_pm_seed,rng_lcg16,rng_pm_default,rng_a,rng_b,rng_c,crt_rand,polls,chars,char_hash,p1x,p1y,p1z,p2x,p2y,p2z,vid,fmv_a,fmv_b,fmv_c,fmv_d,fmv_frame,bg_pend,bg_job,ll_n,ll_loading,rel,ms,qpc,rawdt\n");
+    if (g_csv) fprintf(g_csv, "F,game_frame,dt,rng_pm_seed,rng_lcg16,rng_pm_default,rng_a,rng_b,rng_c,crt_rand,polls,chars,char_hash,p1x,p1y,p1z,p2x,p2y,p2z,vid,fmv_a,fmv_b,fmv_c,fmv_d,fmv_frame,bg_pend,bg_job,ll_n,ll_loading,rel,ms,qpc,rawdt,fpucw,mxcsr\n");
     logf_("Modus %d, festes dt %d, fps %d, max Frames %d, Screenshot alle %d, Mehrfach %d", g_mode, g_fixed_dt,
           g_fps_cap, g_max_frames, g_shot_every, g_multi);
     logf_("NuBgProc synchron %d, ohne Videos %d, Zufalls-Reset bei Frame %d, Lade-Sync %d, Video-dt fest %d, virtuelle Uhr %d", g_bgsync,

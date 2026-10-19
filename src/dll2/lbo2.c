@@ -23,6 +23,7 @@
 //   LBO_RENDERRNG  1 = Zufallsaufrufe beim Zeichnen (0x5e0d52, 0x5e0db8, 0x598619) und im Musiktakt
 //                  (0x94cdf0) auf eigene Zustaende
 //   LBO_WATCHLCG   1 = Hardware-Haltepunkt auf den LCG 0x11a1844: Schreibstellen im LBO_TRACERNG-Fenster
+//   LBO_WATCHADDR  Adresse (hex): wie LBO_WATCHLCG, aber fuer einen anderen 4-Byte-Wert
 //   LBO_VCLOCK     1 = virtuelle Uhr: Der Spiel-Timer liefert im Hauptthread Frame x 1/60 statt Echtzeit
 //   LBO_TRACERNG   von,bis: Aufrufer von 0x51a1d0 (rng_a) je Frame nach rngtrace.txt
 //   LBO_WINDOWED   1 = Fenstermodus erzwingen (Direct3D Windowed=1)
@@ -102,6 +103,7 @@ enum { MODE_OFF, MODE_SCRIPT };
 static long g_bg_waits, g_bg_timeouts, g_load_waits, g_load_timeouts;
 static int g_loadsync, g_videodt, g_render_rng;
 static int g_trace_from, g_trace_to, g_watch_lcg;
+static DWORD g_watch_addr = 0x011A1844;   // LBO_WATCHADDR=Adresse: anderer Wert statt des LCG
 #define LW_MAX (1 << 20)
 static struct { long f; DWORD eip, tid; } g_lw[LW_MAX];
 static volatile LONG g_nlw;
@@ -113,6 +115,8 @@ static FILE *g_log, *g_csv, *g_liveout, *g_probe;
 // 1 = Hauptthread wartet bewusst in unserem Code (Bildratenbremse, Netz, Jitter); siehe gate_watch
 static volatile LONG g_in_wait;
 static int g_gate;   // LBO_GATE, siehe gate_window
+static FILE *g_memdump;
+static long g_memdump_from, g_memdump_to;
 static struct { DWORD base, off; int deref; } g_probes[32];
 static int g_nprobe;
 static long g_live_pos;
@@ -1100,6 +1104,10 @@ static void net_sync_point(long F, const char *what)
 // Im Netzmodus darf das Spiel nur die beiden Lockstep-Pads sehen. 0x63b6f0 (this, Geraet, Ausgabe) liest
 // Geraet 0-3 per XInput (unser Haken), ab 4 DirectInput-Geraete inkl. Tastatur. Die Aufrufe 0x63bd59,
 // 0x63d608 und 0x63d8ee gehen ueber diesen Stummel: Geraete ab 4 melden "keine Eingabe".
+// LBO_NODINPUT=1: dasselbe im lokalen Test (sonst Standard nur im Netz). Die Tastatur-/DirectInput-Abfrage
+// aenderte im Paartest bei Frame 269 Eingabe-Zustaende (0x13655a4) und verschob den Spielstart um 1 Frame.
+static int g_nodinput;
+
 __declspec(naked) static void stub_poll_device(void)
 {
     __asm {
@@ -1308,6 +1316,24 @@ static ULONG64 io_cycles(void)
     return sum;
 }
 
+// Lese-Pipeline der Datenstroeme (Objekt = Argument von m_readThread, Thread-Tabelle Eintrag 2, +4):
+// m_readThread (0x567460) liest Bloecke von der Platte, m_decodeThread (0x563980) entpackt sie. Wartet der
+// Leser auf die Platte, rechnet er nicht - die CPU-Ruhe allein sagt dann nichts. Leerlauf heisst:
+// Leser wartet auf sein Ereignis (+0x16792c = 1) und keine Anfrage ist offen (wie die Pruefung in 0x567460).
+static int stream_busy(void)
+{
+    __try {
+        unsigned char *o = *(unsigned char **)(0x0102DBE0 + 2 * 0xB4 + 4);
+        unsigned char *q;
+        if (!o) return 0;
+        q = *(unsigned char **)(o + 0xC);
+        if (*(volatile LONG *)(o + 0x16792C) != 1) return 1;
+        if (q && *(int *)(q + 0x18) + *(int *)(q + 8) - *(int *)(o + 0x18) != 0) return 1;
+        if (*(int *)(o + 0x4124) != *(int *)(o + 0x4120)) return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
 static void wait_io(void)
 {
     DWORD t0 = GetTickCount();
@@ -1316,12 +1342,54 @@ static void wait_io(void)
     for (;;) {
         Sleep(3);
         now = io_cycles();
-        if (now == prev) break;
+        if (now == prev && !stream_busy()) break;
         prev = now;
         waited = 1;
         if (GetTickCount() - t0 > 500) { g_io_timeouts++; break; }
     }
     if (waited) g_io_waits++;
+}
+
+// Speicher-Thread SaveCore (0x540f70): Auftragsring bei 0x102ca58 (Kopf 0x102cab8, Ende 0x102cabc), waehrend
+// der Bearbeitung ist 0x11cc19a gesetzt. Er schaut nur alle 100 ms nach (Sleep bei 0x5410c1) und haelt
+// Meldungen wie "Speichern..." eine Mindestzeit in Echtzeit (Schleife 0x540db0, Uhr per QPC). Im Paartest
+// erschien der Spielstand-Bildschirm deshalb mal bei Frame 4842, mal bei 4879.
+// Mit LBO_IOWAIT: Pause auf 1 ms, Mindestzeit uebersprungen (0x540e2b jnp -> jmp, nur im Speicher), und das
+// Frame-Ende wartet, bis der Ring leer ist und nichts mehr bearbeitet wird.
+static long g_save_waits, g_save_timeouts;
+
+static void wait_savecore(void)
+{
+    DWORD t0 = GetTickCount();
+    int waited = 0;
+    for (;;) {
+        LONG head = *(volatile LONG *)0x0102CAB8, tail = *(volatile LONG *)0x0102CABC;
+        if (head == tail && !*(volatile BYTE *)0x011CC19A) break;
+        if (GetTickCount() - t0 > 3000) {
+            g_save_timeouts++;
+            logf_("SaveCore: Zeitgrenze (Ring %ld/%ld)", head, tail);
+            break;
+        }
+        waited = 1;
+        Sleep(0);
+    }
+    if (waited) g_save_waits++;
+}
+
+static void patch_byte(DWORD at, BYTE expect, BYTE val)
+{
+    DWORD old;
+    if (*(BYTE *)at != expect) return;   // noch verschluesselt oder schon gepatcht
+    VirtualProtect((void *)at, 1, PAGE_EXECUTE_READWRITE, &old);
+    *(BYTE *)at = val;
+    VirtualProtect((void *)at, 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void *)at, 1);
+}
+
+static void patch_savecore(void)
+{
+    if (*(WORD *)0x005410C1 == 0x646A) patch_byte(0x005410C2, 0x64, 1);      // push 100 -> push 1
+    if (*(WORD *)0x00540E2B == 0x117B) patch_byte(0x00540E2B, 0x7B, 0xEB);   // jnp -> jmp: keine Mindestzeit
 }
 
 // Alle Streaming-Eintraege im Uebergang, auch Entladen: laedt (2), entlaedt (5), gewuenscht aber leer (1),
@@ -1478,6 +1546,177 @@ static void __cdecl post_frame_end(void)
     if (g_gate && g_F > 30) gate_suspend();
 }
 
+// --- Getaktete Lade-Schleife (LBO_LOOPGATE=1) -------------------------------------------------------
+// Die Streaming-Schleife 0x7eb950 dreht im Hintergrund ununterbrochen, solange es Eintraege gibt, und
+// aendert deren Zustand zu beliebigen Zeitpunkten (Speichervergleich: bei Frame 281 steckte sie in einem
+// Lauf mitten im Durchlauf, im anderen nicht). Am Schleifenanfang (0x7eb979, keine Sperre gehalten) wartet
+// sie deshalb auf eine Freigabe. Nach dem Frame-Ende gibt loop_window einzelne Durchlaeufe frei, bis sich
+// die Eintraege zwei Durchlaeufe lang nicht aendern und keiner mehr laedt. Waehrend Logik und Zeichnen
+// steht sie. Laeuft die Schleife im Hauptthread (erstes Laden), wird nicht gebremst.
+static int g_loopgate;
+static HANDLE g_loop_sem;
+static volatile LONG g_loop_at_gate, g_loop_arrivals;
+static long g_loop_iters, g_loop_timeouts, g_loop_windows;
+
+static long g_loop_selfrelease;
+
+static void __cdecl loop_gate(void)
+{
+    LONG f0;
+    DWORD t0;
+    if (!g_loopgate || !g_loop_sem || !g_main_tid || GetCurrentThreadId() == g_main_tid) return;
+    InterlockedIncrement(&g_loop_at_gate);
+    InterlockedIncrement(&g_loop_arrivals);
+    // Sicherheitsnetz: Wartet der Hauptthread im Spielcode auf die Schleife, kaeme kein Fenster mehr.
+    // Freigabe, wenn 1 s lang kein Frame endet und der Hauptthread nicht in einer gewollten Pause steckt.
+    f0 = g_F;
+    t0 = GetTickCount();
+    for (;;) {
+        if (WaitForSingleObject(g_loop_sem, 50) == WAIT_OBJECT_0) break;
+        if (g_F != f0 || g_in_wait) { f0 = g_F; t0 = GetTickCount(); }
+        else if (GetTickCount() - t0 > 1000) {
+            int *cur = (int *)G_BGPROC_CURRENT;
+            InterlockedIncrement(&g_loop_selfrelease);
+            logf_("Lade-Schleife: Selbstfreigabe (Auftrag %08x)", cur ? cur[2] : 0);
+            break;
+        }
+    }
+    InterlockedDecrement(&g_loop_at_gate);
+}
+
+__declspec(naked) static void stub_loop_top(void)
+{
+    __asm {
+        pushad
+        pushfd
+        call loop_gate
+        popfd
+        popad
+        push 0138BA90h      // ueberschriebener Befehl bei 0x7eb979
+        push 007EB97Eh
+        ret
+    }
+}
+
+// Aufraeum-Schleife 0x7ebef0 (StreamingLevel::Unload 0x7ddc60 ruft sie im NuBgProc-Thread): dreht, bis
+// alle nicht mehr gewuenschten Eintraege entladen sind, und wartet dabei auf das Zeichnen im Hauptthread.
+// Ohne Takt endete Unload je nach Rechnertempo einen Frame frueher oder spaeter (Paar F2, Frame 7851).
+// Gleiche Freigabe wie die Lade-Schleife, Haken am Schleifenanfang 0x7ebf19 (push 0x138ba90).
+// Startphase: Dort wartet der Hauptthread selbst auf StreamingLevel::Unload (sonst 2x 5 s Stillstand)
+static void __cdecl flush_gate(void)
+{
+    if (g_F >= 300) loop_gate();
+}
+
+__declspec(naked) static void stub_flush_top(void)
+{
+    __asm {
+        pushad
+        pushfd
+        call flush_gate
+        popfd
+        popad
+        push 0138BA90h      // ueberschriebener Befehl bei 0x7ebf19
+        push 007EBF1Eh
+        ret
+    }
+}
+
+// Signatur der Streaming-Liste (Eintrag, Zustand, gewuenscht) und Zahl der ladenden Eintraege
+static unsigned list_signature(int *loading)
+{
+    int *list = G_LOADLIST, *it, guard = 0;
+    unsigned h = 2166136261u;
+    *loading = 0;
+    if (!list) return 0;
+    __try {
+        EnterCriticalSection(LOADLIST_CS);
+        for (it = (int *)list[0]; it && guard < 4096; it = (int *)it[2], guard++) {
+            h = (h ^ (unsigned)(DWORD)it) * 16777619u;
+            h = (h ^ (unsigned)it[5]) * 16777619u;
+            h = (h ^ (unsigned)*((char *)it + 0x1c)) * 16777619u;
+            if (it[5] == 2) (*loading)++;
+        }
+        h ^= (unsigned)list[2];
+        LeaveCriticalSection(LOADLIST_CS);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return h;
+}
+
+static ULONG64 bgproc_cycles(void)
+{
+    ULONG64 c = 0;
+    HANDLE h = *(HANDLE *)(0x0102DBE0 + 15 * 0xB4 + 0xA8);   // NuBgProc
+    if (h) QueryThreadCycleTime(h, &c);
+    return c;
+}
+
+static void loop_window(void)
+{
+    DWORD t0 = GetTickCount();
+    int stable = 0, loading;
+    unsigned sig, prev;
+    if (!g_loop_at_gate) return;
+    g_loop_windows++;
+    prev = list_signature(&loading);
+    for (;;) {
+        LONG a0 = g_loop_arrivals;
+        ULONG64 c, last = bgproc_cycles();
+        int idle = 0;
+        ReleaseSemaphore(g_loop_sem, 1, NULL);
+        g_loop_iters++;
+        // Warten, bis die Schleife wieder am Anfang steht. Endet sie (Liste leer), kommt sie nicht wieder:
+        // dann ruht NuBgProc oder arbeitet am naechsten Auftrag ausserhalb der Schleife.
+        while (g_loop_arrivals == a0) {
+            Sleep(0);
+            c = bgproc_cycles();
+            if (c == last) { if (++idle > 2000) break; } else { idle = 0; last = c; }
+            if (GetTickCount() - t0 > 2000) break;
+        }
+        if (g_loop_arrivals == a0) break;   // Schleife verlassen
+        sig = list_signature(&loading);
+        if (sig == prev && !loading) { if (++stable >= 2) break; }
+        else stable = 0;
+        prev = sig;
+        if (GetTickCount() - t0 > 2000) {
+            g_loop_timeouts++;
+            logf_("Lade-Schleife: Zeitgrenze (%d Eintraege laden)", loading);
+            break;
+        }
+    }
+}
+
+// Nach dem Frame-Ende NuBgProc zur Ruhe kommen lassen: Andere Auftraege (z. B. SampleLoader 0x7359b0 beim
+// Levelstart) liefen sonst je nach Rechnertempo noch in den naechsten Spielschritt hinein (Paar F4: bei
+// Anker +2 lief er in der verzoegerten Instanz noch, ab +4 kippte der LCG). Ruhe heisst: kein Auftrag,
+// Auftrag wartet auf einen Frame, Schleife steht an ihrer Freigabe, oder der Thread rechnet 5 ms lang
+// nicht und liest nichts (wartet auf den Hauptthread). Rueckgabe 1, wenn gewartet wurde.
+static long g_settle_waits, g_settle_timeouts;
+
+static int bg_settle(void)
+{
+    DWORD t0 = GetTickCount();
+    ULONG64 last = bgproc_cycles(), c;
+    DWORD still = GetTickCount();
+    int waited = 0;
+    if (!G_BGPROC) return 0;
+    for (;;) {
+        int *cur = (int *)G_BGPROC_CURRENT;
+        LONG pend = *(volatile LONG *)(G_BGPROC + BGPROC_PENDING);
+        if (*(volatile int *)(G_BGPROC + BGPROC_WAITFRAME)) break;
+        if (!cur && pend <= 0) break;
+        if (g_loop_at_gate) break;
+        c = bgproc_cycles();
+        if (c != last || stream_busy()) { last = c; still = GetTickCount(); }
+        else if (GetTickCount() - still >= 5) break;
+        if (GetTickCount() - t0 > 2000) { g_settle_timeouts++; break; }
+        waited = 1;
+        Sleep(0);
+    }
+    if (waited) g_settle_waits++;
+    return waited;
+}
+
 static void __cdecl post_frame_end_inner(void)
 {
     DWORD t0;
@@ -1489,7 +1728,22 @@ static void __cdecl post_frame_end_inner(void)
         Sleep((g_jitter_state >> 16) % (unsigned)(g_jitter + 1));
         g_in_wait = 0;
     }
-    if (g_iowait) wait_io();   // nach dem Zeichnen: angestossene Shader- und Textur-Arbeit abwarten
+    if (g_iowait) { wait_io(); wait_savecore(); }   // nach dem Zeichnen: Shader-, Textur- und Speicherarbeit
+    if (g_loopgate) {
+        int k;
+        loop_window();
+        // Ein fertig gewordener Auftrag kann die Schleife neu starten: dann noch ein Fenster
+        // Ab Frame 30 (davor laufen die Start-Auftraege, auf die der Hauptthread selbst wartet). Beim ersten
+        // Laden (Frame 280-284) endete der Lade-Auftrag sonst manchmal erst im naechsten Spielschritt.
+        for (k = 0; k < 4 && g_F >= 30 && bg_settle(); k++) loop_window();
+        // Ist die Liste leer, beendet sich der Auftrag gleich (siehe unten): auch hier abwarten
+        t0 = GetTickCount();
+        while (G_LOADLIST && G_LOADLIST[2] == 0 && bg_loader_active() && !g_loop_at_gate) {
+            if (GetTickCount() - t0 > 1000) { g_post_timeouts++; break; }
+            Sleep(0);
+        }
+        return;
+    }
     if (!g_loadsync || !G_BGPROC) return;
     if (g_load_slow) {
         int *cur = (int *)G_BGPROC_CURRENT;
@@ -1540,6 +1794,25 @@ __declspec(naked) static void stub_after_frame_end(void)
     }
 }
 
+// Startphase: Hier laufen weitere NuBgProc-Auftraege (Ladebildschirm, Samples), deren Dauer sonst
+// bestimmt, an welchem Frame das Intro beginnt. Bis Frame 300 auf jeden Auftrag ausser der
+// Streaming-Schleife warten (der Hauptthread laeuft weiter, sobald die Zeitgrenze erreicht ist).
+static void boot_bg_wait(void)
+{
+    DWORD t0;
+    if (g_F >= 300 || !G_BGPROC) return;
+    t0 = GetTickCount();
+    for (;;) {
+        int *cur = (int *)G_BGPROC_CURRENT;
+        LONG pend = *(volatile LONG *)(G_BGPROC + BGPROC_PENDING);
+        if (*(volatile int *)(G_BGPROC + BGPROC_WAITFRAME)) break;
+        if (cur && cur[2] == 0x007D48C0 && pend <= 0) break;
+        if (!cur && pend <= 0) break;
+        if (GetTickCount() - t0 > 5000) { logf_("Start: NuBgProc-Zeitgrenze (Auftrag %08x, offen %ld)", cur ? cur[2] : 0, pend); break; }
+        Sleep(0);
+    }
+}
+
 static void wait_loads(void)
 {
     DWORD t0 = GetTickCount();
@@ -1557,21 +1830,7 @@ static void wait_loads(void)
         Sleep(0);
     }
     if (waited) g_load_waits++;
-    // Startphase: Hier laufen weitere NuBgProc-Auftraege (Ladebildschirm, Samples), deren Dauer sonst
-    // bestimmt, an welchem Frame das Intro beginnt. Bis Frame 300 auf jeden Auftrag ausser der
-    // Streaming-Schleife warten (der Hauptthread laeuft weiter, sobald die Zeitgrenze erreicht ist).
-    if (g_F < 300 && G_BGPROC) {
-        t0 = GetTickCount();
-        for (;;) {
-            int *cur = (int *)G_BGPROC_CURRENT;
-            LONG pend = *(volatile LONG *)(G_BGPROC + BGPROC_PENDING);
-            if (*(volatile int *)(G_BGPROC + BGPROC_WAITFRAME)) break;
-            if (cur && cur[2] == 0x007D48C0 && pend <= 0) break;
-            if (!cur && pend <= 0) break;
-            if (GetTickCount() - t0 > 5000) { logf_("Start: NuBgProc-Zeitgrenze (Auftrag %08x, offen %ld)", cur ? cur[2] : 0, pend); break; }
-            Sleep(0);
-        }
-    }
+    boot_bg_wait();
 }
 
 // Aufrufer der Zufallsgeneratoren mitschreiben (Diagnose: wer zieht unterschiedlich oft?)
@@ -1659,6 +1918,8 @@ __declspec(naked) static void render_rng_a(void)
 // LBO_BREAKAT=Adresse (Diagnose): Ausfuehrungs-Haltepunkt (DR1) im Hauptthread. Beim ersten Treffer werden
 // Frame und Aufrufstapel protokolliert, danach ist der Haltepunkt aus.
 static DWORD g_breakat;
+static int g_break_write;   // LBO_BREAKW: Schreib- statt Ausfuehrungs-Haltepunkt
+static long g_break_from;   // LBO_BREAKFROM: erst ab diesem Frame scharf
 static volatile LONG g_break_hit;
 
 static LONG CALLBACK break_handler(EXCEPTION_POINTERS *e)
@@ -1691,9 +1952,10 @@ static DWORD WINAPI break_set(void *arg)
     while (!g_break_hit) {
         if (SuspendThread(g_main_thread) != (DWORD)-1) {
             c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            if (!g_break_hit && GetThreadContext(g_main_thread, &c) && (c.Dr1 != g_breakat || !(c.Dr7 & 4))) {
+            if (!g_break_hit && g_F >= g_break_from && GetThreadContext(g_main_thread, &c) && (c.Dr1 != g_breakat || !(c.Dr7 & 4))) {
                 c.Dr1 = g_breakat;
-                c.Dr7 = (c.Dr7 & ~0x00F0000Cu) | 4u;   // L1, Ausfuehren, Laenge 1
+                // L1; Ausfuehren (Laenge 1) oder mit LBO_BREAKW Schreiben (4 Byte)
+                c.Dr7 = (c.Dr7 & ~0x00F0000Cu) | 4u | (g_break_write ? (1u << 20) | (3u << 22) : 0u);
                 SetThreadContext(g_main_thread, &c);
             }
             ResumeThread(g_main_thread);
@@ -1736,8 +1998,8 @@ static DWORD WINAPI lcg_watch_set(void *arg)
                 if (!t) continue;
                 if (SuspendThread(t) != (DWORD)-1) {
                     c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-                    if (GetThreadContext(t, &c) && c.Dr0 != 0x011A1844) {
-                        c.Dr0 = 0x011A1844;
+                    if (GetThreadContext(t, &c) && c.Dr0 != g_watch_addr) {
+                        c.Dr0 = g_watch_addr;
                         c.Dr7 = (c.Dr7 & ~0x000F0003u) | 1u | (1u << 16) | (3u << 18);
                         if (SetThreadContext(t, &c)) n++;
                     }
@@ -1816,9 +2078,28 @@ static void __cdecl on_frame_end(void)
         if (g_breakat) CreateThread(NULL, 0, break_set, NULL, 0, NULL);
         if (g_gate) CreateThread(NULL, 0, gate_watch, NULL, 0, NULL);
     }
+    if (g_loopgate && F % 3000 == 0)
+        logf_("Lade-Schleife: %ld Fenster, %ld Durchlaeufe, %ld Zeitgrenzen, %ld Selbstfreigaben; NuBgProc-Ruhe: %ld Wartephasen, %ld Zeitgrenzen",
+              g_loop_windows, g_loop_iters, g_loop_timeouts, g_loop_selfrelease, g_settle_waits, g_settle_timeouts);
     if (g_gate && F % 3000 == 0)
         logf_("Lade-Threads: %ld Fenster, %ld Zeitgrenzen, %ld Freigaben fuer den Hauptthread", g_gate_windows,
               g_gate_timeouts, g_gate_assists);
+    if (g_memdump && F >= g_memdump_from && F <= g_memdump_to) {
+        // LBO_MEMDUMP=von,bis (Diagnose): .data des Spiels (0x101f000, 0x38e7ec Byte) je Frame anhaengen;
+        // tools/memdiff_b2.py findet den ersten globalen Wert, der zwischen zwei Laeufen auseinanderlaeuft
+        // Erst im Speicher sammeln: Schreiben je Frame bremst genau das Fenster, in dem der Wettlauf passiert
+        static unsigned char *buf;
+        if (!buf) buf = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)(g_memdump_to - g_memdump_from + 1) * 0x38E7EC,
+                                                      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        __try { if (buf) memcpy(buf + (SIZE_T)(F - g_memdump_from) * 0x38E7EC, (void *)0x0101F000, 0x38E7EC); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (F == g_memdump_to) {
+            if (buf) fwrite(buf, 0x38E7EC, (size_t)(g_memdump_to - g_memdump_from + 1), g_memdump);
+            fclose(g_memdump);
+            g_memdump = NULL;
+            logf_("Speicherabzug fertig");
+        }
+    }
     if (g_watch_lcg && g_trace && F == g_trace_to + 2) {
         LONG i, n = g_nlw < LW_MAX ? g_nlw : LW_MAX;
         for (i = 0; i < n; i++)
@@ -1833,11 +2114,17 @@ static void __cdecl on_frame_end(void)
     if (g_mode == MODE_SCRIPT) G_WINDOW_ACTIVE = 1;
     if (g_bgsync == 2) bg_wait_idle();
     // Mit LBO_GATE sind die Lade-Threads hier angehalten; gewartet wird im Fenster nach dem Frame-Ende
-    if (g_loadsync && !(g_gate && F > 30)) wait_loads();
+    if (g_loadsync && !(g_gate && F > 30) && !g_loopgate) wait_loads();
+    else if (g_loopgate) boot_bg_wait();
     if (g_iowait) wait_io();
+    // Maus (0x633860) und Tastatur (0x6338f0) per DirectInput: Ob Poll/Acquire gelingt, haengt am
+    // Fensterfokus, und jeder Erfolg schaltet Puffer um (0x13658bc, 0x13655a4). Das Spiel hat dafuer
+    // Abschalt-Bits (0x136555c: 1 Maus, 2 Tastatur); im Netz zaehlen ohnehin nur die Lockstep-Pads.
+    if (g_net || g_nodinput) *(volatile BYTE *)0x0136555C |= 3;
     if (g_vaudio) va_tick();
     if (g_audiolog && F % 600 == 0) audio_log();
-    if (g_iowait && F % 3000 == 0) logf_("Datei-Threads: %ld Wartephasen, %ld Zeitgrenzen", g_io_waits, g_io_timeouts);
+    if (g_iowait && F % 3000 == 0) logf_("Datei-Threads: %ld Wartephasen, %ld Zeitgrenzen; SaveCore: %ld Wartephasen, %ld Zeitgrenzen",
+                                         g_io_waits, g_io_timeouts, g_save_waits, g_save_timeouts);
     if (F % 3000 == 0 && g_loadsync) logf_("Laden: %ld Wartephasen, %ld Zeitgrenzen; nach Frame-Ende %ld Wartephasen, %ld Zeitgrenzen, %ld verlangsamte Frames", g_load_waits, g_load_timeouts, g_post_waits, g_post_timeouts, g_slow_frames);
     if (F % 3000 == 0 && g_bgsync == 2) logf_("NuBgProc: %ld Wartephasen, %ld Zeitgrenzen", g_bg_waits, g_bg_timeouts);
     if (g_bgsync == 1 && G_BGPROC && !G_BGPROC[BGPROC_SYNC]) {
@@ -1965,7 +2252,7 @@ static DWORD WINAPI installer(void *arg)
     DWORD start = GetTickCount();
     void *file_fn = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "CreateFileA");
     static const unsigned char vdt_orig[6] = { 0xD9, 0x1D, 0xDC, 0xF0, 0x1C, 0x01 };
-    int vdt_done = !g_videodt, rng_done = !g_trace_to, rrng_done = !g_render_rng, poll_done = !g_net, post_done = !g_loadsync;
+    int vdt_done = !g_videodt, rng_done = !g_trace_to, rrng_done = !g_render_rng, poll_done = !g_net && !g_nodinput, post_done = !g_loadsync;
     int mutex_done = !g_multi, frame_done = 0, xinput_done = 0, d3d_done = 0, file_done = 0, fmv_done = !g_no_movies;
     (void)arg;
     // Eng pollen: Die Importtabelle wird von der Huelle befuellt, der Mutex kurz danach angelegt
@@ -2002,6 +2289,14 @@ static DWORD WINAPI installer(void *arg)
                     rng_done = (!g_watch_lcg || patch_jmp(0x0094CDF0, (void *)stub_trig, pro_trig)) &&
                                patch_jmp(FN_RNG_A, (void *)stub_rng_a, pro_rng) &&
                                patch_jmp(0x00BD1C9D, (void *)stub_crt_rand, pro_rand);
+            }
+            if (!post_done && g_iowait) patch_savecore();
+            if (!post_done && g_loopgate) {
+                static const unsigned char pro_loop[5] = { 0x68, 0x90, 0xBA, 0x38, 0x01 };   // push 0x138ba90
+                if (!memcmp((void *)0x007EB979, pro_loop, 5) && !patch_jmp(0x007EB979, (void *)stub_loop_top, pro_loop))
+                    logf_("Lade-Schleife: Haken bei 0x7eb979 fehlgeschlagen");
+                if (!memcmp((void *)0x007EBF19, pro_loop, 5) && !patch_jmp(0x007EBF19, (void *)stub_flush_top, pro_loop))
+                    logf_("Aufraeum-Schleife: Haken bei 0x7ebf19 fehlgeschlagen");
             }
             if (!post_done)
                 post_done = patch_call(0x007EBB90, 0x00557850, (void *)stub_bgloop) &&
@@ -2065,13 +2360,20 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_VIDEODT", buf, sizeof buf)) g_videodt = atoi(buf);
     if (GetEnvironmentVariableA("LBO_VCLOCK", buf, sizeof buf)) g_vclock = atoi(buf);
     if (GetEnvironmentVariableA("LBO_WATCHLCG", buf, sizeof buf)) g_watch_lcg = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_WATCHADDR", buf, sizeof buf)) { g_watch_addr = strtoul(buf, NULL, 16); g_watch_lcg = 1; }
     if (GetEnvironmentVariableA("LBO_BREAKAT", buf, sizeof buf)) g_breakat = strtoul(buf, NULL, 16);
+    if (GetEnvironmentVariableA("LBO_BREAKW", buf, sizeof buf)) { g_breakat = strtoul(buf, NULL, 16); g_break_write = 1; }
+    if (GetEnvironmentVariableA("LBO_BREAKFROM", buf, sizeof buf)) g_break_from = atol(buf);
     if (GetEnvironmentVariableA("LBO_RENDERRNG", buf, sizeof buf)) g_render_rng = atoi(buf);
     if (GetEnvironmentVariableA("LBO_ANCHOR", buf, sizeof buf)) g_anchor_mode = atoi(buf);
     if (GetEnvironmentVariableA("LBO_IOWAIT", buf, sizeof buf)) g_iowait = atoi(buf);
     if (GetEnvironmentVariableA("LBO_SLOWSTART", buf, sizeof buf)) g_slow_start = atoi(buf);
     if (GetEnvironmentVariableA("LBO_LOADSLOW", buf, sizeof buf)) g_load_slow = atoi(buf);
     if (GetEnvironmentVariableA("LBO_GATE", buf, sizeof buf)) g_gate = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_LOOPGATE", buf, sizeof buf)) g_loopgate = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_NODINPUT", buf, sizeof buf)) g_nodinput = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_MEMDUMP", buf, sizeof buf) && sscanf(buf, "%ld,%ld", &g_memdump_from, &g_memdump_to) == 2)
+        g_memdump = open_out("memdump.bin", "wb");
     if (GetEnvironmentVariableA("LBO_GATESET", buf, sizeof buf)) {
         char *t = strtok(buf, ",");
         g_gate_n = 0;
@@ -2121,6 +2423,7 @@ static void init(void)
           g_fps_cap, g_max_frames, g_shot_every, g_multi);
     logf_("NuBgProc synchron %d, ohne Videos %d, Zufalls-Reset bei Frame %d, Lade-Sync %d, Video-dt fest %d, virtuelle Uhr %d", g_bgsync,
           g_no_movies, g_rng_reset, g_loadsync, g_videodt, g_vclock);
+    if (g_loopgate) g_loop_sem = CreateSemaphoreA(NULL, 0, 100000, NULL);
     CreateThread(NULL, 0, installer, NULL, 0, NULL);
 }
 

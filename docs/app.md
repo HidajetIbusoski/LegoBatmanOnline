@@ -16,7 +16,11 @@ Zwei Freunde teilen eine **Welt**: einen benannten Spielstand. Jeder kann jederz
 | `Core/Messenger.cs` | Vermittlung über öffentliche MQTT-Dienste, Ende-zu-Ende-Verschlüsselung |
 | `Core/GameBridge.cs` | Spiel finden (Steam-Registry + `libraryfolders.vdf`), Spielstände auflisten, Launcher aufrufen (`--stun`, `--connect`, `--solo`), Verknüpfungen anlegen |
 | `Core/Lobby.cs` | Ablauf: Freunde, Welten, Abgleich, Einladungen, Sitzung; Testoptionen |
-| `MainWindow.xaml` | Oberfläche |
+| `Core/Games.cs` | Spielkatalog des Launchers (Batman 1 und 2 spielbar, Pirates, Marvel, Harry Potter als Platzhalter) |
+| `MainWindow.xaml` | Oberfläche im PS5-Stil: Spielkacheln oben, dahinter das Vollbild des gewählten Spiels (Überblendung), runde Symbolleiste links, Glas-Panel mit Welten und Freunden rechts. Pfeiltasten wählen, Enter spielt |
+| `Assets/Games/<spiel>/` | `bg.jpg` (1920×1080, aus dem Steam-Library-Hero), `tile.jpg` (320×320 aus der Kapsel), `logo.png`. Als WPF-Ressource eingebettet |
+
+Test: `--shot datei.png [--shot-game batman2]` rendert das Fenster selbst als PNG und beendet die App (Fenster-Screenshots per GDI liefern bei WPF nur Weiß).
 
 Welt-Ordner: `%LOCALAPPDATA%\LegoBatmanOnline\welten\<profil>\<welt-id>\`
 - `spielstand\`: SaveGame-Dateien. Das Spiel liest und speichert hier: Die DLL leitet alle Zugriffe auf `Saved Games` per `LBO_SAVEDIR` um.

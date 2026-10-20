@@ -345,7 +345,22 @@ Offen (F36, reproduzierbar mit denselben Werten): `rng_a` kippt bei 14681. Dort 
 
 Die Zählung nach dem Anker taugt erst, wenn der Vorlauf gleich ist: Mit unterschiedlichem Vorlauf weichen auch nach dem Rücksetzen der Zufallszustände die geladenen Daten ab.
 
-Im Netzmodus sind `LOOPGATE` und `IOWAIT` noch nicht eingeschaltet (dort gilt weiter `LBO_SLOWSTART`/`LBO_LOADSLOW`). Maus und Tastatur sind dort schon aus.
+### Lokale Netztests (20.10.2026)
+
+Host und Gast auf diesem PC (UDP über 127.0.0.1), beide mit Skript-Eingaben, je 31.000 Frames (Intro, Zwischensequenzen, erstes Level):
+
+| Lauf | Bedingung | Ergebnis |
+|---|---|---|
+| N20 | Gast mit `LBO_JITTER=20` | alle Logikwerte gleich, 0 Desyncs, Schranke am Levelstart bei beiden Frame 20380 |
+| N21 | ohne Jitter | alle Logikwerte gleich, 0 Desyncs, 59 fps in Zwischensequenz und Level |
+| N22 | Gast bei Frame 22.000 beendet | Host wartet 30 s, zeigt den Hinweis und spielt allein weiter |
+| N23 | Gast 40 s angehalten (`LBO_PAUSE`), dann beendet | kein falscher Abbruch während der Pause, danach weiter gleich; nach dem Beenden Abbruch nach 30 s |
+
+**Abbruchschutz:** Ein eigener Thread schickt jede halbe Sekunde ein Lebenszeichen. Erst wenn 30 s gar nichts mehr ankommt, gilt der Partner als verloren: Spieler 2 bekommt neutrale Eingaben, die eigene Seite sendet nichts mehr (käme der Partner zurück, liefe er so ebenfalls in die Zeitgrenze statt endlos zu warten). Ein Hinweisfenster erklärt das. Bei einem Desync (Prüfsumme alle 60 Frames) erscheint ebenfalls ein Hinweis.
+
+**FPU:** Im Netzmodus wird der x87-Zustand (0x7f) und MXCSR (0x1f80) je Frame festgesetzt, wie bei Batman 1. In allen Tests war keine Korrektur nötig; es sichert gegen Treiber oder Overlays ab, die die Genauigkeit verstellen.
+
+Noch nicht getestet: zwei echte PCs über das Internet.
 
 ## Zufallsgeneratoren
 

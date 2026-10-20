@@ -705,6 +705,7 @@ typedef struct {
     int pend_be;     // BufferEnd ohne Stream-Ende im letzten va_tick ausgeliefert
     int streaming;   // hat schon einmal im selben Frame nachgeliefert (Musik, Sprache)
     int owed;        // ausstehende Nachlieferungen eines Streams
+    int dry;         // laeuft ohne Daten und es kommt nichts mehr (Stream-Ende oder Zeitgrenze)
     double pos;
     UINT64 played;
     VA_BUF q[64];
@@ -764,6 +765,7 @@ static HRESULT STDMETHODCALLTYPE a_submit(void *v, const XA_BUFFER *b, const voi
         EnterCriticalSection(&g_va_cs);
         if ((a = va_find(v)) != NULL) {
             if (a->pend_be > 0) { a->pend_be--; a->streaming = 1; }
+            a->dry = 0;
             if (a->owed > 0) a->owed--;
             if (a->n < 64) {
                 VA_BUF *e = &a->q[(a->head + a->n) % 64];
@@ -966,8 +968,8 @@ static ULONG64 sound_cycles(void)
 // Gestreamte Stimmen (Musik, Sprache) bekommen ihren naechsten Puffer erst nach BufferEnd, vom Ton-Streamer in
 // Echtzeit. Kam er nach dem naechsten va_tick, lief die virtuelle Stimme leer. Ohne dieses Warten trat der
 // 1-Frame-Versatz der ersten Musikstimme (Frame 283/284) wieder auf, mit ihm in 15 Laeufen nicht.
-// Gewartet wird nur bei Musik-Streams: Stimmen mit 44,1 kHz und mindestens 2 Kanaelen, die schon einmal im
-// selben Frame nachgeliefert haben. Soundeffekte (22 kHz mono) liessen sonst im Level das Bild stocken
+// Gewartet wird nur bei Musik- und Sprach-Streams: Stimmen mit 44,1 kHz, die schon einmal im selben Frame
+// nachgeliefert haben (Sprache ist mono). Soundeffekte (22 kHz mono) liessen sonst im Level das Bild stocken
 // (Paartest: 322 Haenger von etwa 220 ms, mit fester 2-s-Grenze je 2 s). Hoechstens 200 ms; kommt
 // nichts, ist der Stream zu Ende und die Stimme gilt wieder als nicht gestreamt.
 static long g_va_refill_waits, g_va_refill_timeouts;
@@ -989,7 +991,7 @@ static void va_wait_refills(void)
         if (GetTickCount() - t0 > 200) {
             g_va_refill_timeouts++;
             EnterCriticalSection(&g_va_cs);
-            for (i = 0; i < 64; i++) if (g_va[i].owed > 0) { g_va[i].owed = 0; g_va[i].streaming = 0; }
+            for (i = 0; i < 64; i++) if (g_va[i].owed > 0) { g_va[i].owed = 0; g_va[i].streaming = 0; g_va[i].dry = 1; }
             LeaveCriticalSection(&g_va_cs);
             break;
         }
@@ -999,10 +1001,47 @@ static void va_wait_refills(void)
     if (waited) g_va_refill_waits++;
 }
 
+// Erste Puffer: Eine gestartete 44,1-kHz-Stimme (Musik, Sprache) ohne Daten bekommt ihren ersten Puffer vom
+// Streamer in Echtzeit. Kaeme er erst nach diesem Takt, liefe ihre Uhr einen Frame spaeter los (die Zwischen-
+// sequenz folgt der Ton-Position; Paartest: Ladeauftrag bei 11483/11484 versetzt). Hoechstens 200 ms.
+static long g_va_start_waits, g_va_start_timeouts;
+
+static int va_starving(void)
+{
+    int i, n = 0;
+    EnterCriticalSection(&g_va_cs);
+    for (i = 0; i < 64; i++) {
+        VA_VOICE *a = &g_va[i];
+        if (a->voice && a->cb && a->running && a->rate >= 44100 && !a->n && !a->dry) n++;
+    }
+    LeaveCriticalSection(&g_va_cs);
+    return n;
+}
+
+static void va_wait_first_buffers(void)
+{
+    DWORD t0;
+    int i;
+    if (!va_starving()) return;
+    g_va_start_waits++;
+    t0 = GetTickCount();
+    while (va_starving()) {
+        if (GetTickCount() - t0 > 200) {
+            g_va_start_timeouts++;
+            EnterCriticalSection(&g_va_cs);
+            for (i = 0; i < 64; i++) if (g_va[i].voice && !g_va[i].n) g_va[i].dry = 1;
+            LeaveCriticalSection(&g_va_cs);
+            break;
+        }
+        Sleep(0);
+    }
+}
+
 static void va_tick(void)
 {
     static VA_EVENT ev[1024];
     int nev = 0, i, k;
+    va_wait_first_buffers();
     EnterCriticalSection(&g_va_cs);
     for (i = 0; i < 64; i++) {
         VA_VOICE *a = &g_va[i];
@@ -1019,8 +1058,8 @@ static void va_tick(void)
             if (rem > budget) { a->pos += budget; a->played += (UINT64)budget; break; }
             if (rem > 0) { budget -= rem; a->played += (UINT64)rem; }
             ev[nev].cb = a->cb; ev[nev].kind = 4; ev[nev++].ctx = e->ctx;
-            if (e->flags & 0x40) { ev[nev].cb = a->cb; ev[nev].kind = 2; ev[nev++].ctx = NULL; }   // END_OF_STREAM
-            else if (e->samples) { a->pend_be++; if (a->streaming && a->rate >= 44100 && a->channels >= 2) a->owed++; }
+            if (e->flags & 0x40) { ev[nev].cb = a->cb; ev[nev].kind = 2; ev[nev++].ctx = NULL; a->dry = 1; }   // END_OF_STREAM
+            else if (e->samples) { a->pend_be++; if (a->streaming && a->rate >= 44100) a->owed++; }
             a->head = (a->head + 1) % 64;
             a->n--;
             a->pos = 0;
@@ -1372,7 +1411,7 @@ static int loads_in_flight(int *first_state)
 // So erscheinen Figuren und Levelteile an festen Frames, unabhaengig von der Ladezeit.
 // LBO_IOWAIT=1: Arbeits-Threads des Spiels (Thread-Tabelle 0x102dbe0, Abstand 0xb4, Handle +0xa8):
 // 2 m_readThread, 3 m_decodeThread, 4 TextureDecode, 5-12 NuUbershaderBytecodeCache::Work,
-// 13 NuShaderManagerGen::WorkerThread. Das Frame-Ende wartet, bis keiner von ihnen 3 ms lang gerechnet hat
+// 13 NuShaderManagerGen::WorkerThread. Nach dem Frame-Ende wird gewartet, bis keiner von ihnen 2 ms lang gerechnet hat
 // (QueryThreadCycleTime), hoechstens 500 ms. Eine neue Szene startet erst, wenn ihre Shader bereit sind
 // (Netztest: Szenen-Flag *0x11bdf70+0xdd beim Host einen Frame frueher).
 static int g_iowait;
@@ -1414,7 +1453,7 @@ static void wait_io(void)
     ULONG64 prev = io_cycles(), now;
     int waited = 0;
     for (;;) {
-        Sleep(3);
+        Sleep(2);
         now = io_cycles();
         if (now == prev && !stream_busy()) break;
         prev = now;
@@ -1613,10 +1652,40 @@ static DWORD WINAPI gate_watch(void *arg)
 
 static void __cdecl post_frame_end_inner(void);
 
+// Diagnose: Zeit, die die Mod pro Frame in eigenen Wartestellen verbringt (CSV-Spalte wait_ms, ohne Jitter)
+static LONGLONG g_wait_ticks;
+static LONGLONG g_wt[8];   // je Wartestelle: 0 wait_io (Frame-Ende), 1 va_tick, 2 wait_io (danach), 3 SaveCore, 4 Lade-Schleife, 5 NuBgProc-Ruhe, 6 Rest
+
+static LONGLONG qpc_now(void)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);   // Import der DLL, nicht der gehakte des Spiels
+    return t.QuadPart;
+}
+
+static long wait_ms_take(void)
+{
+    LARGE_INTEGER f;
+    long ms;
+    QueryPerformanceFrequency(&f);
+    ms = (long)(g_wait_ticks * 1000 / f.QuadPart);
+    g_wait_ticks = 0;
+    return ms;
+}
+
 static void __cdecl post_frame_end(void)
 {
+    LONGLONG t0;
+    if (g_jitter) {
+        g_jitter_state = g_jitter_state * 1103515245u + 12345u;
+        g_in_wait = 1;
+        Sleep((g_jitter_state >> 16) % (unsigned)(g_jitter + 1));
+        g_in_wait = 0;
+    }
+    t0 = qpc_now();
     if (g_gate && g_F > 30) gate_window();
     post_frame_end_inner();
+    g_wait_ticks += qpc_now() - t0;
     if (g_gate && g_F > 30) gate_suspend();
 }
 
@@ -1796,20 +1865,24 @@ static void __cdecl post_frame_end_inner(void)
     DWORD t0;
     LONG c0;
     int waited = 0;
-    if (g_jitter) {
-        g_jitter_state = g_jitter_state * 1103515245u + 12345u;
-        g_in_wait = 1;
-        Sleep((g_jitter_state >> 16) % (unsigned)(g_jitter + 1));
-        g_in_wait = 0;
+    if (g_iowait) {   // nach dem Zeichnen: Shader-, Textur- und Speicherarbeit
+        LONGLONG t = qpc_now();
+        wait_io();
+        g_wt[2] += qpc_now() - t; t = qpc_now();
+        wait_savecore();
+        g_wt[3] += qpc_now() - t;
     }
-    if (g_iowait) { wait_io(); wait_savecore(); }   // nach dem Zeichnen: Shader-, Textur- und Speicherarbeit
     if (g_loopgate) {
         int k;
+        LONGLONG t = qpc_now();
         loop_window();
+        g_wt[4] += qpc_now() - t;
         // Ein fertig gewordener Auftrag kann die Schleife neu starten: dann noch ein Fenster
         // Ab Frame 30 (davor laufen die Start-Auftraege, auf die der Hauptthread selbst wartet). Beim ersten
         // Laden (Frame 280-284) endete der Lade-Auftrag sonst manchmal erst im naechsten Spielschritt.
+        t = qpc_now();
         for (k = 0; k < 4 && g_F >= 30 && bg_settle(); k++) loop_window();
+        g_wt[5] += qpc_now() - t;
         // Ist die Liste leer, beendet sich der Auftrag gleich (siehe unten): auch hier abwarten
         t0 = GetTickCount();
         while (G_LOADLIST && G_LOADLIST[2] == 0 && bg_loader_active() && !g_loop_at_gate) {
@@ -2200,14 +2273,26 @@ static void __cdecl on_frame_end(void)
     // Mit LBO_GATE sind die Lade-Threads hier angehalten; gewartet wird im Fenster nach dem Frame-Ende
     if (g_loadsync && !(g_gate && F > 30) && !g_loopgate) wait_loads();
     else if (g_loopgate) boot_bg_wait();
-    if (g_iowait) wait_io();
+    // wait_io laeuft nur noch nach dem Frame-Ende (post_frame_end); ein zweiter Aufruf hier direkt davor
+    // kostete je Frame weitere 4 ms ohne Nutzen
     // Maus (0x633860) und Tastatur (0x6338f0) per DirectInput: Ob Poll/Acquire gelingt, haengt am
     // Fensterfokus, und jeder Erfolg schaltet Puffer um (0x13658bc, 0x13655a4). Das Spiel hat dafuer
     // Abschalt-Bits (0x136555c: 1 Maus, 2 Tastatur); im Netz zaehlen ohnehin nur die Lockstep-Pads.
     if (g_net || g_nodinput) *(volatile BYTE *)0x0136555C |= 3;
-    if (g_vaudio) va_tick();
+    if (g_vaudio) { LONGLONG t0 = qpc_now(); va_tick(); t0 = qpc_now() - t0; g_wait_ticks += t0; g_wt[1] += t0; }
     if (g_audiolog && F % 600 == 0) audio_log();
-    if (g_vaudio && F % 3000 == 0) logf_("Ton: %ld Nachlieferungen abgewartet, %ld Stream-Enden", g_va_refill_waits, g_va_refill_timeouts);
+    if (g_vaudio && F % 3000 == 0) logf_("Ton: %ld Nachlieferungen abgewartet, %ld Stream-Enden; erste Puffer %ld abgewartet, %ld Zeitgrenzen",
+                                         g_va_refill_waits, g_va_refill_timeouts, g_va_start_waits, g_va_start_timeouts);
+    if (F % 3000 == 0) {
+        LARGE_INTEGER f;
+        int k;
+        char line[300];
+        int len;
+        QueryPerformanceFrequency(&f);
+        len = snprintf(line, sizeof line, "Wartezeit je Frame (ms, letzte 3000):");
+        for (k = 0; k < 6; k++) { len += snprintf(line + len, sizeof line - len, " %d=%.2f", k, g_wt[k] * 1000.0 / f.QuadPart / 3000); g_wt[k] = 0; }
+        logf_("%s (0 Datei-Threads, 1 Ton, 2 Datei-Threads nach Frame-Ende, 3 SaveCore, 4 Lade-Schleife, 5 NuBgProc)", line);
+    }
     if (g_iowait && F % 3000 == 0) logf_("Datei-Threads: %ld Wartephasen, %ld Zeitgrenzen; SaveCore: %ld Wartephasen, %ld Zeitgrenzen",
                                          g_io_waits, g_io_timeouts, g_save_waits, g_save_timeouts);
     if (F % 3000 == 0 && g_loadsync) logf_("Laden: %ld Wartephasen, %ld Zeitgrenzen; nach Frame-Ende %ld Wartephasen, %ld Zeitgrenzen, %ld verlangsamte Frames", g_load_waits, g_load_timeouts, g_post_waits, g_post_timeouts, g_slow_frames);
@@ -2255,12 +2340,12 @@ static void __cdecl on_frame_end(void)
             unsigned char *q = G_BGPROC;
             int *cur = (int *)G_BGPROC_CURRENT;
             fprintf(g_csv, "%ld,%d,%.6f,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%d,%d,%08x,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-                    "%d,%d,%d,%d,%d,%d,%ld,%08x,%d,%d,%ld,%lu,%ld,%08lx,%04x,%08x\n", F, G_FRAMECOUNT,
+                    "%d,%d,%d,%d,%d,%d,%ld,%08x,%d,%d,%ld,%lu,%ld,%08lx,%04x,%08x,%ld\n", F, G_FRAMECOUNT,
                     G_DT, G_RNG_PM_SEED, G_RNG_LCG16, G_RNG_PM_DEFAULT, G_RNG_A, G_RNG_B, G_RNG_C, crt_rand_state(), g_polls, cs.n, cs.hash,
                     cs.p1[0], cs.p1[1], cs.p1[2], cs.p2[0], cs.p2[1], cs.p2[2],
                     *(int *)0x011CF178, *(int *)0x0131356C, *(int *)0x01313574, *(int *)0x0131359C, *(int *)0x013135B0,
                     *(int *)0x01313568, q ? *(LONG *)(q + BGPROC_PENDING) : -1, cur ? cur[2] : 0, ll ? ll[2] : -1, inflight,
-                    g_anchor < 0 ? -1L : F - g_anchor, GetTickCount() - g_t0, g_vcalls, *(DWORD *)0x011CF0D8, fpu_cw(), _mm_getcsr());
+                    g_anchor < 0 ? -1L : F - g_anchor, GetTickCount() - g_t0, g_vcalls, *(DWORD *)0x011CF0D8, fpu_cw(), _mm_getcsr(), wait_ms_take());
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         if (F % 60 == 0) fflush(g_csv);
         if (g_trace && F == g_trace_to + 1) fflush(g_trace);
@@ -2501,10 +2586,12 @@ static void init(void)
         g_mode = MODE_SCRIPT;
         g_connected[0] = g_connected[1] = 1;
         g_fixed_dt = g_loadsync = g_videodt = g_vclock = g_render_rng = g_vaudio = g_anchor_mode = 1;
+        // Frame-gebundene Lade-Schleifen, Datei-/Speicher-Threads und keine Maus/Tastatur (Paartest
+        // schnell gegen verzoegert: 31.000 Frames gleich); LBO_LOADSLOW gilt damit nicht mehr
+        g_loopgate = g_iowait = g_nodinput = 1;
         g_rng_reset = 0;
         if (g_fps_cap <= 0) g_fps_cap = 60;
-        if (!g_slow_start) g_slow_start = 900;
-        if (!g_load_slow) g_load_slow = 40;
+        if (!g_slow_start) g_slow_start = 320;   // Intro-Start bei Frame 283/284 haengt sonst am Tempo
         input_init(GetProcAddress(LoadLibraryA("xinput1_3.dll"), (LPCSTR)2), logf_);   // Ordinal 2 = XInputGetState
     }
     if (g_mode == MODE_SCRIPT && GetEnvironmentVariableA("LBO_SCRIPT", buf, sizeof buf)) load_script(buf);
@@ -2515,7 +2602,7 @@ static void init(void)
     }
     logf_("Spielstand-Schutz %s", g_allow_save ? "AUS (LBO_ALLOWSAVE)" : "aktiv");
     g_csv = open_out("frames.csv", "w");
-    if (g_csv) fprintf(g_csv, "F,game_frame,dt,rng_pm_seed,rng_lcg16,rng_pm_default,rng_a,rng_b,rng_c,crt_rand,polls,chars,char_hash,p1x,p1y,p1z,p2x,p2y,p2z,vid,fmv_a,fmv_b,fmv_c,fmv_d,fmv_frame,bg_pend,bg_job,ll_n,ll_loading,rel,ms,qpc,rawdt,fpucw,mxcsr\n");
+    if (g_csv) fprintf(g_csv, "F,game_frame,dt,rng_pm_seed,rng_lcg16,rng_pm_default,rng_a,rng_b,rng_c,crt_rand,polls,chars,char_hash,p1x,p1y,p1z,p2x,p2y,p2z,vid,fmv_a,fmv_b,fmv_c,fmv_d,fmv_frame,bg_pend,bg_job,ll_n,ll_loading,rel,ms,qpc,rawdt,fpucw,mxcsr,wait_ms\n");
     logf_("Modus %d, festes dt %d, fps %d, max Frames %d, Screenshot alle %d, Mehrfach %d", g_mode, g_fixed_dt,
           g_fps_cap, g_max_frames, g_shot_every, g_multi);
     logf_("NuBgProc synchron %d, ohne Videos %d, Zufalls-Reset bei Frame %d, Lade-Sync %d, Video-dt fest %d, virtuelle Uhr %d", g_bgsync,

@@ -140,6 +140,25 @@ static unsigned fpu_cw(void)
     __asm fnstcw w
     return w;
 }
+
+// Rechengenauigkeit im Netzmodus (wie Batman 1): Direct3D stellt die x87-FPU auf 24 Bit. Ob das auf jedem PC
+// gleich passiert (Treiber, Overlays), ist nicht sicher; eine andere Genauigkeit liesse die Spiele
+// auseinanderlaufen. Beide Seiten setzen deshalb je Frame denselben Zustand (im Paartest stets 0x7f/0x1f80).
+static int g_fpu_fixes;
+static void logf_(const char *fmt, ...);
+
+static void enforce_fpu(const char *where)
+{
+    unsigned short cw, want = 0x007F;   // 24 Bit, runden zum Naechsten, alle Ausnahmen maskiert
+    unsigned int csr = _mm_getcsr();
+    __asm fnstcw cw
+    if (cw != want || (csr & 0xFFC0) != 0x1F80) {
+        if (g_fpu_fixes++ < 5)
+            logf_("FPU korrigiert (%s): x87 %04x -> %04x, MXCSR %08x -> %08x", where, cw, want, csr, (csr & 0x3F) | 0x1F80);
+        __asm fldcw want
+        _mm_setcsr((csr & 0x3F) | 0x1F80);
+    }
+}
 static volatile DWORD g_last_frame_tick;
 
 static void logf_(const char *fmt, ...)
@@ -1234,6 +1253,25 @@ __declspec(naked) static void stub_poll_device(void)
     }
 }
 
+// Hinweise an den Spieler (eigener Thread, damit das Spiel weiterlaeuft): 1 = nicht mehr synchron,
+// 2 = Partner antwortet nicht mehr
+static DWORD WINAPI net_notice(void *arg)
+{
+    MessageBeep(MB_ICONEXCLAMATION);
+    if ((int)(INT_PTR)arg == 1)
+        MessageBoxW(NULL,
+            L"Eure Spiele laufen nicht mehr synchron.\n\n"
+            L"Ab jetzt seht ihr unterschiedliche Spielst\u00e4nde, Eingaben des Mitspielers wirken falsch.\n\n"
+            L"Beendet beide das Spiel und startet in der App erneut \"Zusammen spielen\".",
+            L"LEGO Online \u2013 nicht mehr synchron", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+    else
+        MessageBoxW(NULL,
+            L"Dein Mitspieler antwortet seit 30 Sekunden nicht mehr (Verbindung getrennt oder Spiel beendet).\n\n"
+            L"Du spielst alleine weiter. Um wieder zusammen zu spielen, beende das Spiel und lade ihn in der App neu ein.",
+            L"LEGO Online \u2013 Verbindung verloren", MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+    return 0;
+}
+
 // Lokale Eingabe abtasten (Skript zum Testen, sonst echter Controller) und mit dem Partner tauschen
 static void net_exchange(long F)
 {
@@ -1254,6 +1292,14 @@ static void net_exchange(long F)
     g_in_wait = 1;
     net_frame((int)F, &local, both);
     g_in_wait = 0;
+    if (net_partner_lost()) {
+        static int notified;
+        if (!notified) {
+            notified = 1;
+            logf_("Netz: Partner verloren, Hinweis an den Spieler");
+            CreateThread(NULL, 0, net_notice, (void *)2, 0, NULL);
+        }
+    }
     for (i = 0; i < 2; i++) {
         g_net_pad[i].wButtons = both[i].buttons;
         g_net_pad[i].bLeftTrigger = both[i].lt; g_net_pad[i].bRightTrigger = both[i].rt;
@@ -1564,6 +1610,9 @@ static long g_slow_frames;
 // Wartezeiten im Netz nach, damit sich Lade-Wettlaeufe lokal mit zwei Instanzen nachstellen lassen.
 static int g_jitter;
 static unsigned g_jitter_state;
+// LBO_PAUSE=frame,ms (Test): einmalige lange Pause, z. B. wie ein Spieler, der per Alt-Tab weg ist
+static long g_pause_at;
+static int g_pause_ms;
 
 // --- Frame-gebundene Lade-Threads (LBO_GATE=1) ------------------------------------------------------
 // Die Lade-Threads (Tabelle 0x102dbe0: 2 m_readThread, 15 NuBgProc)
@@ -1682,7 +1731,14 @@ static void __cdecl post_frame_end(void)
         Sleep((g_jitter_state >> 16) % (unsigned)(g_jitter + 1));
         g_in_wait = 0;
     }
+    if (g_pause_ms && g_F == g_pause_at) {
+        logf_("Test: Pause %d ms", g_pause_ms);
+        g_in_wait = 1;
+        Sleep(g_pause_ms);
+        g_in_wait = 0;
+    }
     t0 = qpc_now();
+    if (g_net) enforce_fpu("nach Frame-Ende");
     if (g_gate && g_F > 30) gate_window();
     post_frame_end_inner();
     g_wait_ticks += qpc_now() - t0;
@@ -2340,6 +2396,7 @@ static void __cdecl on_frame_end(void)
     // Fensterfokus, und jeder Erfolg schaltet Puffer um (0x13658bc, 0x13655a4). Das Spiel hat dafuer
     // Abschalt-Bits (0x136555c: 1 Maus, 2 Tastatur); im Netz zaehlen ohnehin nur die Lockstep-Pads.
     if (g_net || g_nodinput) *(volatile BYTE *)0x0136555C |= 3;
+    if (g_net) enforce_fpu("Frame-Ende");
     if (g_vaudio) { LONGLONG t0 = qpc_now(); va_tick(); t0 = qpc_now() - t0; g_wait_ticks += t0; g_wt[1] += t0; }
     if (g_audiolog && F % 600 == 0) audio_log();
     if (g_vaudio && F % 3000 == 0) logf_("Ton: %ld Nachlieferungen abgewartet, %ld Stream-Enden; erste Puffer %ld abgewartet, %ld Zeitgrenzen",
@@ -2392,6 +2449,16 @@ static void __cdecl on_frame_end(void)
             ck = ((unsigned long long)k.hash << 32) ^ (unsigned)k.n ^ G_RNG_LCG16 ^ ((unsigned long long)G_RNG_A << 16) ^
                  ((unsigned long long)G_RNG_PM_DEFAULT << 40) ^ crt_rand_state();
             net_checksum((int)NF, ck);
+            {
+                static int notified;
+                long stalls, desyncs;
+                net_stats(&stalls, &desyncs);
+                if (desyncs > 0 && !notified) {
+                    notified = 1;
+                    logf_("NICHT SYNCHRON: Hinweis an den Spieler");
+                    CreateThread(NULL, 0, net_notice, (void *)1, 0, NULL);
+                }
+            }
         }
     }
     if (g_csv) {
@@ -2624,6 +2691,7 @@ static void init(void)
         while (t && g_gate_n < 19) { g_gate_idx[g_gate_n++] = atoi(t); t = strtok(NULL, ","); }
     }
     if (GetEnvironmentVariableA("LBO_JITTER", buf, sizeof buf)) { g_jitter = atoi(buf); g_jitter_state = GetCurrentProcessId(); }
+    if (GetEnvironmentVariableA("LBO_PAUSE", buf, sizeof buf)) sscanf(buf, "%ld,%d", &g_pause_at, &g_pause_ms);
     if (GetEnvironmentVariableA("LBO_AUDIOLOG", buf, sizeof buf)) g_audiolog = atoi(buf);
     if (GetEnvironmentVariableA("LBO_VAUDIO", buf, sizeof buf)) g_vaudio = atoi(buf);
     if (GetEnvironmentVariableA("LBO_PROBE", buf, sizeof buf)) {
@@ -2644,6 +2712,7 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_RNGRESET", buf, sizeof buf)) g_rng_reset = atoi(buf);
     // Netzmodus: alle Schalter, die den Ablauf deterministisch machen, sind Pflicht (docs/batman2-phase0.md)
     g_net = net_init(logf_);
+    if (g_net) net_set_partner_timeout(30000);   // danach alleine weiter statt endlos einfrieren
     if (g_net) {
         g_mode = MODE_SCRIPT;
         g_connected[0] = g_connected[1] = 1;

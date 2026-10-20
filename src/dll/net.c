@@ -55,6 +55,9 @@ static SOCKET g_sock = INVALID_SOCKET;
 static struct sockaddr_in g_peer;
 static int g_role;   // 0 = Host (Pad 0), 1 = Client (Pad 1)
 static int g_delay = 3;
+static int g_partner_timeout_ms;    // 0 = nie aufgeben
+static volatile LONG g_partner_lost;
+static volatile DWORD g_last_rx;    // GetTickCount() des letzten Pakets vom Partner (auch Lebenszeichen)
 static int g_loss;        // LBO_NETLOSS: Prozent ausgehender Pakete verwerfen (nur zum Testen)
 static long g_dropped;
 static NETPAD g_local[RING], g_remote[RING];
@@ -80,6 +83,16 @@ static DWORD WINAPI keepalive(void *arg)
     while (!g_started) {
         send_inputs();
         Sleep(200);
+    }
+    // Danach (nur mit Partner-Zeitgrenze) ein Lebenszeichen je halbe Sekunde, auch wenn das Spiel steht
+    // (Alt-Tab, Ladehaenger). So gilt der Partner nur als verloren, wenn wirklich nichts mehr ankommt.
+    // Gilt er als verloren, schweigen wir auch: Kaeme er zurueck, liefe sein Spiel sonst nie weiter.
+    while (!g_partner_lost) {
+        if (g_partner_timeout_ms) {
+            unsigned ping[2] = { MAGIC, 5 };
+            sendto(g_sock, (const char *)ping, sizeof ping, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
+        }
+        Sleep(500);
     }
     return 0;
 }
@@ -131,6 +144,7 @@ int net_init(void (*logger)(const char *fmt, ...))
     memset(g_remote_have, 0, sizeof g_remote_have);
     for (port = 1; port <= g_delay; port++) g_remote_have[port % RING] = 1;
     if (g_loss) g_log("Netz-Test: simuliere %d %% Paketverlust", g_loss);
+    g_last_rx = GetTickCount();
     g_keepalive = CreateThread(NULL, 0, keepalive, NULL, 0, NULL);
     g_log("Netz: Rolle %s, Port %d, Partner %s:%d, Verzoegerung %d Frames",
           g_role ? "Client (Spieler 2)" : "Host (Spieler 1)", ntohs(me.sin_port), host, peer_port, g_delay);
@@ -141,6 +155,7 @@ static void send_inputs(void)
 {
     PACKET p;
     int i, first;
+    if (g_partner_lost) return;
     memset(&p, 0, sizeof p);
     p.magic = MAGIC;
     p.type = 1 | ((unsigned)g_epoch << 16);
@@ -274,6 +289,7 @@ static void receive(void)
     PACKET p;
     int n, i, f;
     while ((n = recv(g_sock, (char *)&u, sizeof u, 0)) > 0) {
+        if (n >= 8 && u.p.magic == MAGIC) g_last_rx = GetTickCount();
         if (n == (int)sizeof(SYNCPACKET) && u.s.magic == MAGIC && u.s.type == 2) {
             if (u.s.frame != g_sync_in_frame && u.s.len >= 0 && u.s.len <= 256) {
                 g_sync_in = u.s;
@@ -325,9 +341,15 @@ void net_frame(int F, const NETPAD *local_now, NETPAD out[2])
     }
     send_inputs();
     receive();
-    if (g_remote_upto < F) g_stalls++;
-    while (g_remote_upto < F) {
+    if (g_remote_upto < F && !g_partner_lost) g_stalls++;
+    while (g_remote_upto < F && !g_partner_lost) {
         DWORD now = GetTickCount();
+        if (g_partner_timeout_ms && now - g_last_rx > (DWORD)g_partner_timeout_ms) {
+            g_log("Netz: seit %lu ms kein Paket vom Partner (wartet seit %lu ms), Spiel laeuft alleine weiter",
+                  now - g_last_rx, now - start);
+            InterlockedExchange(&g_partner_lost, 1);
+            break;
+        }
         if (now - last_send >= 4) { send_inputs(); last_send = now; }
         if (now - last_log >= 5000) {
             g_log("Netz: warte seit %lu ms auf Partner-Eingabe fuer Frame %d (bekannt bis %d)", now - start, F, g_remote_upto);
@@ -343,8 +365,13 @@ void net_frame(int F, const NETPAD *local_now, NETPAD out[2])
         receive();
     }
     out[g_role] = g_local[F % RING];
-    out[1 - g_role] = g_remote[F % RING];
+    if (g_partner_lost && g_remote_upto < F) memset(&out[1 - g_role], 0, sizeof out[1 - g_role]);
+    else out[1 - g_role] = g_remote[F % RING];
 }
+
+void net_set_partner_timeout(int ms) { g_partner_timeout_ms = ms; }
+
+int net_partner_lost(void) { return g_partner_lost != 0; }
 
 void net_checksum(int F, unsigned long long ck)
 {

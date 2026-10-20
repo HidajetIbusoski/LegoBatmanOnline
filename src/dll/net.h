@@ -22,3 +22,8 @@ void net_send_sync(int F, const void *data, int len);
 int net_wait_sync(int F, void *data, int len, int timeout_ms);
 // Schranke mit Zustand vom Host; danach zaehlen beide Seiten die Frames neu ab 1 (siehe net.c)
 int net_barrier(int F, void *data, int len, int timeout_ms);
+// Partner weg (LEGO Batman 2): Kommt laenger als ms kein Paket (auch kein Lebenszeichen, das ein eigener
+// Thread jede halbe Sekunde schickt), gilt er als verloren. Ab dann liefert net_frame fuer ihn neutrale
+// Eingaben, wartet nicht mehr und sendet selbst nichts mehr. 0 = nie aufgeben (Standard, Batman 1).
+void net_set_partner_timeout(int ms);
+int net_partner_lost(void);

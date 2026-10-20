@@ -25,6 +25,41 @@ public static class GameBridge
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "Warner Bros. Interactive Entertainment", "LEGO Batman", "Saved Games");
 
+    /// <summary>
+    /// LEGO Batman 2 braucht ein laufendes, angemeldetes Steam (Kopierschutz). Sonst beendet sich das Spiel beim
+    /// Start oder wartet auf ein Steam-Fenster; im Playtest 20.10. abends kam das Spiel des Mitspielers so nicht
+    /// ueber den Start hinaus. Startet Steam bei Bedarf und wartet hoechstens 2 Minuten auf die Anmeldung.
+    /// </summary>
+    public static bool SteamReady()
+    {
+        var user = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam\ActiveProcess", "ActiveUser", 0);
+        return Process.GetProcessesByName("steam").Length > 0 && user is int u && u != 0;
+    }
+
+    public static async Task<bool> EnsureSteamAsync(Action<string> status, CancellationToken ct = default)
+    {
+        if (SteamReady()) return true;
+        if (Process.GetProcessesByName("steam").Length == 0)
+        {
+            var exe = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamExe", null) as string;
+            if (exe == null) { status("Steam wurde nicht gefunden. LEGO Batman 2 braucht Steam."); return false; }
+            try { Process.Start(new ProcessStartInfo(exe, "-silent") { UseShellExecute = true }); }
+            catch { status("Steam konnte nicht gestartet werden."); return false; }
+            status("Starte Steam …");
+        }
+        else status("Warte auf die Steam-Anmeldung …");
+        var start = DateTime.Now;
+        while (DateTime.Now - start < TimeSpan.FromMinutes(2))
+        {
+            await Task.Delay(500, ct).ContinueWith(_ => { });
+            if (ct.IsCancellationRequested) return false;
+            if (SteamReady()) { await Task.Delay(3000); return true; }
+            if (DateTime.Now - start > TimeSpan.FromSeconds(15)) status("Warte auf Steam – bitte bei Steam anmelden, falls ein Fenster offen ist …");
+        }
+        status("Steam ist nach 2 Minuten nicht bereit.");
+        return false;
+    }
+
     /// <summary>Sucht LEGOBatman.exe in allen Steam-Bibliotheken.</summary>
     public static string? FindGame()
     {

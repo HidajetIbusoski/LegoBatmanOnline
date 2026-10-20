@@ -552,6 +552,7 @@ static void net_exchange(long F)
         long stalls, desyncs;
         net_stats(&stalls, &desyncs);
         logf_("Netz: %ld Wartephasen, %ld Desyncs bis Frame %ld", stalls, desyncs, F);
+        net_report();
     }
 }
 
@@ -575,6 +576,11 @@ static void cap_frame_rate(void)
         LONGLONG left_ms = (g_next_frame.QuadPart - now.QuadPart) * 1000 / g_qpf.QuadPart;
         if (left_ms > 2) Sleep((DWORD)(left_ms - 1));
         QueryPerformanceCounter(&now);
+    }
+    // Zeitabgleich im Netz: Sind wir dem Partner voraus, wird der Frame um bis zu 4 ms laenger (net_advantage)
+    if (g_net) {
+        double a = net_advantage();
+        if (a > 0.5) g_next_frame.QuadPart += (LONGLONG)((a - 0.5 > 2 ? 2 : a - 0.5) * 2.0 * g_qpf.QuadPart / 1000);
     }
     g_next_frame.QuadPart += period;
 }

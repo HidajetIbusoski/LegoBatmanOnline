@@ -9,6 +9,8 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <shlobj.h>
+#include <shellapi.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <string.h>
 #include "online.h"
@@ -67,6 +69,66 @@ static int find_game(char *out)
 }
 
 // --- Spiel starten und DLL laden --------------------------------------------------------
+// --- Steam (nur LEGO Batman 2) ------------------------------------------------------------
+// Batman 2 hat einen Steam-Kopierschutz: Laeuft Steam nicht (oder ist niemand angemeldet), startet das Spiel
+// Steam und beendet sich, oder es wartet auf ein Steam-Fenster. Im Playtest (20.10. abends) kam das Spiel des
+// Mitspielers so zweimal nicht ueber den Start hinaus. Deshalb vorher Steam starten und auf die Anmeldung warten.
+static int process_running(const char *exe)
+{
+    PROCESSENTRY32 pe;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    int found = 0;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    pe.dwSize = sizeof pe;
+    if (Process32First(snap, &pe)) {
+        do { if (!_stricmp(pe.szExeFile, exe)) { found = 1; break; } } while (Process32Next(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+static DWORD steam_active_user(void)
+{
+    DWORD user = 0, len = sizeof user;
+    if (RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam\\ActiveProcess", "ActiveUser", RRF_RT_REG_DWORD, NULL, &user, &len))
+        return 0;
+    return user;
+}
+
+static void ensure_steam(void)
+{
+    char exe[MAX_PATH];
+    DWORD len = sizeof exe, t0;
+    int asked = 0;
+    if (process_running("steam.exe") && steam_active_user()) return;
+    printf("STATUS steam\n");
+    if (!process_running("steam.exe")) {
+        if (RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamExe", RRF_RT_REG_SZ, NULL, exe, &len)) {
+            printf("Steam laeuft nicht und wurde nicht gefunden. Bitte Steam starten.\n");
+        } else {
+            printf("Steam laeuft nicht, starte Steam ...\n");
+            ShellExecuteA(NULL, "open", exe, "-silent", NULL, SW_SHOWMINNOACTIVE);
+        }
+    }
+    fflush(stdout);
+    t0 = GetTickCount();
+    while (GetTickCount() - t0 < 120000) {
+        if (process_running("steam.exe") && steam_active_user()) {
+            printf("Steam ist bereit.\n");
+            fflush(stdout);
+            Sleep(3000);   // Steam braucht nach der Anmeldung noch einen Moment fuer seine Dienste
+            return;
+        }
+        if (!asked && GetTickCount() - t0 > 15000) {
+            printf("Warte auf Steam - bitte bei Steam anmelden, falls ein Fenster offen ist.\n");
+            fflush(stdout);
+            asked = 1;
+        }
+        Sleep(500);
+    }
+    printf("Steam ist nach 2 Minuten nicht bereit, starte das Spiel trotzdem.\n");
+}
+
 static int launch(const char *game, const char *dll, const char *args, int wait)
 {
     char cmdline[4096], dir[MAX_PATH];
@@ -406,6 +468,9 @@ static int app_mode(int argc, char **argv)
     online_set_keys(key, peer_key);
     if (!peer_pub || !online_parse_endpoint(peer_pub, &o.peer_pub)) { printf("ERROR Adresse des Partners fehlt\n"); online_close(); return 1; }
     if (peer_loc) online_parse_endpoint(peer_loc, &o.peer_local);
+    // Vor dem Verbinden (60 s Zeitgrenze fuer beide): Steam muss fuer Batman 2 schon laufen (die App prueft das
+    // normalerweise vorher, das hier ist der Rueckfall)
+    if (g_b2) ensure_steam();
     printf("STATUS verbinde\n");
     if (!online_connect(&o, hash, 60)) { printf("ERROR Keine Verbindung zum Partner\n"); online_close(); return 1; }
     printf("STATUS verbunden\n");

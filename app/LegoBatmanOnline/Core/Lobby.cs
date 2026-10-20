@@ -542,6 +542,13 @@ public sealed class Lobby : Bindable
         _world = null;
         _sessionSlot = -1;
         SessionActive = true;
+        var sid = _sid;
+        if (!await GameBridge.EnsureSteamAsync(t => { SessionText = t; AddLog(t); }))
+        {
+            if (_sid == sid) EndSession("LEGO Batman 2 braucht ein laufendes, angemeldetes Steam.");
+            return;
+        }
+        if (_sid != sid || !SessionActive) return;
         SessionText = $"Warte auf {f.Name} …";
         AddLog($"Einladung zu LEGO Batman 2 an {f.Name} gesendet");
         await _msg.SendAsync(f.Id, pub, new JsonObject { ["t"] = "invite", ["sid"] = _sid, ["slot"] = -1, ["game"] = "b2" });
@@ -579,6 +586,16 @@ public sealed class Lobby : Bindable
         _batman2 = inv.Game == "b2";
         _world = null;  // der Gast spielt mit der Kopie des Hosts, sein Weltordner bleibt unberuehrt
         SessionActive = true;
+        if (_batman2)
+        {
+            var sid = _sid;
+            if (!await GameBridge.EnsureSteamAsync(t => { SessionText = t; AddLog(t); }))
+            {
+                if (_sid == sid) EndSession("LEGO Batman 2 braucht ein laufendes, angemeldetes Steam.");
+                return;
+            }
+            if (_sid != sid || !SessionActive) return;
+        }
         SessionText = "Ermittle deine Adresse …";
         _myEp = await GameBridge.StunAsync(_launcher!);
         if (_myEp == null) { EndSession("Adresse konnte nicht ermittelt werden (STUN)."); return; }
@@ -779,10 +796,11 @@ public sealed class Lobby : Bindable
         var code = await GameBridge.ConnectAndPlayAsync(_launcher!, _isHost, _myEp!, peerEp, _sessionSlot, saveDir, _batman2,
             line => _ui.BeginInvoke(() => OnLauncherLine(line)), TestEnv(), _sessionCts.Token);
         var logDir = _logDir;
+        bool b2 = _batman2;
         if (_sid == sid)
             EndSession(_desyncShown ? "Das Spiel war nicht mehr synchron. Die Fehlerdaten gehen an deinen Mitspieler."
                      : code == 0 ? "Spiel beendet." : "Verbindung fehlgeschlagen.");
-        if (peer != null && logDir != null) await SendDiagAsync(peer, logDir);
+        if (peer != null) await SendDiagAsync(peer, logDir, b2, code);
     }
 
     // --- Desync: Hinweis und Fehlerdaten -------------------------------------------------
@@ -819,28 +837,50 @@ public sealed class Lobby : Bindable
         return r.ReadToEnd();
     }
 
-    /// <summary>Nach einem Desync: Log-Auszug und frames.csv rund um die erste Abweichung an den Partner.</summary>
-    private async Task SendDiagAsync(FriendItem peer, string logDir)
+    /// <summary>
+    /// Fehlerdaten an den Partner: nach einem Desync Log-Auszug und frames.csv rund um die erste Abweichung. Bei
+    /// LEGO Batman 2 auch, wenn die Sitzung schiefging (nie im Level, Partner verloren, Start gescheitert): Anfang und
+    /// Ende des Logs, die letzten Frames und das App-Protokoll. Im Playtest 20.10. abends fehlten genau diese Daten.
+    /// </summary>
+    private async Task SendDiagAsync(FriendItem peer, string? logDir, bool b2, int code)
     {
         try
         {
-            var log = ReadShared(Path.Combine(logDir, "lbo.log"));
+            if (PubOf(peer.Id) is not { } pub) return;
+            string log = "";
+            try { if (logDir != null) log = ReadShared(Path.Combine(logDir, "lbo.log")); } catch { }
             // Neuere DLL: "DESYNC bei Frame <Lockstep> (Spiel-Frame <F>)"; frames.csv zaehlt Spiel-Frames
             var m = System.Text.RegularExpressions.Regex.Match(log, @"DESYNC bei Frame (\d+)(?: \(Spiel-Frame (\d+)\))?");
-            if (!m.Success || PubOf(peer.Id) is not { } pub) return;
-            int f0 = int.Parse(m.Groups[2].Success ? m.Groups[2].Value : m.Groups[1].Value);
-            var csvLines = ReadShared(Path.Combine(logDir, "frames.csv")).Split('\n');
-            var rows = new List<string> { csvLines[0].TrimEnd('\r') };
-            foreach (var l in csvLines.Skip(1))
+            bool trouble = b2 && (code != 0 || log.Length == 0 || !log.Contains("Levelanker") || log.Contains("Partner verloren")
+                                  || log.Contains("startet nicht") || log.Contains("kam nicht an der Schranke"));
+            if (!m.Success && !trouble) return;
+            int f0 = m.Success ? int.Parse(m.Groups[2].Success ? m.Groups[2].Value : m.Groups[1].Value) : -1;
+            string[] csvLines = Array.Empty<string>();
+            try { if (logDir != null) csvLines = ReadShared(Path.Combine(logDir, "frames.csv")).Split('\n'); } catch { }
+            var rows = new List<string>();
+            if (csvLines.Length > 0)
             {
-                var comma = l.IndexOf(',');
-                if (comma > 0 && int.TryParse(l[..comma], out var f) && f >= f0 - 600 && f <= f0 + 120) rows.Add(l.TrimEnd('\r'));
+                rows.Add(csvLines[0].TrimEnd('\r'));
+                if (m.Success)
+                {
+                    foreach (var l in csvLines.Skip(1))
+                    {
+                        var comma = l.IndexOf(',');
+                        if (comma > 0 && int.TryParse(l[..comma], out var f) && f >= f0 - 600 && f <= f0 + 120) rows.Add(l.TrimEnd('\r'));
+                    }
+                }
+                else rows.AddRange(csvLines.Skip(1).TakeLast(300).Select(l => l.TrimEnd('\r')));
             }
-            // Die 400 Zeilen vor der ersten Abweichung und die ersten Abweichungen selbst
             var logLines = log.Split('\n').Select(l => l.TrimEnd('\r')).ToList();
-            int first = logLines.FindIndex(l => l.Contains("DESYNC"));
-            var excerpt = logLines.Take(first < 0 ? logLines.Count : first).TakeLast(400)
-                .Concat(logLines.Where(l => l.Contains("DESYNC")).Take(5));
+            IEnumerable<string> excerpt;
+            if (m.Success)
+            {
+                // Die 400 Zeilen vor der ersten Abweichung und die ersten Abweichungen selbst
+                int first = logLines.FindIndex(l => l.Contains("DESYNC"));
+                excerpt = logLines.Take(first < 0 ? logLines.Count : first).TakeLast(400)
+                    .Concat(logLines.Where(l => l.Contains("DESYNC")).Take(5));
+            }
+            else excerpt = logLines.Count <= 400 ? logLines : logLines.Take(120).Append("[...]").Concat(logLines.TakeLast(280));
             string cfg = "", cpu = "";
             try { cfg = File.ReadAllText(Path.Combine(Path.GetDirectoryName(GameBridge.SaveDir)!, "pcconfig.txt")); } catch { }
             try
@@ -851,15 +891,17 @@ public sealed class Lobby : Bindable
             catch { }
             var doc = new JsonObject
             {
-                ["frame"] = f0, ["dir"] = Path.GetFileName(logDir),
+                ["frame"] = f0, ["dir"] = logDir != null ? Path.GetFileName(logDir) : "",
                 ["log"] = string.Join("\n", excerpt), ["csv"] = string.Join("\n", rows),
+                ["app"] = string.Join("\n", Log.TakeLast(80)), ["code"] = code,
                 ["cfg"] = cfg, ["sys"] = $"{cpu.Trim()} | {Environment.ProcessorCount} Threads | {Environment.OSVersion}",
             };
             using var ms = new MemoryStream();
             using (var gz = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionLevel.SmallestSize))
                 gz.Write(System.Text.Encoding.UTF8.GetBytes(doc.ToJsonString()));
             await _msg.SendAsync(peer.Id, pub, new JsonObject { ["t"] = "diag", ["d"] = Convert.ToBase64String(ms.ToArray()) });
-            AddLog($"Fehlerdaten (Desync ab Frame {f0}) an {peer.Name} geschickt");
+            AddLog(m.Success ? $"Fehlerdaten (Desync ab Frame {f0}) an {peer.Name} geschickt"
+                             : $"Sitzungsdaten (Abbruch) an {peer.Name} geschickt");
         }
         catch (Exception e) { AddLog("Fehlerdaten konnten nicht gesendet werden: " + e.Message); }
     }
@@ -878,8 +920,11 @@ public sealed class Lobby : Bindable
             File.WriteAllText(Path.Combine(dir, "partner_lbo.log"), (string?)doc["log"] ?? "");
             File.WriteAllText(Path.Combine(dir, "partner_frames.csv"), (string?)doc["csv"] ?? "");
             File.WriteAllText(Path.Combine(dir, "partner_pcconfig.txt"), (string?)doc["cfg"] ?? "");
+            File.WriteAllText(Path.Combine(dir, "partner_app.txt"), (string?)doc["app"] ?? "");
+            int frame = (int?)doc["frame"] ?? -1;
             File.WriteAllText(Path.Combine(dir, "info.txt"),
-                $"Von: {fromName}\nErster Desync bei Frame: {(int?)doc["frame"]}\nLog-Ordner beim Partner: {(string?)doc["dir"]}\n" +
+                $"Von: {fromName}\n" + (frame >= 0 ? $"Erster Desync bei Frame: {frame}\n" : "Grund: Sitzung abgebrochen oder nicht gestartet\n") +
+                $"Rueckgabe des Launchers: {(int?)doc["code"]}\nLog-Ordner beim Partner: {(string?)doc["dir"]}\n" +
                 $"System des Partners: {(string?)doc["sys"]}\n");
             AddLog($"Fehlerdaten von {fromName} gespeichert: {dir}");
         }
@@ -903,11 +948,13 @@ public sealed class Lobby : Bindable
                     ? (_sessionSlot >= 0 ? "Spiel läuft – euer Spielstand wird automatisch geladen" : "Spiel läuft – du bedienst die Menüs")
                     : "Spiel läuft – drücke START, sobald ihr im Spiel seid",
                 "beendet" => "Spiel beendet",
+                "steam" => "Warte auf Steam … (LEGO Batman 2 braucht ein laufendes, angemeldetes Steam)",
                 var s => s,
             };
         }
         else if (line.StartsWith("ERROR ")) AddLog(line[6..]);
-        else if (line.StartsWith("Ping:") || line.StartsWith("Verbunden")) AddLog(line);
+        else if (line.StartsWith("Ping:") || line.StartsWith("Verbunden") || line.StartsWith("Steam") || line.StartsWith("Warte auf Steam"))
+            AddLog(line);
     }
 
     // --- Testhilfen -------------------------------------------------------------------

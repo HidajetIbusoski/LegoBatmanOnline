@@ -80,8 +80,9 @@ naechsten Start abgeglichen.
 
 LEGO Batman 2 (neu, Testphase)
 ------------------------------
-Beide brauchen LEGO Batman 2: DC Super Heroes auf Steam. Steam muss hier
-LAUFEN (das Spiel prueft das beim Start).
+Beide brauchen LEGO Batman 2: DC Super Heroes auf Steam. Steam muss dabei
+laufen und angemeldet sein (der Kopierschutz des Spiels prueft das). Die App
+startet Steam bei Bedarf selbst und wartet auf die Anmeldung.
 1. Die Kachel "LEGO Batman 2" waehlen und "Zusammen spielen" druecken,
    dann den Freund waehlen (oder beim Freund direkt "Einladen"). Der andere
    drueckt "Annehmen und spielen".
@@ -91,6 +92,11 @@ LAUFEN (das Spiel prueft das beim Start).
    fortfahren". Spielstaende gibt es bei Batman 2 noch nicht.
 4. Im Level drueckt der Eingeladene START und steigt als Robin ein.
 Waehrend des Ladens laufen die Spiele kurz langsamer, auch das ist gewollt.
+WLAN: Die Mod misst die Verbindung laufend und passt die Eingabeverzoegerung
+an (bei gutem Netz etwa 3 Frames, bei wackeligem WLAN bis 12). Kurze
+Funkloecher zeigen sich als kurzes Anhalten, danach geht es synchron weiter.
+Kommt das Spiel des Mitspielers nicht in Gang, erscheint nach 45 Sekunden ein
+Hinweis (meist ist dann Steam bei ihm nicht angemeldet).
 Nur Controller oder die Tastatur der App werden uebertragen; die Tastatur
 des Spiels selbst ist im Online-Modus aus.
 

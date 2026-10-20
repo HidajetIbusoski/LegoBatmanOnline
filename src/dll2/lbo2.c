@@ -38,6 +38,29 @@
 #include <tlhelp32.h>
 #include <intrin.h>
 #include "../dll/net.h"
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+
+// Warteschleifen (schwaechere PCs): Erst ein paar hundert Mal den Kern an bereite Threads abgeben (die Spiel-Threads,
+// auf die wir warten, kommen so sofort dran), danach Sleep(1). Vorher drehten die Schleifen mit Sleep(0) und
+// belegten beim Laden einen ganzen Kern, den auf einem Vierkerner der Entpacker gebraucht haette.
+static void idle_wait(int *spins)
+{
+    if (*spins < 200) { (*spins)++; if (!SwitchToThread()) YieldProcessor(); }
+    else Sleep(1);
+}
+
+// Kurzes, genaues Messfenster (statt Sleep(2), das 2-3 ms dauerte): bereite Threads gehen dabei vor
+static void window_ms(double ms)
+{
+    static LONGLONG f;
+    LARGE_INTEGER t;
+    LONGLONG end;
+    if (!f) { QueryPerformanceFrequency(&t); f = t.QuadPart; }
+    QueryPerformanceCounter(&t);
+    end = t.QuadPart + (LONGLONG)(ms * f / 1000.0);
+    do { if (!SwitchToThread()) YieldProcessor(); QueryPerformanceCounter(&t); } while (t.QuadPart < end);
+}
 #include "../dll/input.h"
 
 // --- Spieladressen (LEGO Batman 2) ---------------------------------------------------
@@ -1075,6 +1098,7 @@ static int sound_idle(void)
 
 static void va_wait_refills(void)
 {
+    int spins = 0;
     DWORD t0 = GetTickCount(), idle_at = 0, checked = 0;
     int i, waited = 0;
     while (va_owed()) {
@@ -1100,7 +1124,7 @@ static void va_wait_refills(void)
         }
         waited = 1;
         if (probe_due(t0)) { thread_probe(17, "Ton-Nachschub"); thread_probe(16, "Ton-Nachschub"); }
-        Sleep(0);
+        idle_wait(&spins);
     }
     if (waited) g_va_refill_waits++;
 }
@@ -1124,6 +1148,7 @@ static int va_starving(void)
 
 static void va_wait_first_buffers(void)
 {
+    int spins = 0;
     DWORD t0;
     int i;
     if (!va_starving()) return;
@@ -1137,7 +1162,7 @@ static void va_wait_first_buffers(void)
             LeaveCriticalSection(&g_va_cs);
             break;
         }
-        Sleep(0);
+        idle_wait(&spins);
     }
 }
 
@@ -1298,11 +1323,11 @@ static void va_tick(void)
             }
     }
     g_va_delivering = 0;
-    {   // Ton-Threads reagieren lassen: warten, bis sie 2 ms lang nicht gerechnet haben (hoechstens 50 ms)
+    {   // Ton-Threads reagieren lassen: warten, bis sie 1 ms lang nicht gerechnet haben (hoechstens 50 ms)
         DWORD t0 = GetTickCount();
         ULONG64 prev = sound_cycles(), now;
         for (;;) {
-            Sleep(2);
+            window_ms(1.0);
             now = sound_cycles();
             if (now == prev || GetTickCount() - t0 > 50) break;
             prev = now;
@@ -1359,6 +1384,12 @@ static void cap_frame_rate(void)
         LONGLONG left = (g_next.QuadPart - now.QuadPart) * 1000 / g_qpf.QuadPart;
         if (left > 2) Sleep((DWORD)(left - 1));
         QueryPerformanceCounter(&now);
+    }
+    // Zeitabgleich im Netz: Sind wir dem Partner voraus, wird der Frame um bis zu 4 ms laenger (net_advantage).
+    // Sonst holte die Bremse nach jeder Wartephase auf und rannte gleich in die naechste (WLAN-Test W2).
+    if (g_net) {
+        double a = net_advantage();
+        if (a > 0.5) g_next.QuadPart += (LONGLONG)((a - 0.5 > 2 ? 2 : a - 0.5) * 2.0 * g_qpf.QuadPart / 1000);
     }
     g_next.QuadPart += period;
     g_in_wait = 0;
@@ -1484,11 +1515,24 @@ __declspec(naked) static void stub_poll_device(void)
 }
 
 // Hinweise an den Spieler (eigener Thread, damit das Spiel weiterlaeuft): 1 = nicht mehr synchron,
-// 2 = Partner antwortet nicht mehr
+// 2 = Partner antwortet nicht mehr, 3 = Spiel des Partners kommt nicht ueber den Start hinaus (lebt aber),
+// 4 = Partner weg, bevor sein Spiel ueberhaupt lief (Playtest 20.10. abends: vermutlich Steam bei ihm aus)
 static DWORD WINAPI net_notice(void *arg)
 {
+    int kind = (int)(INT_PTR)arg;
     MessageBeep(MB_ICONEXCLAMATION);
-    if ((int)(INT_PTR)arg == 1)
+    if (kind == 3)
+        MessageBoxW(NULL,
+            L"Das Spiel deines Mitspielers ist auch nach 45 Sekunden noch nicht gestartet.\n\n"
+            L"Meist l\u00e4uft bei ihm Steam nicht oder ein Steam-Fenster (Anmeldung, Update) wartet auf ihn. "
+            L"Er sollte nachsehen; sobald sein Spiel l\u00e4uft, geht es hier automatisch weiter.",
+            L"LEGO Online \u2013 Mitspieler startet nicht", MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+    else if (kind == 4)
+        MessageBoxW(NULL,
+            L"Das Spiel deines Mitspielers wurde beim Start beendet (seit 30 Sekunden kein Lebenszeichen).\n\n"
+            L"Meist lief bei ihm Steam nicht. Beendet beide das Spiel, er startet Steam, dann l\u00e4dst du ihn in der App neu ein.",
+            L"LEGO Online \u2013 Mitspieler-Spiel beendet", MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+    else if (kind == 1)
         MessageBoxW(NULL,
             L"Eure Spiele laufen nicht mehr synchron.\n\n"
             L"Ab jetzt seht ihr unterschiedliche Spielst\u00e4nde, Eingaben des Mitspielers wirken falsch.\n\n"
@@ -1501,6 +1545,8 @@ static DWORD WINAPI net_notice(void *arg)
             L"LEGO Online \u2013 Verbindung verloren", MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
     return 0;
 }
+
+static void net_notice_cb(int kind) { CreateThread(NULL, 0, net_notice, (void *)(INT_PTR)kind, 0, NULL); }
 
 // Lokale Eingabe abtasten (Skript zum Testen, sonst echter Controller) und mit dem Partner tauschen
 static void net_exchange(long F)
@@ -1527,7 +1573,7 @@ static void net_exchange(long F)
         if (!notified) {
             notified = 1;
             logf_("Netz: Partner verloren, Hinweis an den Spieler");
-            CreateThread(NULL, 0, net_notice, (void *)2, 0, NULL);
+            CreateThread(NULL, 0, net_notice, (void *)(INT_PTR)(net_peer_started() ? 2 : 4), 0, NULL);
         }
     }
     for (i = 0; i < 2; i++) {
@@ -1540,6 +1586,7 @@ static void net_exchange(long F)
         long stalls, desyncs;
         net_stats(&stalls, &desyncs);
         logf_("Netz: %ld Wartephasen, %ld Desyncs bis Frame %ld", stalls, desyncs, F);
+        net_report();
     }
 }
 
@@ -1787,7 +1834,7 @@ static void wait_io(void)
     int waited = 0;
     io_settled(prev);
     for (;;) {
-        Sleep(2);
+        window_ms(1.0);
         if (io_settled(prev) && !stream_busy()) break;
         waited = 1;
         if (GetTickCount() - t0 > 500) { g_io_timeouts++; break; }
@@ -1810,6 +1857,7 @@ static long g_save_waits, g_save_timeouts;
 
 static void wait_savecore(void)
 {
+    int spins = 0;
     DWORD t0 = GetTickCount();
     int waited = 0;
     for (;;) {
@@ -1821,7 +1869,7 @@ static void wait_savecore(void)
             break;
         }
         waited = 1;
-        Sleep(0);
+        idle_wait(&spins);
     }
     if (waited) g_save_waits++;
 }
@@ -1998,6 +2046,14 @@ static void __cdecl post_frame_end_inner(void);
 static LONGLONG g_wait_ticks;
 static LONGLONG g_wt[8];   // je Wartestelle: 0 wait_io (Frame-Ende), 1 va_tick, 2 wait_io (danach), 3 SaveCore, 4 Lade-Schleife, 5 NuBgProc-Ruhe, 6 Rest
 
+static LONGLONG qpc_now(void);
+static double qpc_ms_since(LONGLONG t0)
+{
+    static LONGLONG f;
+    if (!f) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); f = q.QuadPart; }
+    return (double)(qpc_now() - t0) * 1000.0 / f;
+}
+
 static LONGLONG qpc_now(void)
 {
     LARGE_INTEGER t;
@@ -2154,15 +2210,17 @@ static void loop_window(void)
     for (;;) {
         LONG a0 = g_loop_arrivals;
         ULONG64 c, last = bgproc_cycles();
-        int idle = 0;
+        LONGLONG still = qpc_now();
+        int spins = 0;
         ReleaseSemaphore(g_loop_sem, 1, NULL);
         g_loop_iters++;
         // Warten, bis die Schleife wieder am Anfang steht. Endet sie (Liste leer), kommt sie nicht wieder:
         // dann ruht NuBgProc oder arbeitet am naechsten Auftrag ausserhalb der Schleife.
         while (g_loop_arrivals == a0) {
-            Sleep(0);
+            idle_wait(&spins);
             c = bgproc_cycles();
-            if (c == last) { if (++idle > 2000) break; } else { idle = 0; last = c; }
+            // NuBgProc rechnet 3 ms nicht: Schleife beendet oder Auftrag ausserhalb (frueher 2000 x Sleep(0))
+            if (c == last) { if (qpc_ms_since(still) >= 3) break; } else { still = qpc_now(); last = c; }
             if (GetTickCount() - t0 > 2000) break;
             av_hitch(t0);
             if (probe_due(t0)) {
@@ -2204,6 +2262,7 @@ static int pipeline_drain_stalled(void)
 
 static int bg_settle(void)
 {
+    int spins = 0;
     DWORD t0 = GetTickCount();
     ULONG64 last = bgproc_cycles(), c;
     DWORD still = GetTickCount();
@@ -2233,7 +2292,7 @@ static int bg_settle(void)
             thread_probe(2, "NuBgProc-Ruhe");
         }
         waited = 1;
-        Sleep(0);
+        idle_wait(&spins);
     }
     if (waited) g_settle_waits++;
     if (g_loadprobe && GetTickCount() - t0 > 100) {
@@ -2247,6 +2306,7 @@ static int bg_settle(void)
 
 static void __cdecl post_frame_end_inner(void)
 {
+    int spins = 0;
     DWORD t0;
     LONG c0;
     int waited = 0;
@@ -2272,7 +2332,7 @@ static void __cdecl post_frame_end_inner(void)
         t0 = GetTickCount();
         while (G_LOADLIST && G_LOADLIST[2] == 0 && bg_loader_active() && !g_loop_at_gate) {
             if (GetTickCount() - t0 > 1000) { g_post_timeouts++; break; }
-            Sleep(0);
+            idle_wait(&spins);
         }
         return;
     }
@@ -2294,7 +2354,7 @@ static void __cdecl post_frame_end_inner(void)
             break;
         }
         waited = 1;
-        Sleep(0);
+        idle_wait(&spins);
     }
     // Ist die Liste leer, beendet sich der Auftrag gleich. Der naechste Spielschritt prueft, ob ein Auftrag
     // laeuft (*0x11cc118, 0x7e6cd0) - dieses Ende darf nicht mal vor, mal nach der Pruefung liegen.
@@ -2302,7 +2362,7 @@ static void __cdecl post_frame_end_inner(void)
     while (G_LOADLIST && G_LOADLIST[2] == 0 && bg_loader_active()) {
         if (GetTickCount() - t0 > 1000) { g_post_timeouts++; logf_("Nach Frame-Ende: Auftrag endet nicht"); break; }
         waited = 1;
-        Sleep(0);
+        idle_wait(&spins);
     }
     if (waited) g_post_waits++;
 }
@@ -2331,6 +2391,7 @@ __declspec(naked) static void stub_after_frame_end(void)
 // Streaming-Schleife warten (der Hauptthread laeuft weiter, sobald die Zeitgrenze erreicht ist).
 static void boot_bg_wait(void)
 {
+    int spins = 0;
     DWORD t0;
     if (g_F >= 300 || !G_BGPROC) return;
     t0 = GetTickCount();
@@ -2341,12 +2402,13 @@ static void boot_bg_wait(void)
         if (cur && cur[2] == 0x007D48C0 && pend <= 0) break;
         if (!cur && pend <= 0) break;
         if (GetTickCount() - t0 > 5000) { logf_("Start: NuBgProc-Zeitgrenze (Auftrag %08x, offen %ld)", cur ? cur[2] : 0, pend); break; }
-        Sleep(0);
+        idle_wait(&spins);
     }
 }
 
 static void wait_loads(void)
 {
+    int spins = 0;
     DWORD t0 = GetTickCount();
     int n, st, waited = 0;
     // Nur warten, solange der Hintergrund-Auftrag (0x7d48c0 -> 0x7eb950) laeuft oder eingereiht ist. Beim
@@ -2359,7 +2421,7 @@ static void wait_loads(void)
             break;
         }
         waited = 1;
-        Sleep(0);
+        idle_wait(&spins);
     }
     if (waited) g_load_waits++;
     boot_bg_wait();
@@ -2859,7 +2921,7 @@ static void __cdecl on_frame_end(void)
                  ((unsigned long long)G_RNG_PM_DEFAULT << 40) ^ crt_rand_state();
             net_checksum((int)NF, ck);
             {
-                // Abweichung nach der letzten Reparatur: Host plant eine Reparatur 40 Frames voraus (der Gast
+                // Abweichung nach der letzten Reparatur: Host plant eine Reparatur 36-54 Frames voraus (der Gast
                 // erfaehrt es mit den Eingaben). Erst wenn drei Reparaturen nacheinander nicht helfen, Hinweis.
                 static int notified;
                 int last = net_last_desync();
@@ -2868,8 +2930,10 @@ static void __cdecl on_frame_end(void)
                     if (g_last_repair && last - g_last_repair > 600) g_repairs = 0;   // neuer Vorfall
                     if (g_repairs < 3) {
                         if (net_role() == 0 && net_repair_frame() <= NF) {
-                            net_schedule_repair((int)NF + 40);
-                            logf_("Netz: Abweichung bei Frame %d, Reparatur bei Frame %ld geplant", last, NF + 40);
+                            // Vorlauf: der Gast kann um seine Verzoegerung plus die Laufzeit voraus sein (WLAN: bis ~30)
+                            int lead = 30 + 2 * net_delay();
+                            net_schedule_repair((int)NF + lead);
+                            logf_("Netz: Abweichung bei Frame %d, Reparatur bei Frame %ld geplant", last, NF + lead);
                         }
                     } else if (!notified) {
                         notified = 1;
@@ -3073,6 +3137,7 @@ static void init(void)
     g_log = open_out("lbo.log", "w");
     InitializeCriticalSection(&g_cs);
     InitializeCriticalSection(&g_va_cs);
+    timeBeginPeriod(1);   // Sleep(1) wirklich 1 ms, auch wenn das Spiel die Zeitaufloesung nicht selbst setzt
     QueryPerformanceFrequency(&g_qpf);
     g_t0 = GetTickCount();
     logf_("lbo2.dll (LEGO Batman 2) geladen, Ausgabe nach %s", g_dir);
@@ -3137,7 +3202,8 @@ static void init(void)
     // Netzmodus: alle Schalter, die den Ablauf deterministisch machen, sind Pflicht (docs/batman2-phase0.md)
     g_net = net_init(logf_);
     if (g_net) net_set_partner_timeout(30000);
-    if (g_net) net_set_wait_callback(av_hitch);   // danach alleine weiter statt endlos einfrieren
+    if (g_net) net_set_wait_callback(av_hitch);
+    if (g_net) net_set_notice_callback(net_notice_cb);   // danach alleine weiter statt endlos einfrieren
     if (g_net) {
         g_mode = MODE_SCRIPT;
         g_connected[0] = g_connected[1] = 1;

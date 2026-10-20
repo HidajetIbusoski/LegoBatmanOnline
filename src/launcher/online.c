@@ -393,7 +393,9 @@ int online_measure_ping(ONLINE *o)
     for (i = 0; i < got; i++)
         for (j = i + 1; j < got; j++)
             if (rtt[j] < rtt[i]) { int x = rtt[i]; rtt[i] = rtt[j]; rtt[j] = x; }
-    o->ping_ms = rtt[got / 2];
+    // 80. Perzentil statt Median: Bei WLAN streut die Rundlaufzeit stark, der Median unterschaetzt sie. Im Spiel
+    // passt sich die Verzoegerung danach ohnehin laufend an (net.c), das hier ist nur der Startwert.
+    o->ping_ms = rtt[(got - 1) * 4 / 5];
     return o->ping_ms;
 }
 

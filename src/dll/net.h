@@ -16,6 +16,7 @@ int net_role(void);                                  // 0 = Host/Pad 0, 1 = Clie
 void net_frame(int F, const NETPAD *local_now, NETPAD out[2]);  // blockiert bis beide Eingaben fuer F da sind
 void net_checksum(int F, unsigned long long ck);
 void net_stats(long *stalls, long *desyncs);
+void net_report(void);   // Rundlaufzeit, Verlust, Verzoegerung und Wartezeit seit dem letzten Bericht ins Log
 // Zustandsabgleich (LEGO Batman 2): Der Host schickt fuer Frame F einen Datenblock (hoechstens 256 Byte),
 // der Gast wartet an Frame F darauf. Rueckgabe des Gasts: Frame des empfangenen Blocks, 0 bei Zeitueberschreitung.
 void net_send_sync(int F, const void *data, int len);
@@ -34,3 +35,7 @@ int net_repair_frame(void);            // Host: eigener Plan, Gast: zuletzt ange
 int net_last_desync(void);             // Pruefsummen-Frame der letzten Abweichung dieser Epoche (0 = keine)
 void net_set_frame_offset(long offset);   // fuer das Log: Spiel-Frame = Lockstep-Frame + offset
 void net_set_wait_callback(void (*cb)(unsigned long start));   // waehrend net_frame auf den Partner wartet
+void net_set_notice_callback(void (*cb)(int kind));   // Hinweis an den Spieler: 3 = Spiel des Partners startet nicht
+int net_delay(void);                                   // aktuelle eigene Eingabeverzoegerung in Frames
+int net_peer_started(void);                            // Partner hat schon echte Eingaben geschickt
+double net_advantage(void);   // geschaetzter zeitlicher Vorsprung vor dem Partner in Frames (positiv: wir sind voraus)

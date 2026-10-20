@@ -377,6 +377,15 @@ Host (dieser PC) und Gast (i5-10400F), Verzögerung 4 Frames, 83.000 Frames (23 
 - Ton 0,2 s am Ende von Musik-Streams (Wartezeit auf eine Nachlieferung, die nicht kommt).
 - Netz bis 1,9 s: der langsamere PC beim Laden.
 
+**Hänger verkürzt (20.10.2026, nachmittags):** `LBO_LOADPROBE=1` hält in langen Wartephasen die Spiel-Threads kurz an und loggt, wo sie stehen (EIP und Rückadressen). Befunde und Fixes:
+- *Datei-Threads nach dem Frame-Ende, 500 ms:* Alle Datei- und Shader-Threads warteten untätig, nur der Shader-Generator (T13) prüfte im Leerlauf jede Millisekunde per `Sleep`. Die Wartestelle verlangte "gar kein Takt" und lief deshalb bis zur Zeitgrenze. Jetzt gilt ein Thread unter 300.000 Takten je 2 ms als ruhig.
+- *Ton 200 ms an jedem Stream-Ende:* Der Ton-Streamer (T17, 0x61d240) schläft im Leerlauf mit `Sleep(5)` bei 0x61d2ac, solange seine Auftragsschlangen leer sind, der Ton-Decoder (T16) wartet auf sein Ereignis. Stehen beide zweimal im Abstand von mindestens 6 ms so da, ist der Stream zu Ende (statt 200 ms Zeitgrenze).
+- *NuBgProc leert die Lese-Pipeline (0x5637c0), 270–380 ms:* Leser (T2) und Entpacker (T3) warteten untätig, die Puffer kommen erst zurück, wenn der Hauptthread weiterläuft. Die Wartestelle endete zufällig. Jetzt wird dieser Zustand erkannt (gleiche Regel: zweimal, 6 ms Abstand).
+- *Echte Arbeit:* An Szenenanfängen rechnet der Entpacker (T3) 0,4–0,5 s am Stück (Frames 5047, 6326). Das bleibt, solange Laden im Gleichlauf in einem Frame fertig werden muss.
+- *Verklemmung durch den Ton-Gleichlauf (N27, Frame 7610):* `av_sync` rief XAudio2 unter der eigenen Sperre auf, während XAudio2 aus seinem Thread einen Rückruf des Spiels ausführte, der dieselbe Sperre brauchte. Jetzt ruft kein Pfad XAudio2 unter `g_va_cs` auf; `a_destroy` wartet, solange `av_sync` die Stimme abfragt.
+
+Ergebnis N31 (ohne Zittern) gegen N26: Stillstand nach dem Start 4,8 s statt 6,4 s, alle 10.619 Frames ab dem Levelstart gleich.
+
 Testschalter: `LBO_TESTDESYNC=N` verstellt beim Gast den LCG16 bei Netz-Frame N, `LBO_TESTMEET=N` löst bei N eine Schranke wie nach dem Laden aus.
 
 ## Zufallsgeneratoren

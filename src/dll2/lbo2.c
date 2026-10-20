@@ -577,6 +577,11 @@ static HANDLE WINAPI hook_createfile(LPCSTR path, DWORD access, DWORD share, LPS
         logf_("Schreibzugriff umgeleitet: %s -> %s", path, red);
         return real_createfile(red, access, share, sa, disp, flags, tmpl);
     }
+    {   // Diagnose: wie das Spiel seine Daten oeffnet (0x20000000 = ungepuffert, 0x40000000 = ueberlappend)
+        static volatile LONG n_open;
+        if (path && !(access & GENERIC_WRITE) && InterlockedIncrement(&n_open) <= 60)
+            logf_("Datei: %s (Flags %08lx, Zugriff %08lx)", path, flags, access);
+    }
     return real_createfile(path, access, share, sa, disp, flags, tmpl);
 }
 
@@ -855,11 +860,14 @@ static void STDMETHODCALLTYPE a_getratio(void *v, float *r)
     if (g_vaudio && r) { EnterCriticalSection(&g_va_cs); if ((a = va_find(v)) != NULL) *r = a->ratio; LeaveCriticalSection(&g_va_cs); }
 }
 
+static void *volatile g_av_inuse;   // Stimme, die av_sync gerade ohne Sperre bei XAudio2 abfragt
+
 static void STDMETHODCALLTYPE a_destroy(void *v)
 {
     VA_VOICE *a;
     InterlockedIncrement(&g_a_destroy);
     if (g_vaudio) { EnterCriticalSection(&g_va_cs); if ((a = va_find(v)) != NULL) memset(a, 0, sizeof *a); LeaveCriticalSection(&g_va_cs); }
+    while (g_av_inuse == v) Sleep(0);
     real_vdestroy(v);
 }
 
@@ -1017,6 +1025,9 @@ static ULONG64 sound_cycles(void)
 // nichts, ist der Stream zu Ende und die Stimme gilt wieder als nicht gestreamt.
 static long g_va_refill_waits, g_va_refill_timeouts;
 
+static void thread_probe(int idx, const char *what);
+static int probe_due(DWORD t0);
+
 static int va_owed(void)
 {
     int i, n = 0;
@@ -1026,11 +1037,62 @@ static int va_owed(void)
     return n;
 }
 
+// Kommt noch ein Nachschub? Der Ton-Streamer (Thread 17, 0x61d240) wartet im Leerlauf mit Sleep(5) bei 0x61d2ac,
+// solange seine beiden Auftragsschlangen (+0x408/+0x40c, +0x810/+0x814) leer sind; der Ton-Decoder (16) wartet
+// dann auf sein Ereignis (0x539c3e aus 0x61bedc). Stehen beide zweimal im Abstand von mindestens 6 ms so da, ist der
+// Stream zu Ende (Proben: an jedem Stream-Ende 200 ms Stillstand bis zur Zeitgrenze, ohne dass einer rechnete).
+static long g_va_refill_idle;
+
+static DWORD first_game_ret(int idx)
+{
+    HANDLE h = *(HANDLE *)(0x0102DBE0 + idx * 0xB4 + 0xA8);
+    CONTEXT ctx;
+    DWORD r = 0, *sp;
+    int k;
+    if (!h || SuspendThread(h) == (DWORD)-1) return 0;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    if (GetThreadContext(h, &ctx)) {
+        if (ctx.Eip >= 0x00401000 && ctx.Eip < 0x00C50000) r = 1;   // rechnet gerade im Spielcode
+        else {
+            sp = (DWORD *)ctx.Esp;
+            __try { for (k = 0; k < 64 && !r; k++) if (sp[k] >= 0x00401000 && sp[k] < 0x00C50000) r = sp[k]; }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+    ResumeThread(h);
+    return r;
+}
+
+static int sound_idle(void)
+{
+    unsigned char *o = *(unsigned char **)(0x0102DBE0 + 17 * 0xB4 + 4);
+    __try {
+        if (!o) return 0;
+        if (*(volatile int *)(o + 0x408) != *(volatile int *)(o + 0x40C)) return 0;
+        if (*(volatile int *)(o + 0x810) != *(volatile int *)(o + 0x814)) return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return first_game_ret(17) == 0x0061D2B4 && first_game_ret(16) == 0x00539C3E;
+}
+
 static void va_wait_refills(void)
 {
-    DWORD t0 = GetTickCount();
+    DWORD t0 = GetTickCount(), idle_at = 0, checked = 0;
     int i, waited = 0;
     while (va_owed()) {
+        DWORD now = GetTickCount();
+        if (now - checked >= 3) {
+            checked = now;
+            if (!sound_idle()) idle_at = 0;
+            else if (!idle_at) idle_at = now ? now : 1;
+            else if (now - idle_at >= 6) {
+                g_va_refill_idle++;
+                EnterCriticalSection(&g_va_cs);
+                for (i = 0; i < 64; i++) if (g_va[i].owed > 0) { g_va[i].owed = 0; g_va[i].streaming = 0; g_va[i].dry = 1; }
+                LeaveCriticalSection(&g_va_cs);
+                break;
+            }
+        }
         if (GetTickCount() - t0 > 200) {
             g_va_refill_timeouts++;
             EnterCriticalSection(&g_va_cs);
@@ -1039,6 +1101,7 @@ static void va_wait_refills(void)
             break;
         }
         waited = 1;
+        if (probe_due(t0)) { thread_probe(17, "Ton-Nachschub"); thread_probe(16, "Ton-Nachschub"); }
         Sleep(0);
     }
     if (waited) g_va_refill_waits++;
@@ -1092,39 +1155,60 @@ static volatile LONG g_engine_held;
 static volatile DWORD g_va_last_tick;
 static long g_av_holds, g_av_engine_holds;
 
+// XAudio2 wird hier nie unter g_va_cs aufgerufen: XAudio2 ruft aus seinem Ton-Thread Rueckrufe des Spiels auf, die
+// GetState (also g_va_cs) brauchen, waehrend es seine eigene Sperre haelt. Mit beiden Sperren in umgekehrter Reihenfolge
+// fror das Spiel im Test N27 bei Frame 7610 ein. a_destroy wartet, solange av_sync die Stimme gerade abfragt.
+
 static void av_sync(void)
 {
     int i;
     for (i = 0; i < 64; i++) {
         VA_VOICE *a = &g_va[i];
+        void *voice;
         XA_STATE st;
         double ahead, rate;
-        float corr;
-        if (!a->voice || !a->cb || !a->running || !a->rate) continue;
+        float corr, ratio;
+        int setratio = 0, act = 0;
+        EnterCriticalSection(&g_va_cs);
+        voice = a->voice;
+        if (!voice || !a->cb || !a->running || !a->rate) { LeaveCriticalSection(&g_va_cs); continue; }
+        g_av_inuse = voice;
+        LeaveCriticalSection(&g_va_cs);
         memset(&st, 0, sizeof st);
-        real_vgetstate(a->voice, &st);
+        real_vgetstate(voice, &st);
+        EnterCriticalSection(&g_va_cs);
+        if (a->voice != voice) { LeaveCriticalSection(&g_va_cs); g_av_inuse = NULL; continue; }
         // Echte Samples zaehlen ab dem Ende eines Streams neu: dann neu ansetzen
         if (st.SamplesPlayed < a->rlast) a->rtot = a->vtot;
         else a->rtot += (double)(st.SamplesPlayed - a->rlast);
         a->rlast = st.SamplesPlayed;
-        rate = a->rate * (a->ratio > 0 ? a->ratio : 1.0);
+        ratio = a->ratio > 0 ? a->ratio : 1.0f;
+        rate = a->rate * ratio;
         ahead = (a->rtot - a->vtot) * 1000.0 / rate;   // positiv: echter Ton ist vorn
         if (!g_avsync) corr = 1.0f;
         else if (ahead > 15) corr = (float)(1.0 - (ahead - 15 > 60 ? 60 : ahead - 15) / 400.0);
         else if (ahead < -15) corr = (float)(1.0 + (-ahead - 15 > 40 ? 40 : -ahead - 15) / 400.0);
         else corr = 1.0f;
-        if (corr * a->ratio > a->maxr) corr = a->maxr / (a->ratio > 0 ? a->ratio : 1.0f);
-        if (corr - a->corr > 0.004f || a->corr - corr > 0.004f) {
-            a->corr = corr;
-            real_vsetratio(a->voice, a->ratio * corr, 0);
-        }
-        if (g_avsync && !a->held && ahead > 150 && st.BuffersQueued) { real_vstop(a->voice, 0, 0); a->held = 1; g_av_holds++; }
-        else if (a->held && ahead < 20) { real_vstart(a->voice, 0, 0); a->held = 0; }
+        if (corr * ratio > a->maxr) corr = a->maxr / ratio;
+        if (corr - a->corr > 0.004f || a->corr - corr > 0.004f) { a->corr = corr; setratio = 1; }
+        if (g_avsync && !a->held && ahead > 150 && st.BuffersQueued) { a->held = 1; act = 1; g_av_holds++; }
+        else if (a->held && ahead < 20) { a->held = 0; act = 2; }
         if (g_avlog && (ahead - g_av_last[i] > 20 || g_av_last[i] - ahead > 20)) {
             logf_("Ton-Abstand: Stimme %d (%u Hz, %u Kan.) echter Ton %+.0f ms vorn, Faktor %.3f%s, Puffer %d/%u",
                   i, a->rate, a->channels, ahead, a->corr, a->held ? ", angehalten" : "", a->n, st.BuffersQueued);
             g_av_last[i] = ahead;
         }
+        LeaveCriticalSection(&g_va_cs);
+        if (setratio) real_vsetratio(voice, ratio * corr, 0);
+        if (act == 1) {
+            real_vstop(voice, 0, 0);
+            // Hat das Spiel die Stimme inzwischen selbst gestartet oder gestoppt, gilt sein Wille
+            EnterCriticalSection(&g_va_cs);
+            act = a->voice == voice && !a->held && a->running;
+            LeaveCriticalSection(&g_va_cs);
+            if (act) real_vstart(voice, 0, 0);
+        } else if (act == 2) real_vstart(voice, 0, 0);
+        g_av_inuse = NULL;
     }
 }
 
@@ -1173,8 +1257,8 @@ static void va_tick(void)
             a->pos = 0;
         }
     }
-    if (g_avsync || g_avlog) av_sync();
     LeaveCriticalSection(&g_va_cs);
+    if (g_avsync || g_avlog) av_sync();
     if (!nev) return;
     g_va_events += nev;
     g_va_delivering = GetCurrentThreadId();
@@ -1613,18 +1697,78 @@ static int stream_busy(void)
     return 0;
 }
 
+// Diagnose (LBO_LOADPROBE=1): Wo steht ein Spiel-Thread, waehrend die Mod auf ihn wartet? EIP und die ersten
+// Werte auf seinem Stapel, die wie Rueckadressen ins Spiel aussehen. Hoechstens 150 Zeilen.
+static int g_loadprobe;
+static long g_probe_lines;
+
+static void thread_probe(int idx, const char *what)
+{
+    HANDLE h = *(HANDLE *)(0x0102DBE0 + idx * 0xB4 + 0xA8);
+    CONTEXT ctx;
+    DWORD *sp;
+    char line[300];
+    int len, k, found = 0;
+    if (!g_loadprobe || !h || g_probe_lines >= 150) return;
+    if (SuspendThread(h) == (DWORD)-1) return;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    if (!GetThreadContext(h, &ctx)) { ResumeThread(h); return; }
+    len = snprintf(line, sizeof line, "Lade-Probe %s: T%d EIP %08lx, Stapel", what, idx, ctx.Eip);
+    sp = (DWORD *)ctx.Esp;
+    __try {
+        for (k = 0; k < 600 && found < 12; k++) {
+            DWORD v = sp[k];
+            if (v >= 0x00401000 && v < 0x00C50000) { len += snprintf(line + len, sizeof line - len, " %08lx", v); found++; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    ResumeThread(h);   // vor dem Log: der angehaltene Thread koennte eine Sperre halten, die logf_ braucht
+    g_probe_lines++;
+    logf_("%s", line);
+}
+
+// Hoechstens alle 25 ms eine Probe, erst ab 100 ms Wartezeit
+static int probe_due(DWORD t0)
+{
+    static DWORD last;
+    DWORD now = GetTickCount();
+    if (!g_loadprobe || now - t0 <= 100 || now - last < 25) return 0;
+    last = now;
+    return 1;
+}
+
+// Ruhig heisst: kein Thread rechnet in der Pause mehr als 300.000 Takte (etwa 0,1 ms von 2 ms) und keine Leseanfrage
+// ist offen. Vorher galt nur "gar kein Takt": Der Shader-Generator (T13) prueft im Leerlauf jede Millisekunde per
+// Sleep auf Arbeit, die Wartezeit lief deshalb an Szenenanfaengen jedes Mal die vollen 500 ms aus.
+static int io_settled(ULONG64 *prev)
+{
+    static const int idx[] = { 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
+    int i, quiet = 1;
+    for (i = 0; i < (int)(sizeof idx / sizeof idx[0]); i++) {
+        HANDLE h = *(HANDLE *)(0x0102DBE0 + idx[i] * 0xB4 + 0xA8);
+        ULONG64 c = 0;
+        if (h) QueryThreadCycleTime(h, &c);
+        if (c - prev[i] > 300000) quiet = 0;
+        prev[i] = c;
+    }
+    return quiet;
+}
+
 static void wait_io(void)
 {
     DWORD t0 = GetTickCount();
-    ULONG64 prev = io_cycles(), now;
+    ULONG64 prev[12];
     int waited = 0;
+    io_settled(prev);
     for (;;) {
         Sleep(2);
-        now = io_cycles();
-        if (now == prev && !stream_busy()) break;
-        prev = now;
+        if (io_settled(prev) && !stream_busy()) break;
         waited = 1;
         if (GetTickCount() - t0 > 500) { g_io_timeouts++; break; }
+        if (probe_due(t0)) {
+            int k2;
+            for (k2 = 2; k2 <= 13; k2++) thread_probe(k2, "Datei-Threads");
+        }
     }
     if (waited) g_io_waits++;
 }
@@ -1993,6 +2137,10 @@ static void loop_window(void)
             c = bgproc_cycles();
             if (c == last) { if (++idle > 2000) break; } else { idle = 0; last = c; }
             if (GetTickCount() - t0 > 2000) break;
+            if (probe_due(t0)) {
+                thread_probe(15, "Lade-Schleife");
+                thread_probe(3, "Lade-Schleife");
+            }
         }
         if (g_loop_arrivals == a0) break;   // Schleife verlassen
         sig = list_signature(&loading);
@@ -2014,27 +2162,57 @@ static void loop_window(void)
 // nicht und liest nichts (wartet auf den Hauptthread). Rueckgabe 1, wenn gewartet wurde.
 static long g_settle_waits, g_settle_timeouts;
 
+// NuBgProc leert die Lese-Pipeline (0x5637c0: Sleep(1) bei 0x5637eb/0x5638a4, bis alle Puffer zurueck sind), waehrend
+// Leser (T2, 0x567495) und Entpacker (T3, 0x545832) untaetig warten: Dann kommt nichts zurueck, bis der Hauptthread
+// weiterlaeuft. Proben: an Frame 4266 so 266 ms gewartet, bis NuBgProc zufaellig 5 ms nicht aufwachte.
+static long g_settle_drain;
+
+static int pipeline_drain_stalled(void)
+{
+    DWORD r = first_game_ret(15);
+    if (r != 0x005638AA && r != 0x005637F1) return 0;
+    return first_game_ret(3) == 0x00545832 && first_game_ret(2) == 0x00567495 && !stream_busy();
+}
+
 static int bg_settle(void)
 {
     DWORD t0 = GetTickCount();
     ULONG64 last = bgproc_cycles(), c;
     DWORD still = GetTickCount();
-    int waited = 0;
+    int waited = 0, why = 0;
+    DWORD drain_checked = 0, drain_at = 0;
     if (!G_BGPROC) return 0;
     for (;;) {
         int *cur = (int *)G_BGPROC_CURRENT;
         LONG pend = *(volatile LONG *)(G_BGPROC + BGPROC_PENDING);
-        if (*(volatile int *)(G_BGPROC + BGPROC_WAITFRAME)) break;
-        if (!cur && pend <= 0) break;
-        if (g_loop_at_gate) break;
+        if (*(volatile int *)(G_BGPROC + BGPROC_WAITFRAME)) { why = 1; break; }
+        if (!cur && pend <= 0) { why = 2; break; }
+        if (g_loop_at_gate) { why = 3; break; }
         c = bgproc_cycles();
         if (c != last || stream_busy()) { last = c; still = GetTickCount(); }
-        else if (GetTickCount() - still >= 5) break;
-        if (GetTickCount() - t0 > 2000) { g_settle_timeouts++; break; }
+        else if (GetTickCount() - still >= 5) { why = 4; break; }
+        if (GetTickCount() - t0 > 2000) { g_settle_timeouts++; why = 5; break; }
+        if (GetTickCount() - drain_checked >= 3) {
+            drain_checked = GetTickCount();
+            if (!pipeline_drain_stalled()) drain_at = 0;
+            else if (!drain_at) drain_at = drain_checked ? drain_checked : 1;
+            else if (drain_checked - drain_at >= 6) { g_settle_drain++; why = 6; break; }
+        }
+        if (probe_due(t0)) {
+            thread_probe(15, "NuBgProc-Ruhe");
+            thread_probe(3, "NuBgProc-Ruhe");
+            thread_probe(2, "NuBgProc-Ruhe");
+        }
         waited = 1;
         Sleep(0);
     }
     if (waited) g_settle_waits++;
+    if (g_loadprobe && GetTickCount() - t0 > 100) {
+        static const char *whys[] = { "?", "Auftrag wartet auf Frame", "kein Auftrag", "Schleife an der Freigabe", "5 ms Ruhe", "Zeitgrenze",
+                                      "Pipeline leer" };
+        logf_("NuBgProc-Ruhe nach %lu ms: %s", GetTickCount() - t0, whys[why]);
+        thread_probe(15, "Ende"); thread_probe(3, "Ende"); thread_probe(2, "Ende");
+    }
     return waited;
 }
 
@@ -2471,8 +2649,8 @@ static void __cdecl on_frame_end(void)
         if (g_gate) CreateThread(NULL, 0, gate_watch, NULL, 0, NULL);
     }
     if (g_loopgate && F % 3000 == 0)
-        logf_("Lade-Schleife: %ld Fenster, %ld Durchlaeufe, %ld Zeitgrenzen, %ld Selbstfreigaben; NuBgProc-Ruhe: %ld Wartephasen, %ld Zeitgrenzen",
-              g_loop_windows, g_loop_iters, g_loop_timeouts, g_loop_selfrelease, g_settle_waits, g_settle_timeouts);
+        logf_("Lade-Schleife: %ld Fenster, %ld Durchlaeufe, %ld Zeitgrenzen, %ld Selbstfreigaben; NuBgProc-Ruhe: %ld Wartephasen, %ld Zeitgrenzen, %ld mit leerer Pipeline",
+              g_loop_windows, g_loop_iters, g_loop_timeouts, g_loop_selfrelease, g_settle_waits, g_settle_timeouts, g_settle_drain);
     if (g_gate && F % 3000 == 0)
         logf_("Lade-Threads: %ld Fenster, %ld Zeitgrenzen, %ld Freigaben fuer den Hauptthread", g_gate_windows,
               g_gate_timeouts, g_gate_assists);
@@ -2521,7 +2699,24 @@ static void __cdecl on_frame_end(void)
     if (g_net) enforce_fpu("Frame-Ende");
     if (g_vaudio) { LONGLONG t0 = qpc_now(); va_tick(); t0 = qpc_now() - t0; g_wait_ticks += t0; g_wt[1] += t0; }
     if (g_audiolog && F % 600 == 0) audio_log();
-    {   // Diagnose: Frames ueber 100 ms je Wartestelle aufschluesseln (Netz kommt im selben Frame danach)
+    {   // Diagnose: Frames ueber 100 ms je Wartestelle aufschluesseln (Netz kommt im selben Frame danach),
+        // dazu die CPU-Zeit der Spiel-Threads (Tabelle 0x102dbe0: 2 Lesen, 3 Entpacken, 4 Texturen, 5-13 Shader,
+        // 15 NuBgProc, 16/17 Ton) und des Hauptthreads in diesem Frame
+        static ULONG64 tprev[25];
+        static double tsc_per_ms;
+        ULONG64 tcur[25], tc;
+        int ti;
+        if (!tsc_per_ms) {
+            LARGE_INTEGER q0, q1, qf;
+            unsigned __int64 r0 = __rdtsc();
+            QueryPerformanceCounter(&q0); Sleep(20); QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&qf);
+            tsc_per_ms = (double)(__rdtsc() - r0) / ((q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart);
+        }
+        for (ti = 0; ti < 24; ti++) {
+            HANDLE h = *(HANDLE *)(0x0102DBE0 + ti * 0xB4 + 0xA8);
+            tcur[ti] = (h && QueryThreadCycleTime(h, &tc)) ? tc : 0;
+        }
+        tcur[24] = (g_main_thread && QueryThreadCycleTime(g_main_thread, &tc)) ? tc : 0;
         static LONGLONG prev[8], last_end;
         LONGLONG now = qpc_now(), d[8], sum = 0;
         LARGE_INTEGER f;
@@ -2534,14 +2729,24 @@ static void __cdecl on_frame_end(void)
                 logf_("Langer Frame: %lld ms, davon Datei-Threads %lld, Ton %lld, nach Frame-Ende %lld, SaveCore %lld, Lade-Schleife %lld, NuBgProc %lld, Netz %lld",
                       (now - last_end) * 1000 / f.QuadPart, d[0] * 1000 / f.QuadPart, d[1] * 1000 / f.QuadPart, d[2] * 1000 / f.QuadPart,
                       d[3] * 1000 / f.QuadPart, d[4] * 1000 / f.QuadPart, d[5] * 1000 / f.QuadPart, d[6] * 1000 / f.QuadPart);
+            if (n_long <= 400) {
+                char tl[400];
+                int tlen = snprintf(tl, sizeof tl, "  CPU ms:");
+                for (ti = 0; ti < 25; ti++) {
+                    double ms = tprev[ti] && tcur[ti] >= tprev[ti] ? (tcur[ti] - tprev[ti]) / tsc_per_ms : 0;
+                    if (ms >= 5) tlen += snprintf(tl + tlen, sizeof tl - tlen, " %s%d=%.0f", ti == 24 ? "Haupt" : "T", ti == 24 ? 0 : ti, ms);
+                }
+                logf_("%s", tl);
+            }
         }
+        for (ti = 0; ti < 25; ti++) tprev[ti] = tcur[ti];
         last_end = now;
         if (F % 3000 == 0) for (k = 0; k < 8; k++) prev[k] = 0;
     }
     if (g_vaudio && F % 3000 == 0) logf_("Ton: %ld Nachlieferungen abgewartet, %ld Stream-Enden; erste Puffer %ld abgewartet, %ld Zeitgrenzen; "
-                                         "Gleichlauf: %ld Stimmen angehalten, %ld Haenger mit Ton-Pause",
+                                         "Stream-Ende erkannt %ld; Gleichlauf: %ld Stimmen angehalten, %ld Haenger mit Ton-Pause",
                                          g_va_refill_waits, g_va_refill_timeouts, g_va_start_waits, g_va_start_timeouts,
-                                         g_av_holds, g_av_engine_holds);
+                                         g_va_refill_idle, g_av_holds, g_av_engine_holds);
     if (F % 3000 == 0) {
         LARGE_INTEGER f;
         int k;
@@ -2880,6 +3085,7 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_AVSYNC", buf, sizeof buf)) g_avsync = atoi(buf);
     if (GetEnvironmentVariableA("LBO_TESTDESYNC", buf, sizeof buf)) g_test_desync = atol(buf);
     if (GetEnvironmentVariableA("LBO_TESTMEET", buf, sizeof buf)) g_test_meet = atol(buf);
+    if (GetEnvironmentVariableA("LBO_LOADPROBE", buf, sizeof buf)) g_loadprobe = atoi(buf);
     if (GetEnvironmentVariableA("LBO_PAUSE", buf, sizeof buf)) sscanf(buf, "%ld,%d", &g_pause_at, &g_pause_ms);
     if (GetEnvironmentVariableA("LBO_AUDIOLOG", buf, sizeof buf)) g_audiolog = atoi(buf);
     if (GetEnvironmentVariableA("LBO_VAUDIO", buf, sizeof buf)) g_vaudio = atoi(buf);

@@ -33,3 +33,4 @@ void net_schedule_repair(int frame);   // nur Host
 int net_repair_frame(void);            // Host: eigener Plan, Gast: zuletzt angekuendigter (0 = keiner)
 int net_last_desync(void);             // Pruefsummen-Frame der letzten Abweichung dieser Epoche (0 = keine)
 void net_set_frame_offset(long offset);   // fuer das Log: Spiel-Frame = Lockstep-Frame + offset
+void net_set_wait_callback(void (*cb)(unsigned long start));   // waehrend net_frame auf den Partner wartet

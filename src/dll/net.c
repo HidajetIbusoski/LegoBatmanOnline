@@ -73,6 +73,7 @@ static int g_last_desync;              // Pruefsummen-Frame der letzten Abweichu
 static int g_repair_out, g_repair_in;  // Reparatur-Frame: vom Host geplant / vom Host empfangen
 static long g_frame_offset;            // Spiel-Frame = Lockstep-Frame + Versatz (nur fuer das Log)
 static void (*g_log)(const char *fmt, ...);
+static void (*g_wait_cb)(DWORD start);   // wird waehrend des Wartens auf den Partner aufgerufen (LEGO Batman 2: Ton anhalten)
 
 int net_role(void) { return g_role; }
 
@@ -363,6 +364,7 @@ void net_frame(int F, const NETPAD *local_now, NETPAD out[2])
             break;
         }
         if (now - last_send >= 4) { send_inputs(); last_send = now; }
+        if (g_wait_cb) g_wait_cb(start);
         if (now - last_log >= 5000) {
             g_log("Netz: warte seit %lu ms auf Partner-Eingabe fuer Frame %d (bekannt bis %d)", now - start, F, g_remote_upto);
             last_log = now;
@@ -384,6 +386,8 @@ void net_frame(int F, const NETPAD *local_now, NETPAD out[2])
 void net_set_partner_timeout(int ms) { g_partner_timeout_ms = ms; }
 
 void net_set_frame_offset(long offset) { g_frame_offset = offset; }
+
+void net_set_wait_callback(void (*cb)(DWORD start)) { g_wait_cb = cb; }
 
 int net_last_desync(void) { return g_last_desync; }
 

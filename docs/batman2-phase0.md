@@ -369,11 +369,11 @@ Host (dieser PC) und Gast (i5-10400F), Verzögerung 4 Frames, 83.000 Frames (23 
 - *Selbstheilung:* Prüfsumme alle 20 Frames. Bei einer Abweichung plant der Host 40 Frames voraus einen Reparatur-Frame (in jedem Eingabepaket angekündigt), dort übernimmt der Gast die Zustände. Erst nach drei erfolglosen Reparaturen kommt der Hinweis. Im Härtetest (LCG16 mitten im Level verstellt, Reparatur nach 150 Frames) war die Abweichung schon in die Logik gewandert; daher jetzt 20/40 statt 60/90 Frames. Die Reparatur ersetzt nur Zufallszustände, keine Positionen.
 - *Fehlerbericht:* Das Log schreibt jetzt "DESYNC bei Frame N (Spiel-Frame F)", die App schickt die CSV um F (vorher wurde der Netz-Frame als Spiel-Frame gelesen, der Ausschnitt war 17.000 Frames daneben) und die 400 Logzeilen davor.
 
-**Ton vor dem Bild:** Die virtuelle Ton-Uhr läuft einen Frame je 1/60 s, die Lautsprecher in Echtzeit. Unter 60 fps oder bei Hängern lief der echte Ton vor (gemessen bis 1,06 s) und blieb vorn, weil das Spiel Puffer im virtuellen Takt nachreicht. Jetzt folgt er der virtuellen Uhr: Frequenzverhältnis bis 15 % langsamer/10 % schneller (voll ab 75 ms Abstand), ab 150 ms wird die Stimme angehalten, und hängt der Hauptthread über 100 ms, hält `av_watch` die ganze Ausgabe an (`StopEngine`). `LBO_AVLOG=1` protokolliert die Abstände, `LBO_AVSYNC=0` schaltet ab.
+**Ton vor dem Bild:** Die virtuelle Ton-Uhr läuft einen Frame je 1/60 s, die Lautsprecher in Echtzeit. Unter 60 fps oder bei Hängern lief der echte Ton vor (gemessen bis 1,06 s) und blieb vorn, weil das Spiel Puffer im virtuellen Takt nachreicht. Jetzt folgt er der virtuellen Uhr: Frequenzverhältnis bis 15 % langsamer/10 % schneller (voll ab 75 ms Abstand), ab 150 ms wird die Stimme angehalten, bis die virtuelle Uhr aufgeholt hat. Alle Eingriffe macht nur der Hauptthread: Ein Wächter-Thread, der bei Hängern `StopEngine` rief, verklemmte sich mit dem `StartEngine` des Hauptthreads in XAudio2 (N34, Frame 285) und wurde entfernt. Stattdessen hält der Hauptthread selbst alle laufenden Stimmen an, wenn eine Wartestelle der Mod (Laden, Netz) länger als 60 ms dauert, und setzt sie im nächsten Frame fort. `LBO_AVLOG=1` protokolliert die Abstände, `LBO_AVSYNC=0` schaltet ab.
 
 **Hänger:** `Langer Frame`-Zeilen schlüsseln Frames über 100 ms nach Wartestelle auf. Gefunden:
 - SaveCore 0,5 s bei jedem Speichern: zweite Mindestzeit im Speicher-Thread (0x540d6b, `Sleep(100)` bis Zeitgeber +0x10 abgelaufen), jetzt übersprungen wie 0x540e2b.
-- Lade-Schleife/NuBgProc 0,5–1,2 s an Szenen- und Levelanfängen: echtes Nachladen, das für den Gleichlauf in einen Frame fällt. Bleibt; der Ton hält jetzt mit an.
+- Lade-Schleife/NuBgProc 0,5–1,2 s an Szenen- und Levelanfängen: teils echtes Nachladen, teils Leerlauf (siehe unten).
 - Ton 0,2 s am Ende von Musik-Streams (Wartezeit auf eine Nachlieferung, die nicht kommt).
 - Netz bis 1,9 s: der langsamere PC beim Laden.
 
@@ -384,7 +384,7 @@ Host (dieser PC) und Gast (i5-10400F), Verzögerung 4 Frames, 83.000 Frames (23 
 - *Echte Arbeit:* An Szenenanfängen rechnet der Entpacker (T3) 0,4–0,5 s am Stück (Frames 5047, 6326). Das bleibt, solange Laden im Gleichlauf in einem Frame fertig werden muss.
 - *Verklemmung durch den Ton-Gleichlauf (N27, Frame 7610):* `av_sync` rief XAudio2 unter der eigenen Sperre auf, während XAudio2 aus seinem Thread einen Rückruf des Spiels ausführte, der dieselbe Sperre brauchte. Jetzt ruft kein Pfad XAudio2 unter `g_va_cs` auf; `a_destroy` wartet, solange `av_sync` die Stimme abfragt.
 
-Ergebnis N31 (ohne Zittern) gegen N26: Stillstand nach dem Start 4,8 s statt 6,4 s, alle 10.619 Frames ab dem Levelstart gleich.
+Ergebnis N35 (ohne Zittern) gegen N26: Stillstand nach dem Start 4,3 s statt 6,4 s, Frames über 150 ms 9 statt 22, alle Frames ab dem Levelstart gleich. N36 (Gast mit 20 ms Zittern, etwa 45 fps): 0 Desyncs, Ton höchstens 218 ms neben der virtuellen Uhr.
 
 Testschalter: `LBO_TESTDESYNC=N` verstellt beim Gast den LCG16 bei Netz-Frame N, `LBO_TESTMEET=N` löst bei N eine Schranke wie nach dem Laden aus.
 

@@ -984,8 +984,7 @@ static HRESULT STDMETHODCALLTYPE h_create_src(void *xa, void **out, const WAVEFO
     return hr;
 }
 
-static void *g_xa;   // IXAudio2 des Spiels (Vtable 11 StartEngine, 12 StopEngine)
-static DWORD WINAPI av_watch(void *arg);
+static void *g_xa;   // IXAudio2 des Spiels
 
 static HRESULT WINAPI hook_cocreate(REFCLSID clsid, LPUNKNOWN outer, DWORD ctx, REFIID riid, LPVOID *out)
 {
@@ -993,7 +992,6 @@ static HRESULT WINAPI hook_cocreate(REFCLSID clsid, LPUNKNOWN outer, DWORD ctx, 
     if ((g_audiolog || g_vaudio) && SUCCEEDED(hr) && out && *out && IsEqualGUID(riid, &IID_XAudio2_) && !real_create_src) {
         hook_slot(&(*(void ***)*out)[8], (void *)h_create_src, (void **)&real_create_src);
         g_xa = *out;
-        if (g_vaudio) CreateThread(NULL, 0, av_watch, NULL, 0, NULL);
         logf_("Ton: IXAudio2 %p, CreateSourceVoice gehakt", *out);
     }
     return hr;
@@ -1147,13 +1145,13 @@ static void va_wait_first_buffers(void)
 // Laeuft das Spiel langsamer als 60 fps oder haengt es, lief der echte Ton vor (Messung: bis 0,8 s) und blieb vorn,
 // weil das Spiel neue Puffer im virtuellen Takt nachreicht. In Zwischensequenzen passten Stimme und Mund dann nicht.
 // Jetzt folgt der echte Ton der virtuellen Uhr: kleine Abstaende per Frequenzverhaeltnis (hoechstens 15 % langsamer,
-// 10 % schneller, voll ab 75 ms), ab 150 ms Vorlauf wird die Stimme angehalten. Haengt der Hauptthread laenger als 100 ms, haelt
-// av_watch den ganzen Ton an. LBO_AVSYNC=0 schaltet das ab, LBO_AVLOG=1 protokolliert die Abstaende.
+// 10 % schneller, voll ab 75 ms), ab 150 ms Vorlauf wird die Stimme angehalten, bis die Uhr aufgeholt hat (nach einem
+// Haenger stockt der Ton also kurz). Alle Eingriffe macht nur der Hauptthread: Ein eigener Waechter-Thread mit
+// StopEngine/StartEngine verklemmte sich mit dem Hauptthread in XAudio2 (Test N34, Frame 285).
+// LBO_AVSYNC=0 schaltet das ab, LBO_AVLOG=1 protokolliert die Abstaende.
 static int g_avlog, g_avsync = 1;
 static double g_av_last[64];
-static volatile LONG g_engine_held;
-static volatile DWORD g_va_last_tick;
-static long g_av_holds, g_av_engine_holds;
+static long g_av_holds;
 
 // XAudio2 wird hier nie unter g_va_cs aufgerufen: XAudio2 ruft aus seinem Ton-Thread Rueckrufe des Spiels auf, die
 // GetState (also g_va_cs) brauchen, waehrend es seine eigene Sperre haelt. Mit beiden Sperren in umgekehrter Reihenfolge
@@ -1212,17 +1210,47 @@ static void av_sync(void)
     }
 }
 
-// Haengt der Hauptthread (Laden, Warten auf den Mitspieler), steht auch die virtuelle Uhr: den Ton mit anhalten
-static DWORD WINAPI av_watch(void *arg)
+// Haenger: Dauert eine Wartestelle der Mod (Laden, Netz) laenger als 60 ms, haelt der Hauptthread selbst alle laufenden
+// Stimmen an, va_tick setzt sie im naechsten Frame fort. So steht der Ton mit dem Bild, statt vorzulaufen. Nur der
+// Hauptthread ruft dafuer XAudio2 (ein eigener Waechter-Thread verklemmte sich mit ihm, siehe av_sync).
+static int g_av_paused;
+static void *g_av_paused_voice[64];
+static long g_av_hitch_pauses;
+
+static void av_hitch(DWORD start)
 {
-    (void)arg;
-    for (;;) {
-        Sleep(5);
-        if (!g_xa || !g_avsync || !g_va_last_tick) continue;
-        if (GetTickCount() - g_va_last_tick > 100 && InterlockedCompareExchange(&g_engine_held, 1, 0) == 0) {
-            ((void (STDMETHODCALLTYPE *)(void *))(*(void ***)g_xa)[12])(g_xa);   // StopEngine
-            g_av_engine_holds++;
-        }
+    int i, n = 0;
+    void *list[64];
+    if (!g_vaudio || !g_avsync || g_av_paused || GetCurrentThreadId() != g_main_tid || GetTickCount() - start < 60) return;
+    EnterCriticalSection(&g_va_cs);
+    for (i = 0; i < 64; i++) {
+        VA_VOICE *a = &g_va[i];
+        if (a->voice && a->cb && a->running && !a->held) { a->held = 1; list[n++] = a->voice; }
+    }
+    LeaveCriticalSection(&g_va_cs);
+    for (i = 0; i < n; i++) { g_av_inuse = list[i]; real_vstop(list[i], 0, 0); g_av_paused_voice[i] = list[i]; }
+    g_av_inuse = NULL;
+    for (; i < 64; i++) g_av_paused_voice[i] = NULL;
+    g_av_paused = 1;
+    g_av_hitch_pauses++;
+}
+
+static void av_hitch_resume(void)
+{
+    int i, k;
+    if (!g_av_paused) return;
+    g_av_paused = 0;
+    for (k = 0; k < 64 && g_av_paused_voice[k]; k++) {
+        void *v = g_av_paused_voice[k];
+        int go = 0;
+        g_av_paused_voice[k] = NULL;
+        EnterCriticalSection(&g_va_cs);
+        for (i = 0; i < 64; i++)
+            if (g_va[i].voice == v && g_va[i].held && g_va[i].running) { g_va[i].held = 0; go = 1; }
+        if (go) g_av_inuse = v;
+        LeaveCriticalSection(&g_va_cs);
+        if (go) real_vstart(v, 0, 0);
+        g_av_inuse = NULL;
     }
 }
 
@@ -1230,9 +1258,7 @@ static void va_tick(void)
 {
     static VA_EVENT ev[1024];
     int nev = 0, i, k;
-    g_va_last_tick = GetTickCount();
-    if (InterlockedCompareExchange(&g_engine_held, 0, 1) == 1)
-        ((HRESULT (STDMETHODCALLTYPE *)(void *))(*(void ***)g_xa)[11])(g_xa);   // StartEngine
+    av_hitch_resume();
     va_wait_first_buffers();
     EnterCriticalSection(&g_va_cs);
     for (i = 0; i < 64; i++) {
@@ -1765,6 +1791,7 @@ static void wait_io(void)
         if (io_settled(prev) && !stream_busy()) break;
         waited = 1;
         if (GetTickCount() - t0 > 500) { g_io_timeouts++; break; }
+        av_hitch(t0);
         if (probe_due(t0)) {
             int k2;
             for (k2 = 2; k2 <= 13; k2++) thread_probe(k2, "Datei-Threads");
@@ -2137,6 +2164,7 @@ static void loop_window(void)
             c = bgproc_cycles();
             if (c == last) { if (++idle > 2000) break; } else { idle = 0; last = c; }
             if (GetTickCount() - t0 > 2000) break;
+            av_hitch(t0);
             if (probe_due(t0)) {
                 thread_probe(15, "Lade-Schleife");
                 thread_probe(3, "Lade-Schleife");
@@ -2192,6 +2220,7 @@ static int bg_settle(void)
         if (c != last || stream_busy()) { last = c; still = GetTickCount(); }
         else if (GetTickCount() - still >= 5) { why = 4; break; }
         if (GetTickCount() - t0 > 2000) { g_settle_timeouts++; why = 5; break; }
+        av_hitch(t0);
         if (GetTickCount() - drain_checked >= 3) {
             drain_checked = GetTickCount();
             if (!pipeline_drain_stalled()) drain_at = 0;
@@ -2746,7 +2775,7 @@ static void __cdecl on_frame_end(void)
     if (g_vaudio && F % 3000 == 0) logf_("Ton: %ld Nachlieferungen abgewartet, %ld Stream-Enden; erste Puffer %ld abgewartet, %ld Zeitgrenzen; "
                                          "Stream-Ende erkannt %ld; Gleichlauf: %ld Stimmen angehalten, %ld Haenger mit Ton-Pause",
                                          g_va_refill_waits, g_va_refill_timeouts, g_va_start_waits, g_va_start_timeouts,
-                                         g_va_refill_idle, g_av_holds, g_av_engine_holds);
+                                         g_va_refill_idle, g_av_holds, g_av_hitch_pauses);
     if (F % 3000 == 0) {
         LARGE_INTEGER f;
         int k;
@@ -3107,7 +3136,8 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_RNGRESET", buf, sizeof buf)) g_rng_reset = atoi(buf);
     // Netzmodus: alle Schalter, die den Ablauf deterministisch machen, sind Pflicht (docs/batman2-phase0.md)
     g_net = net_init(logf_);
-    if (g_net) net_set_partner_timeout(30000);   // danach alleine weiter statt endlos einfrieren
+    if (g_net) net_set_partner_timeout(30000);
+    if (g_net) net_set_wait_callback(av_hitch);   // danach alleine weiter statt endlos einfrieren
     if (g_net) {
         g_mode = MODE_SCRIPT;
         g_connected[0] = g_connected[1] = 1;

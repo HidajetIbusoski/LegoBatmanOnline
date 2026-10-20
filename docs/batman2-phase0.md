@@ -338,6 +338,10 @@ Weitere Befunde (Fortsetzung):
 
 **Netzmodus:** `LOOPGATE`, `IOWAIT` und `NODINPUT` sind jetzt fest an, `LBO_LOADSLOW` entfällt.
 
+**Stand 20.10.2026 (Paartest schnell gegen verzögert, je 31.000 Frames, `LBO_SLOWSTART=320`):** Mit dem aktuellen Stand waren 4 von 5 vollen Paaren (F34, F35, F37, F38) in allen Logikwerten gleich: Zufallsgeneratoren, Figuren, Positionen beider Spieler, Levelanker. Einzelne LCG-Abweichungen in nur einem Frame (7610, 20398) sind Momentaufnahmen, während ein Hintergrund-Auftrag zieht; ab dem nächsten Frame ist der LCG wieder gleich.
+
+Offen (F36, reproduzierbar mit denselben Werten): `rng_a` kippt bei 14681. Dort feuert ein Ereignis-Handler (`0x4747a0` → `0x433790` → `0x74bb30`) in der schnellen Instanz einmal mehr. Vorläufer: Bei 9530 ist der Stream-Merker `0x1360b44/45` (gesetzt u. a. von `0x614140`) in der schnellen Instanz 1, in der verzögerten 0. Ab 9538 weicht die Animationszeit `0x1389120` ab, ab 9552 die Kamera der Zwischensequenz in der letzten Stelle. Ein Schreib-Wächter auf `0x1360b44` fand in vier weiteren Läufen keinen Schreibzugriff im Fenster 9520–9540.
+
 
 Die Zählung nach dem Anker taugt erst, wenn der Vorlauf gleich ist: Mit unterschiedlichem Vorlauf weichen auch nach dem Rücksetzen der Zufallszustände die geladenen Daten ab.
 

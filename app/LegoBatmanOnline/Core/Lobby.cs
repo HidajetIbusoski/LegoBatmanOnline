@@ -825,18 +825,21 @@ public sealed class Lobby : Bindable
         try
         {
             var log = ReadShared(Path.Combine(logDir, "lbo.log"));
-            var m = System.Text.RegularExpressions.Regex.Match(log, @"DESYNC bei Frame (\d+)");
+            // Neuere DLL: "DESYNC bei Frame <Lockstep> (Spiel-Frame <F>)"; frames.csv zaehlt Spiel-Frames
+            var m = System.Text.RegularExpressions.Regex.Match(log, @"DESYNC bei Frame (\d+)(?: \(Spiel-Frame (\d+)\))?");
             if (!m.Success || PubOf(peer.Id) is not { } pub) return;
-            int f0 = int.Parse(m.Groups[1].Value);
+            int f0 = int.Parse(m.Groups[2].Success ? m.Groups[2].Value : m.Groups[1].Value);
             var csvLines = ReadShared(Path.Combine(logDir, "frames.csv")).Split('\n');
             var rows = new List<string> { csvLines[0].TrimEnd('\r') };
             foreach (var l in csvLines.Skip(1))
             {
                 var comma = l.IndexOf(',');
-                if (comma > 0 && int.TryParse(l[..comma], out var f) && f >= f0 - 300 && f <= f0 + 60) rows.Add(l.TrimEnd('\r'));
+                if (comma > 0 && int.TryParse(l[..comma], out var f) && f >= f0 - 600 && f <= f0 + 120) rows.Add(l.TrimEnd('\r'));
             }
-            var logLines = log.Split('\n').Select(l => l.TrimEnd('\r'));
-            var excerpt = logLines.Where(l => !l.Contains("DESYNC")).Take(300)
+            // Die 400 Zeilen vor der ersten Abweichung und die ersten Abweichungen selbst
+            var logLines = log.Split('\n').Select(l => l.TrimEnd('\r')).ToList();
+            int first = logLines.FindIndex(l => l.Contains("DESYNC"));
+            var excerpt = logLines.Take(first < 0 ? logLines.Count : first).TakeLast(400)
                 .Concat(logLines.Where(l => l.Contains("DESYNC")).Take(5));
             string cfg = "", cpu = "";
             try { cfg = File.ReadAllText(Path.Combine(Path.GetDirectoryName(GameBridge.SaveDir)!, "pcconfig.txt")); } catch { }

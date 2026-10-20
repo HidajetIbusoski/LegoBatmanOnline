@@ -127,6 +127,8 @@ Wichtig waehrend des Spiels
   Mitspieler; kommt nichts mehr, erscheint ein Hinweis und du spielst alleine
   weiter (Spieler 2 steht dann still).
 - Die App waehrend des Spiels offen lassen.
+- Batman 2: Kleine Abweichungen (z. B. nach einem Ladebildschirm) gleicht die
+  Mod selbst aus, ihr merkt davon hoechstens einen kurzen Ruck.
 - Erscheint "Eure Spiele laufen nicht mehr synchron": Der Einladende speichert
   (falls gewuenscht), beide beenden das Spiel und starten in der App neu mit
   "Zusammen spielen". Die App schickt die Fehlerdaten automatisch an den

@@ -727,6 +727,11 @@ typedef struct {
     int dry;         // laeuft ohne Daten und es kommt nichts mehr (Stream-Ende oder Zeitgrenze)
     double pos;
     UINT64 played;
+    // Ton-Gleichlauf (av_sync): exakte virtuelle und echte Samples, Korrekturfaktor, von uns angehalten
+    double vtot, rtot;
+    UINT64 rlast;
+    float corr, maxr;
+    int held;
     VA_BUF q[64];
 } VA_VOICE;
 static VA_VOICE g_va[64];
@@ -764,7 +769,7 @@ static HRESULT STDMETHODCALLTYPE a_start(void *v, UINT32 f, UINT32 o)
 {
     VA_VOICE *a;
     InterlockedIncrement(&g_a_start);
-    if (g_vaudio) { EnterCriticalSection(&g_va_cs); if ((a = va_find(v)) != NULL) a->running = 1; LeaveCriticalSection(&g_va_cs); }
+    if (g_vaudio) { EnterCriticalSection(&g_va_cs); if ((a = va_find(v)) != NULL) { a->running = 1; a->held = 0; } LeaveCriticalSection(&g_va_cs); }
     return real_vstart(v, f, o);
 }
 
@@ -772,7 +777,7 @@ static HRESULT STDMETHODCALLTYPE a_stop(void *v, UINT32 f, UINT32 o)
 {
     VA_VOICE *a;
     InterlockedIncrement(&g_a_stop);
-    if (g_vaudio) { EnterCriticalSection(&g_va_cs); if ((a = va_find(v)) != NULL) a->running = 0; LeaveCriticalSection(&g_va_cs); }
+    if (g_vaudio) { EnterCriticalSection(&g_va_cs); if ((a = va_find(v)) != NULL) { a->running = 0; a->held = 0; } LeaveCriticalSection(&g_va_cs); }
     return real_vstop(v, f, o);
 }
 
@@ -835,8 +840,19 @@ static HRESULT STDMETHODCALLTYPE a_exitloop(void *v, UINT32 o)
 static HRESULT STDMETHODCALLTYPE a_setratio(void *v, float r, UINT32 o)
 {
     VA_VOICE *a;
-    if (g_vaudio) { EnterCriticalSection(&g_va_cs); if ((a = va_find(v)) != NULL) a->ratio = r; LeaveCriticalSection(&g_va_cs); }
-    return real_vsetratio(v, r, o);
+    float k = 1.0f;
+    if (g_vaudio) { EnterCriticalSection(&g_va_cs); if ((a = va_find(v)) != NULL) { a->ratio = r; k = a->corr; } LeaveCriticalSection(&g_va_cs); }
+    return real_vsetratio(v, r * k, o);
+}
+
+typedef void (STDMETHODCALLTYPE *VGetRatioFn)(void *, float *);
+static VGetRatioFn real_vgetratio;
+
+static void STDMETHODCALLTYPE a_getratio(void *v, float *r)
+{
+    VA_VOICE *a;
+    real_vgetratio(v, r);
+    if (g_vaudio && r) { EnterCriticalSection(&g_va_cs); if ((a = va_find(v)) != NULL) *r = a->ratio; LeaveCriticalSection(&g_va_cs); }
 }
 
 static void STDMETHODCALLTYPE a_destroy(void *v)
@@ -928,6 +944,7 @@ static HRESULT STDMETHODCALLTYPE h_create_src(void *xa, void **out, const WAVEFO
             hook_slot(&vt[25], (void *)a_getstate, (void **)&real_vgetstate);
             hook_slot(&vt[24], (void *)a_exitloop, (void **)&real_vexitloop);
             hook_slot(&vt[26], (void *)a_setratio, (void **)&real_vsetratio);
+            hook_slot(&vt[27], (void *)a_getratio, (void **)&real_vgetratio);
             logf_("Ton: Stimmen-Vtable %p gehakt", (void *)vt);
         }
         if (g_vaudio && fmt) {
@@ -945,6 +962,8 @@ static HRESULT STDMETHODCALLTYPE h_create_src(void *xa, void **out, const WAVEFO
                 a->tag = fmt->wFormatTag;
                 a->spb = (fmt->wFormatTag == 2 && fmt->cbSize >= 2) ? *(const WORD *)((const BYTE *)fmt + 20) : 0;
                 a->ratio = 1.0f;
+                a->corr = 1.0f;
+                a->maxr = maxr > 0 ? maxr : 2.0f;
                 if (g_a_voices <= 20)
                     logf_("Ton: Stimme %p Format %u, %u Hz, %u Kanaele, Block %u, Rueckruf %p (%s, Aufruf %08lx)", *out, a->tag, a->rate,
                           a->channels, a->align, cb, GetCurrentThreadId() == g_main_tid ? "Hauptthread" : "anderer Thread",
@@ -957,11 +976,16 @@ static HRESULT STDMETHODCALLTYPE h_create_src(void *xa, void **out, const WAVEFO
     return hr;
 }
 
+static void *g_xa;   // IXAudio2 des Spiels (Vtable 11 StartEngine, 12 StopEngine)
+static DWORD WINAPI av_watch(void *arg);
+
 static HRESULT WINAPI hook_cocreate(REFCLSID clsid, LPUNKNOWN outer, DWORD ctx, REFIID riid, LPVOID *out)
 {
     HRESULT hr = real_cocreate(clsid, outer, ctx, riid, out);
     if ((g_audiolog || g_vaudio) && SUCCEEDED(hr) && out && *out && IsEqualGUID(riid, &IID_XAudio2_) && !real_create_src) {
         hook_slot(&(*(void ***)*out)[8], (void *)h_create_src, (void **)&real_create_src);
+        g_xa = *out;
+        if (g_vaudio) CreateThread(NULL, 0, av_watch, NULL, 0, NULL);
         logf_("Ton: IXAudio2 %p, CreateSourceVoice gehakt", *out);
     }
     return hr;
@@ -1056,10 +1080,75 @@ static void va_wait_first_buffers(void)
     }
 }
 
+// Ton-Gleichlauf: Das Spiel sieht nur die virtuelle Uhr (ein Frame = 1/60 s), die Lautsprecher spielen in Echtzeit.
+// Laeuft das Spiel langsamer als 60 fps oder haengt es, lief der echte Ton vor (Messung: bis 0,8 s) und blieb vorn,
+// weil das Spiel neue Puffer im virtuellen Takt nachreicht. In Zwischensequenzen passten Stimme und Mund dann nicht.
+// Jetzt folgt der echte Ton der virtuellen Uhr: kleine Abstaende per Frequenzverhaeltnis (hoechstens 15 % langsamer,
+// 10 % schneller, voll ab 75 ms), ab 150 ms Vorlauf wird die Stimme angehalten. Haengt der Hauptthread laenger als 100 ms, haelt
+// av_watch den ganzen Ton an. LBO_AVSYNC=0 schaltet das ab, LBO_AVLOG=1 protokolliert die Abstaende.
+static int g_avlog, g_avsync = 1;
+static double g_av_last[64];
+static volatile LONG g_engine_held;
+static volatile DWORD g_va_last_tick;
+static long g_av_holds, g_av_engine_holds;
+
+static void av_sync(void)
+{
+    int i;
+    for (i = 0; i < 64; i++) {
+        VA_VOICE *a = &g_va[i];
+        XA_STATE st;
+        double ahead, rate;
+        float corr;
+        if (!a->voice || !a->cb || !a->running || !a->rate) continue;
+        memset(&st, 0, sizeof st);
+        real_vgetstate(a->voice, &st);
+        // Echte Samples zaehlen ab dem Ende eines Streams neu: dann neu ansetzen
+        if (st.SamplesPlayed < a->rlast) a->rtot = a->vtot;
+        else a->rtot += (double)(st.SamplesPlayed - a->rlast);
+        a->rlast = st.SamplesPlayed;
+        rate = a->rate * (a->ratio > 0 ? a->ratio : 1.0);
+        ahead = (a->rtot - a->vtot) * 1000.0 / rate;   // positiv: echter Ton ist vorn
+        if (!g_avsync) corr = 1.0f;
+        else if (ahead > 15) corr = (float)(1.0 - (ahead - 15 > 60 ? 60 : ahead - 15) / 400.0);
+        else if (ahead < -15) corr = (float)(1.0 + (-ahead - 15 > 40 ? 40 : -ahead - 15) / 400.0);
+        else corr = 1.0f;
+        if (corr * a->ratio > a->maxr) corr = a->maxr / (a->ratio > 0 ? a->ratio : 1.0f);
+        if (corr - a->corr > 0.004f || a->corr - corr > 0.004f) {
+            a->corr = corr;
+            real_vsetratio(a->voice, a->ratio * corr, 0);
+        }
+        if (g_avsync && !a->held && ahead > 150 && st.BuffersQueued) { real_vstop(a->voice, 0, 0); a->held = 1; g_av_holds++; }
+        else if (a->held && ahead < 20) { real_vstart(a->voice, 0, 0); a->held = 0; }
+        if (g_avlog && (ahead - g_av_last[i] > 20 || g_av_last[i] - ahead > 20)) {
+            logf_("Ton-Abstand: Stimme %d (%u Hz, %u Kan.) echter Ton %+.0f ms vorn, Faktor %.3f%s, Puffer %d/%u",
+                  i, a->rate, a->channels, ahead, a->corr, a->held ? ", angehalten" : "", a->n, st.BuffersQueued);
+            g_av_last[i] = ahead;
+        }
+    }
+}
+
+// Haengt der Hauptthread (Laden, Warten auf den Mitspieler), steht auch die virtuelle Uhr: den Ton mit anhalten
+static DWORD WINAPI av_watch(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        Sleep(5);
+        if (!g_xa || !g_avsync || !g_va_last_tick) continue;
+        if (GetTickCount() - g_va_last_tick > 100 && InterlockedCompareExchange(&g_engine_held, 1, 0) == 0) {
+            ((void (STDMETHODCALLTYPE *)(void *))(*(void ***)g_xa)[12])(g_xa);   // StopEngine
+            g_av_engine_holds++;
+        }
+    }
+}
+
 static void va_tick(void)
 {
     static VA_EVENT ev[1024];
     int nev = 0, i, k;
+    g_va_last_tick = GetTickCount();
+    if (InterlockedCompareExchange(&g_engine_held, 0, 1) == 1)
+        ((HRESULT (STDMETHODCALLTYPE *)(void *))(*(void ***)g_xa)[11])(g_xa);   // StartEngine
     va_wait_first_buffers();
     EnterCriticalSection(&g_va_cs);
     for (i = 0; i < 64; i++) {
@@ -1072,10 +1161,10 @@ static void va_tick(void)
             VA_BUF *e = &a->q[a->head];
             double rem;
             if (!e->started) { e->started = 1; ev[nev].cb = a->cb; ev[nev].kind = 3; ev[nev++].ctx = e->ctx; }
-            if (e->infinite) { a->pos += budget; a->played += (UINT64)budget; break; }
+            if (e->infinite) { a->pos += budget; a->played += (UINT64)budget; a->vtot += budget; break; }
             rem = (double)e->samples - a->pos;
-            if (rem > budget) { a->pos += budget; a->played += (UINT64)budget; break; }
-            if (rem > 0) { budget -= rem; a->played += (UINT64)rem; }
+            if (rem > budget) { a->pos += budget; a->played += (UINT64)budget; a->vtot += budget; break; }
+            if (rem > 0) { budget -= rem; a->played += (UINT64)rem; a->vtot += rem; }
             ev[nev].cb = a->cb; ev[nev].kind = 4; ev[nev++].ctx = e->ctx;
             if (e->flags & 0x40) { ev[nev].cb = a->cb; ev[nev].kind = 2; ev[nev++].ctx = NULL; a->dry = 1; }   // END_OF_STREAM
             else if (e->samples) { a->pend_be++; if (a->streaming && a->rate >= 44100) a->owed++; }
@@ -1084,6 +1173,7 @@ static void va_tick(void)
             a->pos = 0;
         }
     }
+    if (g_avsync || g_avlog) av_sync();
     LeaveCriticalSection(&g_va_cs);
     if (!nev) return;
     g_va_events += nev;
@@ -1231,6 +1321,36 @@ static void net_sync_point(long F, const char *what)
         if (got != F) logf_("Netz: Abgleich %s bei Frame %ld passt nicht (Host-Frame %d)", what, F, got);
     }
     logf_("Netz: Abgleich %s bei Frame %ld", what, F);
+}
+
+// Selbstheilung: Zaehler der Reparaturen in diesem Vorfall, Lockstep-Frame der letzten, zuletzt gesehene Abweichung
+static int g_repairs, g_last_repair, g_repair_done, g_seen_desync;
+static long g_test_desync;   // LBO_TESTDESYNC=<Lockstep-Frame> (Test): dort den LCG16 verstellen wie im Playtest
+static long g_test_meet;     // LBO_TESTMEET=<Lockstep-Frame> (Test): dort eine Schranke wie nach dem Laden
+
+// Schranke mit Zustand vom Host (Levelstart und nach jedem Ladevorgang). Danach zaehlt der Lockstep ab F neu.
+static void net_meet(long F, const char *what)
+{
+    SYNCSTATE s, mine;
+    int ok, i;
+    if (net_partner_lost()) return;
+    sync_capture(&mine);
+    s = mine;
+    g_in_wait = 1;
+    ok = net_barrier((int)F, &s, sizeof s, 120000);
+    g_in_wait = 0;
+    if (ok && net_role() == 1) {
+        char diff[200] = "";
+        int len = 0;
+        for (i = 0; i < 7; i++)
+            if (s.rng[i] != mine.rng[i]) len += snprintf(diff + len, sizeof diff - len, " rng%d %08x->%08x", i, mine.rng[i], s.rng[i]);
+        if (len) logf_("Netz: Zustand wich vor der Schranke ab:%s", diff);
+        sync_apply(&s);
+    }
+    g_anchor = F;
+    net_set_frame_offset(F - 1);
+    g_repairs = g_last_repair = g_repair_done = g_seen_desync = 0;
+    logf_("Netz: Schranke %s bei Frame %ld", what, F);
 }
 
 // Im Netzmodus darf das Spiel nur die beiden Lockstep-Pads sehen. 0x63b6f0 (this, Geraet, Ausgabe) liest
@@ -1549,6 +1669,8 @@ static void patch_savecore(void)
 {
     if (*(WORD *)0x005410C1 == 0x646A) patch_byte(0x005410C2, 0x64, 1);      // push 100 -> push 1
     if (*(WORD *)0x00540E2B == 0x117B) patch_byte(0x00540E2B, 0x7B, 0xEB);   // jnp -> jmp: keine Mindestzeit
+    // Zweite Mindestzeit (Zeitgeber +0x10, je Runde Sleep 100): kostete im Playtest bei jedem Speichern 0,5 s Stillstand
+    if (*(WORD *)0x00540D6B == 0x067B) patch_byte(0x00540D6B, 0x7B, 0xEB);
 }
 
 // Alle Streaming-Eintraege im Uebergang, auch Entladen: laedt (2), entlaedt (5), gewuenscht aber leer (1),
@@ -2399,8 +2521,27 @@ static void __cdecl on_frame_end(void)
     if (g_net) enforce_fpu("Frame-Ende");
     if (g_vaudio) { LONGLONG t0 = qpc_now(); va_tick(); t0 = qpc_now() - t0; g_wait_ticks += t0; g_wt[1] += t0; }
     if (g_audiolog && F % 600 == 0) audio_log();
-    if (g_vaudio && F % 3000 == 0) logf_("Ton: %ld Nachlieferungen abgewartet, %ld Stream-Enden; erste Puffer %ld abgewartet, %ld Zeitgrenzen",
-                                         g_va_refill_waits, g_va_refill_timeouts, g_va_start_waits, g_va_start_timeouts);
+    {   // Diagnose: Frames ueber 100 ms je Wartestelle aufschluesseln (Netz kommt im selben Frame danach)
+        static LONGLONG prev[8], last_end;
+        LONGLONG now = qpc_now(), d[8], sum = 0;
+        LARGE_INTEGER f;
+        int k;
+        QueryPerformanceFrequency(&f);
+        for (k = 0; k < 7; k++) { d[k] = g_wt[k] - prev[k]; prev[k] = g_wt[k]; sum += d[k]; }
+        if (last_end && (now - last_end) * 1000 / f.QuadPart > 100) {
+            static long n_long;
+            if (n_long++ < 400)
+                logf_("Langer Frame: %lld ms, davon Datei-Threads %lld, Ton %lld, nach Frame-Ende %lld, SaveCore %lld, Lade-Schleife %lld, NuBgProc %lld, Netz %lld",
+                      (now - last_end) * 1000 / f.QuadPart, d[0] * 1000 / f.QuadPart, d[1] * 1000 / f.QuadPart, d[2] * 1000 / f.QuadPart,
+                      d[3] * 1000 / f.QuadPart, d[4] * 1000 / f.QuadPart, d[5] * 1000 / f.QuadPart, d[6] * 1000 / f.QuadPart);
+        }
+        last_end = now;
+        if (F % 3000 == 0) for (k = 0; k < 8; k++) prev[k] = 0;
+    }
+    if (g_vaudio && F % 3000 == 0) logf_("Ton: %ld Nachlieferungen abgewartet, %ld Stream-Enden; erste Puffer %ld abgewartet, %ld Zeitgrenzen; "
+                                         "Gleichlauf: %ld Stimmen angehalten, %ld Haenger mit Ton-Pause",
+                                         g_va_refill_waits, g_va_refill_timeouts, g_va_start_waits, g_va_start_timeouts,
+                                         g_av_holds, g_av_engine_holds);
     if (F % 3000 == 0) {
         LARGE_INTEGER f;
         int k;
@@ -2408,8 +2549,8 @@ static void __cdecl on_frame_end(void)
         int len;
         QueryPerformanceFrequency(&f);
         len = snprintf(line, sizeof line, "Wartezeit je Frame (ms, letzte 3000):");
-        for (k = 0; k < 6; k++) { len += snprintf(line + len, sizeof line - len, " %d=%.2f", k, g_wt[k] * 1000.0 / f.QuadPart / 3000); g_wt[k] = 0; }
-        logf_("%s (0 Datei-Threads, 1 Ton, 2 Datei-Threads nach Frame-Ende, 3 SaveCore, 4 Lade-Schleife, 5 NuBgProc)", line);
+        for (k = 0; k < 7; k++) { len += snprintf(line + len, sizeof line - len, " %d=%.2f", k, g_wt[k] * 1000.0 / f.QuadPart / 3000); g_wt[k] = 0; }
+        logf_("%s (0 Datei-Threads, 1 Ton, 2 Datei-Threads nach Frame-Ende, 3 SaveCore, 4 Lade-Schleife, 5 NuBgProc, 6 Netz)", line);
     }
     if (g_iowait && F % 3000 == 0) logf_("Datei-Threads: %ld Wartephasen, %ld Zeitgrenzen; SaveCore: %ld Wartephasen, %ld Zeitgrenzen",
                                          g_io_waits, g_io_timeouts, g_save_waits, g_save_timeouts);
@@ -2423,26 +2564,60 @@ static void __cdecl on_frame_end(void)
     if (g_rng_reset && F == g_rng_reset) reset_rng();
     if (g_net && F == SYNC_EARLY_FRAME) net_sync_point(F, "nach dem Start");
     if (g_anchor_mode && g_anchor < 0 && G_CHAR_COUNT > 2) {
+        // Schranke am Levelstart: Vorher duerfen die Frames durch Ladezeiten leicht auseinanderliegen.
+        // Der Gast uebernimmt den Zustand des Hosts, danach zaehlt der Lockstep ab dem Anker neu.
         g_anchor = F;
-        if (g_net) {
-            // Schranke am Levelstart: Vorher duerfen die Frames durch Ladezeiten leicht auseinanderliegen.
-            // Der Gast uebernimmt den Zustand des Hosts, danach zaehlt der Lockstep ab dem Anker neu.
-            SYNCSTATE s;
-            if (net_role() == 0) sync_capture(&s);
-            int ok;
-            g_in_wait = 1;
-            ok = net_barrier((int)F, &s, sizeof s, 120000);
-            g_in_wait = 0;
-            if (ok && net_role() == 1) sync_apply(&s);
-        } else reset_rng();
+        if (g_net) net_meet(F, "am Levelstart");
+        else reset_rng();
         logf_("Levelanker bei Frame %ld", F);
+    }
+    // Schranke nach jedem Ladevorgang: Ein Ladebildschirm laeuft je nach PC verschieden viele Bilder und zieht
+    // dabei Zufall (Playtest 20.10.2026: nach dem Levelwechsel bei Spiel-Frame 74.300 wich der LCG16 ab, gut
+    // 8.000 Frames spaeter alles). Faellt die Figurenzahl auf 0 und ist das Laden danach 30 Frames lang ruhig,
+    // treffen sich beide Seiten, und der Gast uebernimmt die Zustaende des Hosts.
+    if (g_net && g_anchor >= 0 && g_test_meet && F - g_anchor + 1 == g_test_meet) { g_test_meet = 0; net_meet(F, "(Test)"); }
+    if (g_net && g_anchor >= 0) {
+        static int phase, quiet;
+        if (G_CHAR_COUNT == 0) { phase = 1; quiet = 0; }
+        else if (phase == 1) {
+            int st, busy = 1;
+            __try {
+                unsigned char *q = G_BGPROC;
+                busy = loads_in_flight(&st) != 0 || (q && *(LONG *)(q + BGPROC_PENDING) > 0) || G_BGPROC_CURRENT != 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            quiet = busy ? 0 : quiet + 1;
+            if (quiet >= 30) { phase = 0; quiet = 0; net_meet(F, "nach dem Laden"); }
+        }
     }
     if (g_net) {
         // Lockstep-Frame: vor dem Anker absolut, danach ab dem Anker (Epoche 1 in net.c)
         long NF = g_anchor < 0 ? F : F - g_anchor + 1;
-        net_exchange(NF);
-        // Pruefsummen erst ab dem Anker: vorher sind kleine Frame-Versaetze erlaubt
-        if (g_anchor >= 0 && NF % 60 == 0) {
+        {
+            LONGLONG tn = qpc_now();
+            net_exchange(NF);
+            g_wt[6] += qpc_now() - tn;
+        }
+        if (g_test_desync && g_anchor >= 0 && NF == g_test_desync) {
+            G_RNG_LCG16 ^= 0x5555;
+            logf_("Test: LCG16 bei Frame %ld verstellt", NF);
+        }
+        // Selbstheilung: Am angekuendigten Reparatur-Frame schickt der Host seine Zustaende, der Gast uebernimmt sie
+        // (beide an derselben Stelle des Frame-Endes). Im Playtest wich nach dem Laden zuerst nur der LCG16 ab.
+        if (g_anchor >= 0) {
+            int R = net_repair_frame();
+            if (R && R != g_repair_done && NF == R) {
+                g_repair_done = R;
+                net_sync_point(NF, "zur Reparatur");
+                g_last_repair = R;
+                g_repairs++;
+            } else if (R && R != g_repair_done && NF > R) {
+                g_repair_done = R;
+                logf_("Netz: Reparatur bei Frame %d verpasst (jetzt %ld)", R, NF);
+            }
+        }
+        // Pruefsummen erst ab dem Anker (vorher sind kleine Frame-Versaetze erlaubt), alle 20 Frames, damit die
+        // Selbstheilung eine Abweichung erwischt, bevor die Spiellogik den verstellten Zufall weiterverbreitet
+        if (g_anchor >= 0 && NF % 20 == 0) {
             CHARSNAP k;
             unsigned long long ck;
             char_snapshot(&k);
@@ -2450,13 +2625,23 @@ static void __cdecl on_frame_end(void)
                  ((unsigned long long)G_RNG_PM_DEFAULT << 40) ^ crt_rand_state();
             net_checksum((int)NF, ck);
             {
+                // Abweichung nach der letzten Reparatur: Host plant eine Reparatur 40 Frames voraus (der Gast
+                // erfaehrt es mit den Eingaben). Erst wenn drei Reparaturen nacheinander nicht helfen, Hinweis.
                 static int notified;
-                long stalls, desyncs;
-                net_stats(&stalls, &desyncs);
-                if (desyncs > 0 && !notified) {
-                    notified = 1;
-                    logf_("NICHT SYNCHRON: Hinweis an den Spieler");
-                    CreateThread(NULL, 0, net_notice, (void *)1, 0, NULL);
+                int last = net_last_desync();
+                if (last > g_last_repair && last != g_seen_desync) {
+                    g_seen_desync = last;
+                    if (g_last_repair && last - g_last_repair > 600) g_repairs = 0;   // neuer Vorfall
+                    if (g_repairs < 3) {
+                        if (net_role() == 0 && net_repair_frame() <= NF) {
+                            net_schedule_repair((int)NF + 40);
+                            logf_("Netz: Abweichung bei Frame %d, Reparatur bei Frame %ld geplant", last, NF + 40);
+                        }
+                    } else if (!notified) {
+                        notified = 1;
+                        logf_("NICHT SYNCHRON: Hinweis an den Spieler");
+                        CreateThread(NULL, 0, net_notice, (void *)1, 0, NULL);
+                    }
                 }
             }
         }
@@ -2691,6 +2876,10 @@ static void init(void)
         while (t && g_gate_n < 19) { g_gate_idx[g_gate_n++] = atoi(t); t = strtok(NULL, ","); }
     }
     if (GetEnvironmentVariableA("LBO_JITTER", buf, sizeof buf)) { g_jitter = atoi(buf); g_jitter_state = GetCurrentProcessId(); }
+    if (GetEnvironmentVariableA("LBO_AVLOG", buf, sizeof buf)) g_avlog = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_AVSYNC", buf, sizeof buf)) g_avsync = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_TESTDESYNC", buf, sizeof buf)) g_test_desync = atol(buf);
+    if (GetEnvironmentVariableA("LBO_TESTMEET", buf, sizeof buf)) g_test_meet = atol(buf);
     if (GetEnvironmentVariableA("LBO_PAUSE", buf, sizeof buf)) sscanf(buf, "%ld,%d", &g_pause_at, &g_pause_ms);
     if (GetEnvironmentVariableA("LBO_AUDIOLOG", buf, sizeof buf)) g_audiolog = atoi(buf);
     if (GetEnvironmentVariableA("LBO_VAUDIO", buf, sizeof buf)) g_vaudio = atoi(buf);

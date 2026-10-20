@@ -27,3 +27,9 @@ int net_barrier(int F, void *data, int len, int timeout_ms);
 // Eingaben, wartet nicht mehr und sendet selbst nichts mehr. 0 = nie aufgeben (Standard, Batman 1).
 void net_set_partner_timeout(int ms);
 int net_partner_lost(void);
+// Selbstheilung (LEGO Batman 2): Der Host plant bei einer Abweichung einen Reparatur-Frame und kuendigt ihn in
+// jedem Eingabepaket an; dort uebernimmt der Gast per net_send_sync/net_wait_sync den Zustand des Hosts.
+void net_schedule_repair(int frame);   // nur Host
+int net_repair_frame(void);            // Host: eigener Plan, Gast: zuletzt angekuendigter (0 = keiner)
+int net_last_desync(void);             // Pruefsummen-Frame der letzten Abweichung dieser Epoche (0 = keine)
+void net_set_frame_offset(long offset);   // fuer das Log: Spiel-Frame = Lockstep-Frame + offset

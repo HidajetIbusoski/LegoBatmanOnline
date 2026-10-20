@@ -32,11 +32,12 @@ typedef struct {
     int count;
     int ck_frame;           // Frame der mitgeschickten Pruefsumme (0 = keine)
     unsigned long long ck;  // Pruefsumme
+    int repair;             // Host: geplanter Reparatur-Frame (0 = keiner), siehe net_schedule_repair
     NETPAD in[REDUNDANCY];
 } PACKET;
 typedef struct {
     unsigned magic;
-    unsigned type;          // 2 = Zustandsabgleich
+    unsigned type;          // 2 = Zustandsabgleich (obere 16 Bit: Epoche), 3/4 = Schranke
     int frame;
     int len;
     unsigned char data[256];
@@ -68,6 +69,9 @@ static unsigned long long g_my_ck[RING], g_peer_ck[RING];
 static int g_my_ck_frame[RING], g_peer_ck_frame[RING];
 static int g_last_ck_sent;
 static long g_stalls, g_desyncs;
+static int g_last_desync;              // Pruefsummen-Frame der letzten Abweichung (in der laufenden Epoche)
+static int g_repair_out, g_repair_in;  // Reparatur-Frame: vom Host geplant / vom Host empfangen
+static long g_frame_offset;            // Spiel-Frame = Lockstep-Frame + Versatz (nur fuer das Log)
 static void (*g_log)(const char *fmt, ...);
 
 int net_role(void) { return g_role; }
@@ -167,6 +171,7 @@ static void send_inputs(void)
         p.ck_frame = g_last_ck_sent;
         p.ck = g_my_ck[g_last_ck_sent % RING];
     }
+    p.repair = g_repair_out;
     if (g_loss && (rand() % 100) < g_loss) { g_dropped++; return; }  // Testmodus: Paketverlust
     sendto(g_sock, (const char *)&p, sizeof p, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
     // Den letzten Abgleich eine Weile mitsenden, bis der Gast ihn sicher hat (Pakete koennen verloren gehen)
@@ -231,6 +236,10 @@ int net_barrier(int F, void *data, int len, int timeout_ms)
     g_remote_upto = g_delay;
     for (i = 1; i <= g_delay; i++) { g_local[i % RING] = neutral; g_remote_have[i % RING] = 1; }
     g_bar_resend = 600;   // Partner koennte unser Schranken-Paket noch brauchen
+    g_last_desync = 0;
+    g_repair_out = g_repair_in = 0;
+    g_sync_out.magic = 0;   // Abgleich der alten Epoche nicht weiter senden
+    g_sync_in_frame = 0;
     g_log("Netz: Schranke passiert nach %lu ms (Partner-Frame %d), Epoche %d", GetTickCount() - start, g_bar_in.frame, g_epoch);
     return 1;
 }
@@ -240,7 +249,7 @@ void net_send_sync(int F, const void *data, int len)
     if (len > 256) len = 256;
     memset(&g_sync_out, 0, sizeof g_sync_out);
     g_sync_out.magic = MAGIC;
-    g_sync_out.type = 2;
+    g_sync_out.type = 2 | ((unsigned)g_epoch << 16);
     g_sync_out.frame = F;
     g_sync_out.len = len;
     memcpy(g_sync_out.data, data, len);
@@ -279,7 +288,9 @@ static void compare_checksum(int f)
 {
     if (g_my_ck_frame[f % RING] == f && g_peer_ck_frame[f % RING] == f && g_my_ck[f % RING] != g_peer_ck[f % RING]) {
         g_desyncs++;
-        g_log("DESYNC bei Frame %d: lokal %016llx, Partner %016llx", f, g_my_ck[f % RING], g_peer_ck[f % RING]);
+        if (f > g_last_desync) g_last_desync = f;
+        g_log("DESYNC bei Frame %d (Spiel-Frame %ld): lokal %016llx, Partner %016llx", f, f + g_frame_offset,
+              g_my_ck[f % RING], g_peer_ck[f % RING]);
     }
 }
 
@@ -290,7 +301,7 @@ static void receive(void)
     int n, i, f;
     while ((n = recv(g_sock, (char *)&u, sizeof u, 0)) > 0) {
         if (n >= 8 && u.p.magic == MAGIC) g_last_rx = GetTickCount();
-        if (n == (int)sizeof(SYNCPACKET) && u.s.magic == MAGIC && u.s.type == 2) {
+        if (n == (int)sizeof(SYNCPACKET) && u.s.magic == MAGIC && (u.s.type & 0xFFFF) == 2 && (int)(u.s.type >> 16) == g_epoch) {
             if (u.s.frame != g_sync_in_frame && u.s.len >= 0 && u.s.len <= 256) {
                 g_sync_in = u.s;
                 g_sync_in_frame = u.s.frame;
@@ -308,6 +319,7 @@ static void receive(void)
         if (n != (int)sizeof p) continue;
         p = u.p;
         if (p.magic != MAGIC || (p.type & 0xFFFF) != 1 || (int)(p.type >> 16) != g_epoch || p.count < 0 || p.count > REDUNDANCY) continue;
+        if (g_role == 1 && p.repair > g_repair_in) g_repair_in = p.repair;
         for (i = 0; i < p.count; i++) {
             f = p.last_frame - p.count + 1 + i;
             if (f <= g_remote_upto - RING / 2) continue;  // uralt
@@ -370,6 +382,14 @@ void net_frame(int F, const NETPAD *local_now, NETPAD out[2])
 }
 
 void net_set_partner_timeout(int ms) { g_partner_timeout_ms = ms; }
+
+void net_set_frame_offset(long offset) { g_frame_offset = offset; }
+
+int net_last_desync(void) { return g_last_desync; }
+
+void net_schedule_repair(int frame) { g_repair_out = frame; }
+
+int net_repair_frame(void) { return g_role == 0 ? g_repair_out : g_repair_in; }
 
 int net_partner_lost(void) { return g_partner_lost != 0; }
 

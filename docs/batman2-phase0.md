@@ -360,7 +360,24 @@ Host und Gast auf diesem PC (UDP über 127.0.0.1), beide mit Skript-Eingaben, je
 
 **FPU:** Im Netzmodus wird der x87-Zustand (0x7f) und MXCSR (0x1f80) je Frame festgesetzt, wie bei Batman 1. In allen Tests war keine Korrektur nötig; es sichert gegen Treiber oder Overlays ab, die die Genauigkeit verstellen.
 
-Noch nicht getestet: zwei echte PCs über das Internet.
+### Erster Playtest über das Internet (20.10.2026)
+
+Host (dieser PC) und Gast (i5-10400F), Verzögerung 4 Frames, 83.000 Frames (23 Minuten). Bis Netz-Frame 56.940 keine Abweichung.
+
+**Desync:** Bei Spiel-Frame 74.261–74.312 lief ein Levelwechsel mit Ladebildschirm (Figurenzahl 51 Frames lang 0). Danach wich nur der LCG16 ab (untere 16 Bit der Prüfsumme), 540 Frames lang, dann alles. Ein Ladebildschirm läuft je nach PC verschieden viele Bilder und zieht dabei Zufall.
+- *Schranke nach jedem Laden:* Fällt die Figurenzahl auf 0 und ist das Laden danach 30 Frames ruhig, treffen sich beide Seiten (`net_meet`), der Gast übernimmt alle Zufallszustände des Hosts, der Lockstep zählt neu. Weichen die Zustände vorher ab, steht das im Log ("Zustand wich vor der Schranke ab").
+- *Selbstheilung:* Prüfsumme alle 20 Frames. Bei einer Abweichung plant der Host 40 Frames voraus einen Reparatur-Frame (in jedem Eingabepaket angekündigt), dort übernimmt der Gast die Zustände. Erst nach drei erfolglosen Reparaturen kommt der Hinweis. Im Härtetest (LCG16 mitten im Level verstellt, Reparatur nach 150 Frames) war die Abweichung schon in die Logik gewandert; daher jetzt 20/40 statt 60/90 Frames. Die Reparatur ersetzt nur Zufallszustände, keine Positionen.
+- *Fehlerbericht:* Das Log schreibt jetzt "DESYNC bei Frame N (Spiel-Frame F)", die App schickt die CSV um F (vorher wurde der Netz-Frame als Spiel-Frame gelesen, der Ausschnitt war 17.000 Frames daneben) und die 400 Logzeilen davor.
+
+**Ton vor dem Bild:** Die virtuelle Ton-Uhr läuft einen Frame je 1/60 s, die Lautsprecher in Echtzeit. Unter 60 fps oder bei Hängern lief der echte Ton vor (gemessen bis 1,06 s) und blieb vorn, weil das Spiel Puffer im virtuellen Takt nachreicht. Jetzt folgt er der virtuellen Uhr: Frequenzverhältnis bis 15 % langsamer/10 % schneller (voll ab 75 ms Abstand), ab 150 ms wird die Stimme angehalten, und hängt der Hauptthread über 100 ms, hält `av_watch` die ganze Ausgabe an (`StopEngine`). `LBO_AVLOG=1` protokolliert die Abstände, `LBO_AVSYNC=0` schaltet ab.
+
+**Hänger:** `Langer Frame`-Zeilen schlüsseln Frames über 100 ms nach Wartestelle auf. Gefunden:
+- SaveCore 0,5 s bei jedem Speichern: zweite Mindestzeit im Speicher-Thread (0x540d6b, `Sleep(100)` bis Zeitgeber +0x10 abgelaufen), jetzt übersprungen wie 0x540e2b.
+- Lade-Schleife/NuBgProc 0,5–1,2 s an Szenen- und Levelanfängen: echtes Nachladen, das für den Gleichlauf in einen Frame fällt. Bleibt; der Ton hält jetzt mit an.
+- Ton 0,2 s am Ende von Musik-Streams (Wartezeit auf eine Nachlieferung, die nicht kommt).
+- Netz bis 1,9 s: der langsamere PC beim Laden.
+
+Testschalter: `LBO_TESTDESYNC=N` verstellt beim Gast den LCG16 bei Netz-Frame N, `LBO_TESTMEET=N` löst bei N eine Schranke wie nach dem Laden aus.
 
 ## Zufallsgeneratoren
 

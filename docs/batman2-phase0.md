@@ -238,7 +238,7 @@ Noch nicht geprüft:
 ## Netzmodus (19.10.2026)
 
 `lbo2.dll` nutzt denselben Lockstep wie Batman 1 (`src/dll/net.c`, `src/dll/input.c`, mit in die DLL gelinkt). Mit `LBO_NET=host|join` setzt die DLL alle Determinismus-Schalter selbst:
-- `FIXEDDT`, `LOADSYNC`, `VIDEODT`, `VCLOCK`, `RENDERRNG`, `VAUDIO`, `ANCHOR`, 60 fps.
+- `FIXEDDT`, `LOADSYNC`, `VIDEODT`, `VCLOCK`, `RENDERRNG`, `VAUDIO`, `ANCHOR`, `LOOPGATE`, `IOWAIT`, `NODINPUT`, `SLOWSTART=320`, 60 fps.
 
 Eingaben:
 - Das Spiel sieht nur Pad 0 (Host) und Pad 1 (Gast) aus dem Austausch.
@@ -326,7 +326,18 @@ Weitere Befunde (Fortsetzung):
 - **`rng_b` ist reine Optik:** Alle Nutzer (`0x790500`–`0x7930e0`, `0x7adad0`, `0x7ae500`, `0x7ae7d0`) arbeiten auf Partikel-Systemen. Die Abweichung ab 13349 kommt daher, dass Partikel-Systeme je nach Sichtbarkeit in der Logik (`0x7d8d20` → vtbl+0x30 `0x7b10b0`) oder beim Zeichnen (`0x7c0270` → `0x7b0f90` bei `0x7c053c`) weitergerechnet werden. Für den Lockstep ist das harmlos. Versuche, das umzulenken (eigener Zustand, Update nur in der Logik, Schalter `0x7c5070` aus), änderten an der Logik nichts und wurden wieder entfernt.
 - **Gelesen, nicht die Ursache:** QPC-Aufrufe je Frame, Rohes dt `0x11cf0d8`, x87-Steuerwort und MXCSR (CSV-Spalten `qpc`, `rawdt`, `fpucw`, `mxcsr`: in beiden Instanzen Frame für Frame gleich), RDTSC (keine echten Aufrufe), Ton-Nachlieferungen (Zeitgrenzen in beiden Instanzen an denselben Stellen), Ton-Position (`0x614070` liest die virtuellen SamplesPlayed im Hauptthread).
 
-Noch offen: **Ladestart 14119/14120.** Alle Logik-Zufallswerte bleiben bis zum Levelstart gleich. Der Streaming-Auftrag startet aber in der verzögerten Instanz bei 14119, in der schnellen bei 14120. Der Versatz wächst bis zum Level auf 5 Frames (Levelstart 20379 gegen 20384) und ist in jedem Lauf exakt gleich, hängt also am Zeitmuster der Instanz. Vorläufer: Ab Frame 12499 weichen Render-Zähler (`0x1361d4c`, `0x1354208`) und Cache-Zeiger (`0x11bebb4`) ab, ab 12525 Lichtwerte und die Animationszeit `0x1389120` (Zwischensequenz, 5. Stelle), ab 14101 die Spielkamera. Verdacht: asynchrones Textur- bzw. Mesh-Streaming (TextureDecode, Thread 4), dessen Stand beim Zeichnen in Sichtbarkeit oder LOD und von dort in Animation und Streaming-Wünsche durchsickert. Werkzeug dafür: `LBO_MEMDUMP=von,bis,Schritt` und `tools/drift_b2.py` (relative Abweichung 1e-6 bis 1e-2).
+**Ton als Uhr der Zwischensequenzen:** Die Zwischensequenzen laufen nach der Ton-Position (`0x614070` liest die gespielten Samples der Stream-Stimme im Hauptthread). Gestreamte Musik und Sprache (44,1 kHz) bekommen ihren nächsten Puffer erst nach BufferEnd vom Streamer, in Echtzeit. Kam er zu spät, blieb die virtuelle Stimme stehen. Ab Frame 12525 liefen dann Lichtwerte, die Animationszeit `0x1389120` und die Kamera in der 5. Stelle auseinander, bei 14119 startete das Laden einen Frame anders, und der Levelstart lag 5 Frames auseinander.
+- `va_tick` wartet höchstens 200 ms, bis jede BufferEnd einer 44,1-kHz-Stimme, die schon einmal im selben Frame nachgeliefert hat, mit einem Submit beantwortet ist. Kommt nichts, gilt der Stream als zu Ende (`dry`), und es wird nicht erneut gewartet.
+- Fehler unterwegs: Eine feste 2-s-Grenze für alle Stimmen ließ das Bild an Stream-Enden 2 s stehen. Mit Soundeffekten (22 kHz) im Warten gab es im Level 322 Hänger von etwa 220 ms. Und eine Zeitgrenze bei einem Soundeffekt löschte die ausstehende Musik-Nachlieferung mit; genau das war der Wettlauf bei 14119.
+
+**Zeichnen zieht aus `rng_a`:** Die Ansicht-Zeichenfunktion `0x575480` zieht am Ende zwei Zahlen aus dem Logik-Generator (`0x575c61/69`). Wie viele Ansichten gezeichnet werden, hängt am Zeichnen. Bei 12215 kam je nach Tempo eine dritte Ansicht ein oder zwei Frames früher dazu. Alle 25 `rng_a`-Aufrufe im Zeichenbereich `0x570000`–`0x5f0000` bekommen den eigenen Render-Zustand.
+
+**Wartezeit der Mod:** CSV-Spalte `wait_ms` und eine Logzeile je 3000 Frames zeigen die Zeit in den Wartestellen. `wait_io` lief zweimal je Frame mit fester 3-ms-Pause (zusammen etwa 8 ms). Jetzt läuft es einmal mit 2-ms-Pause, insgesamt etwa 3 ms plus Ton (im Level 4–6 ms). Ungebremst schafft die schnelle Instanz 132 statt 78 fps.
+
+**Startphase:** Der 1-Frame-Versatz des Intros (erste Musikstimme bei 283/284) kommt aus dem Ablaufskript der Zwischensequenz (`0xa1f420`, Objekt +0x6c), dessen Schritte auf Echtzeit-Fertigstellungen warten. Mit `LBO_SLOWSTART=320` (50 ms extra je Frame in den ersten 320 Frames) trat er in 8 Kurzläufen und 6 vollen Läufen nicht auf. Im Netzmodus ist das jetzt Standard (statt 900 Frames).
+
+**Netzmodus:** `LOOPGATE`, `IOWAIT` und `NODINPUT` sind jetzt fest an, `LBO_LOADSLOW` entfällt.
+
 
 Die Zählung nach dem Anker taugt erst, wenn der Vorlauf gleich ist: Mit unterschiedlichem Vorlauf weichen auch nach dem Rücksetzen der Zufallszustände die geladenen Daten ab.
 

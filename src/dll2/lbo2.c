@@ -2039,6 +2039,67 @@ __declspec(naked) static void render_rand(void)
     }
 }
 
+// Weitere rng_a-Aufrufe (0x51a1d0) im Zeichenbereich 0x570000-0x5f0000. Paartest: 0x575480 zeichnet eine
+// Ansicht und zieht am Ende zwei Zahlen (0x575c61/69); ab Frame 12215 kam je nach Tempo eine dritte Ansicht
+// einen oder zwei Frames frueher dazu, rng_a lief auseinander. Alle Stellen bekommen den eigenen Zustand
+// (auch falls eine doch zur Logik gehoert: mit eigenem Zustand bleibt sie deterministisch).
+static const DWORD g_rr_a_sites[] = {
+    0x00575C61, 0x00575C69, 0x005887E7, 0x005887F3, 0x005887FF, 0x00588AE9, 0x00588AF5, 0x00588B01,
+    0x00598E62, 0x0059A4C5, 0x005A8AB3, 0x005A9B8D, 0x005E7DBB, 0x005E7DC7, 0x005E7DD3, 0x005EFA30,
+    0x005EFA3F, 0x005EFA4E, 0x005EFA5D, 0x005EFA6C, 0x005EFA7B, 0x005EFA8A, 0x005EFA93, 0x005EFA9F,
+    0x005EFAA8 };
+// CRT rand (0xbd1c9d) im Zeichenbereich, zusaetzlich zu 0x5e0d52/0x5e0db8 (Licht-/Effekt-Funktion 0x5d8dxx)
+static const DWORD g_rr_crt_sites[] = { 0x005D8E04, 0x005D8E4E, 0x005D8E99, 0x005D8EEF };
+static void render_rand(void);
+
+static void render_rng_a(void);
+
+// 0x575480 zieht ausserdem bei 0x575c7b eine Ganzzahl ueber 0x51a2a0 (schreibt rng_a 0x11be45c direkt).
+// Waehrend dieses Aufrufs bekommt rng_a den Render-Zustand (cdecl, Argumente bleiben auf dem Stapel).
+static unsigned g_rr_a_save, g_rr_a_ret;
+
+__declspec(naked) static void render_rng_int(void)
+{
+    __asm {
+        mov eax, dword ptr ds:[011BE45Ch]
+        mov g_rr_a_save, eax
+        mov eax, g_rr_a
+        mov dword ptr ds:[011BE45Ch], eax
+        pop eax
+        mov g_rr_a_ret, eax
+        mov eax, 0051A2A0h
+        call eax
+        push eax
+        mov eax, dword ptr ds:[011BE45Ch]
+        mov g_rr_a, eax
+        mov eax, g_rr_a_save
+        mov dword ptr ds:[011BE45Ch], eax
+        pop eax
+        push g_rr_a_ret
+        ret
+    }
+}
+
+static int patch_render_rng_a_sites(void)
+{
+    static int int_done;
+    static int done[sizeof g_rr_a_sites / sizeof g_rr_a_sites[0]];
+    int i, all = 1;
+    for (i = 0; i < (int)(sizeof g_rr_a_sites / sizeof g_rr_a_sites[0]); i++) {
+        if (!done[i]) done[i] = patch_call(g_rr_a_sites[i], 0x0051A1D0, (void *)render_rng_a);
+        all &= done[i];
+    }
+    if (!int_done) int_done = patch_call(0x00575C7B, 0x0051A2A0, (void *)render_rng_int);
+    {
+        static int crt_done[sizeof g_rr_crt_sites / sizeof g_rr_crt_sites[0]];
+        for (i = 0; i < (int)(sizeof g_rr_crt_sites / sizeof g_rr_crt_sites[0]); i++) {
+            if (!crt_done[i]) crt_done[i] = patch_call(g_rr_crt_sites[i], 0x00BD1C9D, (void *)render_rand);
+            all &= crt_done[i];
+        }
+    }
+    return all & int_done;
+}
+
 __declspec(naked) static void render_rng_a(void)
 {
     __asm {
@@ -2486,7 +2547,7 @@ static DWORD WINAPI installer(void *arg)
                             ONCE(p[2], patch_call(0x0063D8EE, 0x0063B6F0, (void *)stub_poll_device));
             }
             if (!rrng_done) {
-                static int p[9];
+                static int p[10];
                 rrng_done = ONCE(p[0], patch_call(0x005E0D52, 0x00BD1C9D, (void *)render_rand)) &
                             ONCE(p[1], patch_call(0x005E0DB8, 0x00BD1C9D, (void *)render_rand)) &
                             ONCE(p[2], patch_call(0x00598619, 0x0051A1D0, (void *)render_rng_a)) &
@@ -2495,7 +2556,8 @@ static DWORD WINAPI installer(void *arg)
                             ONCE(p[5], patch_abs32(0x0094CC92, 0x011A1844, &g_rr_music_lcg2)) &
                             ONCE(p[6], patch_abs32(0x0094CCA3, 0x011A1844, &g_rr_music_lcg2)) &
                             ONCE(p[7], patch_abs32(0x0094D201, 0x011A1844, &g_rr_music_lcg3)) &
-                            ONCE(p[8], patch_abs32(0x0094D212, 0x011A1844, &g_rr_music_lcg3)) ;
+                            ONCE(p[8], patch_abs32(0x0094D212, 0x011A1844, &g_rr_music_lcg3)) &
+                            ONCE(p[9], patch_render_rng_a_sites());
             }
             if (!fmv_done) fmv_done = patch_call(FMV_FIND_CALL, FMV_FIND, (void *)no_movie_find);
             if (!vdt_done && !memcmp((void *)VIDEO_DT_STORE, vdt_orig, 6)) {

@@ -1,4 +1,4 @@
-using System.Collections.ObjectModel;
+﻿using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -132,6 +132,31 @@ public sealed class Lobby : Bindable
     public ObservableCollection<SaveSlot> Saves { get; } = new();
     public ObservableCollection<string> Log { get; } = new();
 
+    // Launcher: Spielekatalog und gewaehltes Spiel
+    public ObservableCollection<GameItem> Games { get; } = GameCatalog.Create();
+    private GameItem? _selectedGame;
+    public GameItem? SelectedGame
+    {
+        get => _selectedGame;
+        set
+        {
+            if (_selectedGame == value) return;
+            if (_selectedGame != null) _selectedGame.Selected = false;
+            _selectedGame = value;
+            if (value != null) value.Selected = true;
+            Raise(); Raise(nameof(IsBatman1)); Raise(nameof(IsBatman2)); Raise(nameof(ShowGameMissing));
+        }
+    }
+    public bool IsBatman1 => SelectedGame?.Key == "batman1";
+    public bool IsBatman2 => SelectedGame?.Key == "batman2";
+    public bool ShowGameMissing => IsBatman1 && GameMissing;
+    public void RememberGame(string key)
+    {
+        if (_profile.LastGame == key) return;
+        _profile.LastGame = key;
+        try { _profile.Save(); } catch { }
+    }
+
     public string MyCode => Identity.FormatCode(_me.Id);
     public string Name
     {
@@ -201,7 +226,7 @@ public sealed class Lobby : Bindable
     {
         _profile.GamePath ??= GameBridge.FindGame();
         _profile.Save();
-        Raise(nameof(GamePath)); Raise(nameof(GameText)); Raise(nameof(GameOk)); Raise(nameof(GameMissing));
+        Raise(nameof(GamePath)); Raise(nameof(GameText)); Raise(nameof(GameOk)); Raise(nameof(GameMissing)); Raise(nameof(ShowGameMissing));
         RefreshSaves();
         try { _launcher = GameBridge.PrepareBinaries(); }
         catch (Exception e) { AddLog("Mod-Dateien fehlen: " + e.Message); }
@@ -238,7 +263,7 @@ public sealed class Lobby : Bindable
     {
         _profile.GamePath = path;
         _profile.Save();
-        Raise(nameof(GamePath)); Raise(nameof(GameText)); Raise(nameof(GameOk)); Raise(nameof(GameMissing));
+        Raise(nameof(GamePath)); Raise(nameof(GameText)); Raise(nameof(GameOk)); Raise(nameof(GameMissing)); Raise(nameof(ShowGameMissing));
     }
 
     private void AddLog(string line)
@@ -943,6 +968,8 @@ public sealed class AppOptions
     public string? Name { get; set; }
     public int MaxFrames { get; set; }
     public int Slot { get; set; } = -1;
+    public string? Shot { get; set; }       // Test: Fenster als PNG speichern und beenden
+    public string? ShotGame { get; set; }   // Test: dieses Spiel vor dem Bild auswaehlen
 
     public static AppOptions Parse(string[] args)
     {
@@ -961,6 +988,8 @@ public sealed class AppOptions
                 case "--name" when i + 1 < args.Length: o.Name = args[++i]; break;
                 case "--slot" when i + 1 < args.Length: o.Slot = int.Parse(args[++i]); break;
                 case "--max-frames" when i + 1 < args.Length: o.MaxFrames = int.Parse(args[++i]); break;
+                case "--shot" when i + 1 < args.Length: o.Shot = args[++i]; break;
+                case "--shot-game" when i + 1 < args.Length: o.ShotGame = args[++i]; break;
             }
         }
         return o;

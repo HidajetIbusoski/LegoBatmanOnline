@@ -2,6 +2,9 @@
 using System.Diagnostics;
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using LegoBatmanOnline.Core;
 using Microsoft.Win32;
 
@@ -11,6 +14,7 @@ public partial class MainWindow : Window
 {
     private readonly Lobby _lobby;
     private bool _closing;
+    private bool _bgFront;   // false: BgA sichtbar, true: BgB sichtbar
 
     public MainWindow(Profile profile, Identity me, AppOptions opt)
     {
@@ -23,7 +27,17 @@ public partial class MainWindow : Window
             SetupOverlay.Visibility = Visibility.Visible;
             Loaded += (_, _) => NameBox.Focus();
         }
+        _lobby.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(Lobby.SelectedGame)) ShowBackground(_lobby.SelectedGame);
+            if (e.PropertyName == nameof(Lobby.Name)) UpdateInitial();
+        };
+        _lobby.SelectedGame = _lobby.Games.FirstOrDefault(g => g.Key == profile.LastGame) ?? _lobby.Games[1];
+        UpdateInitial();
+        StartClock();
+        Loaded += (_, _) => StartScanLine();
         Loaded += async (_, _) => await _lobby.StartAsync();
+        if (opt.Shot != null) Loaded += async (_, _) => await ShotAsync(opt);
         // Desync: Taskleistensymbol blinken lassen (das Spiel zeigt selbst eine Meldung)
         _lobby.AlertRequested += () =>
         {
@@ -43,6 +57,126 @@ public partial class MainWindow : Window
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool FlashWindowEx(ref FLASHWINFO info);
 
+    // --- Launcher: Spielauswahl, Hintergrund, Uhr --------------------------------------------
+    private void ShowBackground(GameItem? g)
+    {
+        if (g == null) return;
+        BitmapImage img;
+        try { img = new BitmapImage(new Uri(g.Background)); } catch { return; }
+        var show = _bgFront ? BgA : BgB;
+        var hide = _bgFront ? BgB : BgA;
+        _bgFront = !_bgFront;
+        show.Source = img;
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+        show.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(450)) { EasingFunction = ease });
+        hide.BeginAnimation(OpacityProperty, new DoubleAnimation(0, TimeSpan.FromMilliseconds(450)) { EasingFunction = ease });
+        // Infobereich kurz einblenden, wie beim Wechsel auf der Konsole
+        InfoPanel.BeginAnimation(OpacityProperty, new DoubleAnimation(0.2, 1, TimeSpan.FromMilliseconds(380)));
+        _lobby.RememberGame(g.Key);
+    }
+
+    private void UpdateInitial()
+    {
+        var n = _lobby.Name;
+        Initial.Text = string.IsNullOrWhiteSpace(n) ? "?" : n.Trim()[..1].ToUpperInvariant();
+    }
+
+    private void StartClock()
+    {
+        Clock.Text = DateTime.Now.ToString("HH:mm");
+        var t = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        t.Tick += (_, _) => Clock.Text = DateTime.Now.ToString("HH:mm");
+        t.Start();
+    }
+
+    private void StartScanLine()
+    {
+        var a = new DoubleAnimation(-220, Math.Max(400, ActualWidth), TimeSpan.FromSeconds(6)) { RepeatBehavior = RepeatBehavior.Forever };
+        ScanX.BeginAnimation(System.Windows.Media.TranslateTransform.XProperty, a);
+    }
+
+    private void Tile_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (((FrameworkElement)sender).DataContext is GameItem g)
+        {
+            if (_lobby.SelectedGame == g) Play_Click(sender, e);
+            else _lobby.SelectedGame = g;
+        }
+    }
+
+    private void Window_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.OriginalSource is System.Windows.Controls.TextBox) return;
+        if (SetupOverlay.Visibility == Visibility.Visible || NewWorldOverlay.Visibility == Visibility.Visible ||
+            PickFriendOverlay.Visibility == Visibility.Visible || _lobby.HasIncoming || _lobby.SessionActive) return;
+        int i = _lobby.SelectedGame == null ? 0 : _lobby.Games.IndexOf(_lobby.SelectedGame);
+        switch (e.Key)
+        {
+            case Key.Left: _lobby.SelectedGame = _lobby.Games[Math.Max(0, i - 1)]; e.Handled = true; break;
+            case Key.Right: _lobby.SelectedGame = _lobby.Games[Math.Min(_lobby.Games.Count - 1, i + 1)]; e.Handled = true; break;
+            case Key.Enter: Play_Click(sender, e); e.Handled = true; break;
+        }
+    }
+
+    private void Play_Click(object sender, RoutedEventArgs e)
+    {
+        var g = _lobby.SelectedGame;
+        if (g == null || !g.Available || _lobby.SessionActive) return;
+        if (g.Key == "batman1")
+        {
+            // Erste Welt, deren Partner online ist; sonst eine neue Welt anlegen
+            var w = _lobby.Worlds.FirstOrDefault(x => x.CanPlayTogether);
+            if (w != null) _ = _lobby.PlayTogetherAsync(w);
+            else if (_lobby.Worlds.Count == 0) NewWorld_Click(sender, e);
+            else _lobby.Hint = "Gerade ist niemand aus deinen Welten online. Du kannst alleine weiterspielen.";
+            return;
+        }
+        if (g.Key == "batman2")
+        {
+            var friends = _lobby.Friends.Where(f => f.IsFriend).OrderByDescending(f => f.Online).ToList();
+            if (friends.Count == 0) { _lobby.Hint = "Füge zuerst rechts einen Freund über seinen Code hinzu."; FriendCodeBox.Focus(); return; }
+            PickFriendList.ItemsSource = friends;
+            PickFriendList.SelectedItem = friends.FirstOrDefault(f => f.Online);
+            PickFriendError.Text = "";
+            PickFriendOverlay.Visibility = Visibility.Visible;
+            PickFriendList.Focus();
+        }
+    }
+
+    private async void PickFriendOk_Click(object sender, RoutedEventArgs e)
+    {
+        if (PickFriendList.SelectedItem is not FriendItem f) { PickFriendError.Text = "Wähle einen Freund."; return; }
+        if (!f.Online) { PickFriendError.Text = $"{f.Name} ist gerade offline."; return; }
+        PickFriendOverlay.Visibility = Visibility.Collapsed;
+        await _lobby.PlayBatman2Async(f);
+    }
+
+    private void PickFriendCancel_Click(object sender, RoutedEventArgs e) => PickFriendOverlay.Visibility = Visibility.Collapsed;
+
+    private void RailGames_Click(object sender, RoutedEventArgs e) => Focus();
+
+    private void RailFriends_Click(object sender, RoutedEventArgs e) => FriendCodeBox.Focus();
+
+    private void RailLog_Click(object sender, RoutedEventArgs e) => LogExpander.IsExpanded = !LogExpander.IsExpanded;
+
+    // Test (--shot Datei [--shot-game Schluessel]): Fenster selbst rendern, als PNG speichern, beenden
+    private async Task ShotAsync(AppOptions opt)
+    {
+        if (opt.ShotGame != null && _lobby.Games.FirstOrDefault(g => g.Key == opt.ShotGame) is { } g) _lobby.SelectedGame = g;
+        await Task.Delay(2500);
+        var root = (FrameworkElement)Content;
+        var dpi = System.Windows.Media.VisualTreeHelper.GetDpi(this);
+        var bmp = new RenderTargetBitmap((int)(root.ActualWidth * dpi.DpiScaleX), (int)(root.ActualHeight * dpi.DpiScaleY),
+                                         96 * dpi.DpiScaleX, 96 * dpi.DpiScaleY, System.Windows.Media.PixelFormats.Pbgra32);
+        bmp.Render(root);
+        var enc = new PngBitmapEncoder();
+        enc.Frames.Add(BitmapFrame.Create(bmp));
+        using (var f = System.IO.File.Create(opt.Shot!)) enc.Save(f);
+        _closing = true;
+        Application.Current.Shutdown();
+    }
+
+    // --- Profil --------------------------------------------------------------------------------
     private void SaveName_Click(object sender, RoutedEventArgs e)
     {
         var name = Messenger.Clean(NameBox.Text);
@@ -59,9 +193,9 @@ public partial class MainWindow : Window
     private async void Copy_Click(object sender, RoutedEventArgs e)
     {
         try { Clipboard.SetText(_lobby.MyCode); } catch { return; }
-        CopyButton.Content = "Kopiert ✓";
+        CodeText.Text = "Kopiert ✓";
         await Task.Delay(1500);
-        CopyButton.Content = "Kopieren";
+        CodeText.SetBinding(System.Windows.Controls.TextBlock.TextProperty, nameof(Lobby.MyCode));
     }
 
     // --- Freunde ---------------------------------------------------------------------
@@ -87,12 +221,12 @@ public partial class MainWindow : Window
     private void RemoveFriend_Click(object sender, RoutedEventArgs e)
     {
         var f = ItemOf<FriendItem>(sender);
-        if (MessageBox.Show($"{f.Name} aus der Freundesliste entfernen?", "LEGO Batman Online",
+        if (MessageBox.Show($"{f.Name} aus der Freundesliste entfernen?", "LEGO Online",
                 MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
             _lobby.RemoveFriend(f);
     }
 
-    // --- Welten ----------------------------------------------------------------------
+    // --- Welten (LEGO Batman 1) -----------------------------------------------------------
     private void NewWorld_Click(object sender, RoutedEventArgs e)
     {
         var friends = _lobby.Friends.Where(f => f.IsFriend).ToList();
@@ -141,7 +275,7 @@ public partial class MainWindow : Window
     {
         var w = ItemOf<WorldItem>(sender);
         if (MessageBox.Show($"Welt „{w.Name}“ aus der Liste entfernen?\n\nDie Dateien bleiben auf deinem PC erhalten. " +
-                            "Dein Freund behält die Welt.", "LEGO Batman Online",
+                            "Dein Freund behält die Welt.", "LEGO Online",
                 MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
             await _lobby.RemoveWorldAsync(w);
     }
@@ -165,7 +299,7 @@ public partial class MainWindow : Window
         if (_closing) return;
         if (_lobby.SessionActive &&
             MessageBox.Show("Es läuft gerade ein Spiel. Trotzdem schließen?\n\nDer Spielstand wird dann erst beim nächsten Start der App abgeglichen.",
-                "LEGO Batman Online", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+                "LEGO Online", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
         {
             e.Cancel = true;
             return;

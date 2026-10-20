@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.Security.Cryptography;
 using System.Text.Json;
 
@@ -26,6 +26,7 @@ public sealed class Profile
     public List<WorldInfo> Worlds { get; set; } = new();
     public string? GamePath { get; set; }
     public int LastSlot { get; set; }
+    public string? LastGame { get; set; }   // zuletzt gewaehltes Spiel im Launcher
     public bool ShortcutsCreated { get; set; }
     private string _path = "";
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };

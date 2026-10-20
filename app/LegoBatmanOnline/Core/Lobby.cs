@@ -21,7 +21,8 @@ public sealed class FriendItem : Bindable
     private FriendState _state;
     public string Id { get; init; } = "";
     public string Code => Identity.FormatCode(Id);
-    public string Name { get => _name; set { _name = value; Raise(); } }
+    public string Name { get => _name; set { _name = value; Raise(); Raise(nameof(Initial)); } }
+    public string Initial => string.IsNullOrWhiteSpace(Name) ? "?" : Name.Trim()[..1].ToUpperInvariant();
     /// <summary>"on", "busy" (spielt gerade) oder "off"</summary>
     public string Presence
     {
@@ -606,7 +607,7 @@ public sealed class Lobby : Bindable
 
     private bool CheckReady()
     {
-        if (GamePath == null) { Hint = "LEGO Batman wurde nicht gefunden. Bitte links den Spielordner wählen."; return false; }
+        if (GamePath == null) { Hint = "LEGO Batman wurde nicht gefunden. Bitte unten den Spielordner wählen."; return false; }
         if (_launcher == null) { Hint = "Die Mod-Dateien fehlen. Bitte die App neu herunterladen."; return false; }
         Hint = "";
         return true;
@@ -970,6 +971,7 @@ public sealed class AppOptions
     public int Slot { get; set; } = -1;
     public string? Shot { get; set; }       // Test: Fenster als PNG speichern und beenden
     public string? ShotGame { get; set; }   // Test: dieses Spiel vor dem Bild auswaehlen
+    public string? ShotView { get; set; }   // Test: "freunde" oder "details" vor dem Bild oeffnen
 
     public static AppOptions Parse(string[] args)
     {
@@ -990,6 +992,7 @@ public sealed class AppOptions
                 case "--max-frames" when i + 1 < args.Length: o.MaxFrames = int.Parse(args[++i]); break;
                 case "--shot" when i + 1 < args.Length: o.Shot = args[++i]; break;
                 case "--shot-game" when i + 1 < args.Length: o.ShotGame = args[++i]; break;
+                case "--shot-view" when i + 1 < args.Length: o.ShotView = args[++i]; break;
             }
         }
         return o;

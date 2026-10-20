@@ -16,6 +16,7 @@ public sealed class GameItem : Bindable
     public string Logo => $"pack://application:,,,/Assets/Games/{Key}/logo.png";
     public string StatusText => Available ? "ONLINE-KOOP BEREIT" : "IN ENTWICKLUNG";
     public string PlayText => Available ? "Zusammen spielen" : "Bald verfügbar";
+    public string PlayHint => PlayText.ToUpperInvariant();
 
     private bool _selected;
     public bool Selected { get => _selected; set { _selected = value; Raise(); } }

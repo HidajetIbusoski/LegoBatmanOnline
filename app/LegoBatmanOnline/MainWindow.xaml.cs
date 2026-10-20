@@ -15,6 +15,8 @@ public partial class MainWindow : Window
     private readonly Lobby _lobby;
     private bool _closing;
     private bool _bgFront;   // false: BgA sichtbar, true: BgB sichtbar
+    private List<GameItem> _visible = new();   // Kacheln der gewaehlten Kategorie
+    private readonly DispatcherTimer _toastTimer = new() { Interval = TimeSpan.FromSeconds(6) };
 
     public MainWindow(Profile profile, Identity me, AppOptions opt)
     {
@@ -31,11 +33,14 @@ public partial class MainWindow : Window
         {
             if (e.PropertyName == nameof(Lobby.SelectedGame)) ShowBackground(_lobby.SelectedGame);
             if (e.PropertyName == nameof(Lobby.Name)) UpdateInitial();
+            if (e.PropertyName == nameof(Lobby.Hint) && !string.IsNullOrWhiteSpace(_lobby.Hint)) ShowToast("LEGO ONLINE", _lobby.Hint, "!");
         };
         _lobby.SelectedGame = _lobby.Games.FirstOrDefault(g => g.Key == profile.LastGame) ?? _lobby.Games[1];
+        ApplyFilter();
         UpdateInitial();
         StartClock();
-        Loaded += (_, _) => StartScanLine();
+        WatchFriends();
+        _toastTimer.Tick += (_, _) => HideToast();
         Loaded += async (_, _) => await _lobby.StartAsync();
         if (opt.Shot != null) Loaded += async (_, _) => await ShotAsync(opt);
         // Desync: Taskleistensymbol blinken lassen (das Spiel zeigt selbst eine Meldung)
@@ -70,8 +75,8 @@ public partial class MainWindow : Window
         var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
         show.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(450)) { EasingFunction = ease });
         hide.BeginAnimation(OpacityProperty, new DoubleAnimation(0, TimeSpan.FromMilliseconds(450)) { EasingFunction = ease });
-        // Infobereich kurz einblenden, wie beim Wechsel auf der Konsole
-        InfoPanel.BeginAnimation(OpacityProperty, new DoubleAnimation(0.2, 1, TimeSpan.FromMilliseconds(380)));
+        // Titel kurz einblenden, wie beim Wechsel auf der Konsole
+        TitleBlock.BeginAnimation(OpacityProperty, new DoubleAnimation(0.2, 1, TimeSpan.FromMilliseconds(320)));
         _lobby.RememberGame(g.Key);
     }
 
@@ -89,11 +94,115 @@ public partial class MainWindow : Window
         t.Start();
     }
 
-    private void StartScanLine()
+    // Kategorien: alle, nur spielbare, nur Platzhalter
+    private void ApplyFilter()
     {
-        var a = new DoubleAnimation(-220, Math.Max(400, ActualWidth), TimeSpan.FromSeconds(6)) { RepeatBehavior = RepeatBehavior.Forever };
-        ScanX.BeginAnimation(System.Windows.Media.TranslateTransform.XProperty, a);
+        if (TabAll == null || _lobby == null) return;
+        _visible = _lobby.Games.Where(g => TabCoop.IsChecked == true ? g.Available
+                                          : TabSoon.IsChecked == true ? !g.Available : true).ToList();
+        TileList.ItemsSource = _visible;
+        if (_visible.Count > 0 && (_lobby.SelectedGame == null || !_visible.Contains(_lobby.SelectedGame)))
+            _lobby.SelectedGame = _visible[0];
     }
+
+    private void Tab_Checked(object sender, RoutedEventArgs e) => ApplyFilter();
+
+    private void SwitchTab(int dir)
+    {
+        var tabs = new[] { TabAll, TabCoop, TabSoon };
+        int i = Array.FindIndex(tabs, t => t.IsChecked == true);
+        tabs[Math.Clamp(i + dir, 0, tabs.Length - 1)].IsChecked = true;
+    }
+
+    // Zahlen oben rechts (Anfragen, Freunde online) und Benachrichtigung bei neuen Anfragen
+    private void WatchFriends()
+    {
+        void Hook(FriendItem f)
+        {
+            f.PropertyChanged += (_, e) =>
+            {
+                if (e.PropertyName == nameof(FriendItem.IsIncoming) && f.IsIncoming) ShowToast(f.Name.ToUpperInvariant(), "möchte dein Freund sein", f.Initial);
+                if (e.PropertyName == nameof(FriendItem.Online) && f.Online && f.IsFriend) ShowToast(f.Name.ToUpperInvariant(), "ist jetzt online", f.Initial);
+                UpdateCounts();
+            };
+        }
+        foreach (var f in _lobby.Friends) Hook(f);
+        _lobby.Friends.CollectionChanged += (_, e) =>
+        {
+            if (e.NewItems != null)
+                foreach (FriendItem f in e.NewItems)
+                {
+                    Hook(f);
+                    if (f.IsIncoming) ShowToast(f.Name.ToUpperInvariant(), "möchte dein Freund sein", f.Initial);
+                }
+            UpdateCounts();
+        };
+        UpdateCounts();
+    }
+
+    private void UpdateCounts()
+    {
+        BellCount.Text = _lobby.Friends.Count(f => f.IsIncoming).ToString();
+        OnlineCount.Text = _lobby.Friends.Count(f => f.IsFriend && f.Online).ToString();
+    }
+
+    // Benachrichtigung oben in der Mitte, verschwindet nach 6 s
+    private void ShowToast(string title, string text, string icon)
+    {
+        ToastTitle.Text = title;
+        ToastText.Text = text;
+        ToastIcon.Text = icon;
+        Toast.IsHitTestVisible = true;
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+        Toast.BeginAnimation(OpacityProperty, new DoubleAnimation(1, TimeSpan.FromMilliseconds(220)));
+        ToastShift.BeginAnimation(System.Windows.Media.TranslateTransform.YProperty,
+            new DoubleAnimation(-30, 0, TimeSpan.FromMilliseconds(260)) { EasingFunction = ease });
+        _toastTimer.Stop();
+        _toastTimer.Start();
+    }
+
+    private void HideToast()
+    {
+        _toastTimer.Stop();
+        Toast.IsHitTestVisible = false;
+        Toast.BeginAnimation(OpacityProperty, new DoubleAnimation(0, TimeSpan.FromMilliseconds(300)));
+    }
+
+    private void Toast_Click(object sender, MouseButtonEventArgs e) => HideToast();
+
+    // Seitenleiste mit Freunden und Welten
+    private void OpenFriends_Click(object sender, RoutedEventArgs e)
+    {
+        DetailsOverlay.Visibility = Visibility.Collapsed;
+        Home.Visibility = Visibility.Visible;
+        DrawerLayer.Visibility = Visibility.Visible;
+        DrawerShift.BeginAnimation(System.Windows.Media.TranslateTransform.XProperty,
+            new DoubleAnimation(440, 0, TimeSpan.FromMilliseconds(240)) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } });
+    }
+
+    private void Details_Click(object sender, RoutedEventArgs e)
+    {
+        DrawerLayer.Visibility = Visibility.Collapsed;
+        DetailsOverlay.Visibility = Visibility.Visible;
+        Home.Visibility = Visibility.Hidden;
+        DetailsOverlay.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(200)));
+    }
+
+    private void CloseOverlays_Click(object sender, RoutedEventArgs e) => CloseOverlays();
+
+    private bool CloseOverlays()
+    {
+        bool any = DrawerLayer.Visibility == Visibility.Visible || DetailsOverlay.Visibility == Visibility.Visible ||
+                   LogPanel.Visibility == Visibility.Visible;
+        DrawerLayer.Visibility = Visibility.Collapsed;
+        DetailsOverlay.Visibility = Visibility.Collapsed;
+        LogPanel.Visibility = Visibility.Collapsed;
+        Home.Visibility = Visibility.Visible;
+        return any;
+    }
+
+    private void Log_Click(object sender, RoutedEventArgs e) =>
+        LogPanel.Visibility = LogPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
 
     private void Tile_Click(object sender, MouseButtonEventArgs e)
     {
@@ -107,14 +216,30 @@ public partial class MainWindow : Window
     private void Window_KeyDown(object sender, KeyEventArgs e)
     {
         if (e.OriginalSource is System.Windows.Controls.TextBox) return;
-        if (SetupOverlay.Visibility == Visibility.Visible || NewWorldOverlay.Visibility == Visibility.Visible ||
-            PickFriendOverlay.Visibility == Visibility.Visible || _lobby.HasIncoming || _lobby.SessionActive) return;
-        int i = _lobby.SelectedGame == null ? 0 : _lobby.Games.IndexOf(_lobby.SelectedGame);
+        if (SetupOverlay.Visibility == Visibility.Visible || _lobby.HasIncoming || _lobby.SessionActive) return;
+        if (NewWorldOverlay.Visibility == Visibility.Visible || PickFriendOverlay.Visibility == Visibility.Visible)
+        {
+            if (e.Key == Key.Escape) { NewWorldOverlay.Visibility = PickFriendOverlay.Visibility = Visibility.Collapsed; e.Handled = true; }
+            return;
+        }
+        if (e.Key == Key.Escape) { e.Handled = CloseOverlays(); return; }
+        if (DrawerLayer.Visibility == Visibility.Visible) return;
+        int i = _lobby.SelectedGame == null ? 0 : Math.Max(0, _visible.IndexOf(_lobby.SelectedGame));
+        e.Handled = true;
         switch (e.Key)
         {
-            case Key.Left: _lobby.SelectedGame = _lobby.Games[Math.Max(0, i - 1)]; e.Handled = true; break;
-            case Key.Right: _lobby.SelectedGame = _lobby.Games[Math.Min(_lobby.Games.Count - 1, i + 1)]; e.Handled = true; break;
-            case Key.Enter: Play_Click(sender, e); e.Handled = true; break;
+            case Key.Left when _visible.Count > 0: _lobby.SelectedGame = _visible[Math.Max(0, i - 1)]; break;
+            case Key.Right when _visible.Count > 0: _lobby.SelectedGame = _visible[Math.Min(_visible.Count - 1, i + 1)]; break;
+            case Key.Q: SwitchTab(-1); break;
+            case Key.E: SwitchTab(1); break;
+            case Key.F:
+            case Key.W: OpenFriends_Click(sender, e); break;
+            case Key.D:
+                if (DetailsOverlay.Visibility == Visibility.Visible) CloseOverlays(); else Details_Click(sender, e);
+                break;
+            case Key.P: Log_Click(sender, e); break;
+            case Key.Enter: Play_Click(sender, e); break;
+            default: e.Handled = false; break;
         }
     }
 
@@ -122,6 +247,7 @@ public partial class MainWindow : Window
     {
         var g = _lobby.SelectedGame;
         if (g == null || !g.Available || _lobby.SessionActive) return;
+        CloseOverlays();
         if (g.Key == "batman1")
         {
             // Erste Welt, deren Partner online ist; sonst eine neue Welt anlegen
@@ -134,7 +260,14 @@ public partial class MainWindow : Window
         if (g.Key == "batman2")
         {
             var friends = _lobby.Friends.Where(f => f.IsFriend).OrderByDescending(f => f.Online).ToList();
-            if (friends.Count == 0) { _lobby.Hint = "Füge zuerst rechts einen Freund über seinen Code hinzu."; FriendCodeBox.Focus(); return; }
+            if (friends.Count == 0)
+            {
+                _lobby.Hint = "Füge zuerst einen Freund über seinen Code hinzu.";
+                OpenFriends_Click(sender, e);
+                FriendCodeBox.Focus();
+                return;
+            }
+            CloseOverlays();
             PickFriendList.ItemsSource = friends;
             PickFriendList.SelectedItem = friends.FirstOrDefault(f => f.Online);
             PickFriendError.Text = "";
@@ -153,16 +286,12 @@ public partial class MainWindow : Window
 
     private void PickFriendCancel_Click(object sender, RoutedEventArgs e) => PickFriendOverlay.Visibility = Visibility.Collapsed;
 
-    private void RailGames_Click(object sender, RoutedEventArgs e) => Focus();
-
-    private void RailFriends_Click(object sender, RoutedEventArgs e) => FriendCodeBox.Focus();
-
-    private void RailLog_Click(object sender, RoutedEventArgs e) => LogExpander.IsExpanded = !LogExpander.IsExpanded;
-
     // Test (--shot Datei [--shot-game Schluessel]): Fenster selbst rendern, als PNG speichern, beenden
     private async Task ShotAsync(AppOptions opt)
     {
         if (opt.ShotGame != null && _lobby.Games.FirstOrDefault(g => g.Key == opt.ShotGame) is { } g) _lobby.SelectedGame = g;
+        if (opt.ShotView == "freunde") OpenFriends_Click(this, new RoutedEventArgs());
+        if (opt.ShotView == "details") Details_Click(this, new RoutedEventArgs());
         await Task.Delay(2500);
         var root = (FrameworkElement)Content;
         var dpi = System.Windows.Media.VisualTreeHelper.GetDpi(this);
@@ -193,6 +322,7 @@ public partial class MainWindow : Window
     private async void Copy_Click(object sender, RoutedEventArgs e)
     {
         try { Clipboard.SetText(_lobby.MyCode); } catch { return; }
+        ShowToast("FREUNDESCODE", $"{_lobby.MyCode} kopiert – schick ihn deinem Freund.", "✓");
         CodeText.Text = "Kopiert ✓";
         await Task.Delay(1500);
         CodeText.SetBinding(System.Windows.Controls.TextBlock.TextProperty, nameof(Lobby.MyCode));
@@ -235,6 +365,7 @@ public partial class MainWindow : Window
             _lobby.Hint = "Füge zuerst einen Freund hinzu – eine Welt teilst du immer mit einem Freund.";
             return;
         }
+        CloseOverlays();
         WorldNameBox.Text = "";
         NewWorldError.Text = "";
         PartnerList.ItemsSource = friends;

@@ -25,18 +25,21 @@ Einrichten (einmalig)
 
 Die Startseite
 --------------
-Oben steht eine Reihe Spielkacheln, dahinter das Bild des gewaehlten Spiels.
-Mit der Maus oder den Pfeiltasten waehlst du das Spiel, Enter startet
-"Zusammen spielen". Online spielbar sind LEGO Batman 1 und 2; Pirates of the
-Caribbean, Marvel Super Heroes und Harry Potter sind Platzhalter ("BALD").
-Rechts stehen deine Welten (nur Batman 1) und deine Freunde.
+Aufgebaut wie das PS5-Menue: unten eine Reihe Spielkacheln, dahinter das Bild
+des gewaehlten Spiels. Mit der Maus oder den Pfeiltasten waehlst du das Spiel,
+Enter startet "Zusammen spielen". Oben filtern die Reiter (Q / E) nach
+"Online-Koop" und "Demnaechst". Online spielbar sind LEGO Batman 1 und 2;
+Pirates of the Caribbean, Marvel Super Heroes und Harry Potter sind
+Platzhalter ("BALD").
+Tasten: F = Freunde und Welten (Seitenleiste rechts), D = Details zum Spiel,
+P = Protokoll, Esc = schliessen. Alles geht auch per Klick unten rechts.
 
 
 Freunde hinzufuegen (einmalig)
 ------------------------------
-1. Oben rechts steht dein Freundescode, z. B. HN4U-JZJ2-9NYW.
+1. Oben rechts unter deinem Namen steht dein Freundescode, z. B. HN4U-JZJ2-9NYW.
    Draufklicken kopiert ihn; dann dem Freund schicken (Discord, WhatsApp ...).
-2. Der Freund gibt den Code rechts bei "Freunde" ein und drueckt "Hinzufuegen".
+2. Der Freund oeffnet "Freunde" (Taste F), gibt den Code ein und drueckt "Hinzufuegen".
 3. Bei dir erscheint die Anfrage in der Freundesliste -> "Annehmen".
 Ab jetzt seht ihr, wer online ist (gruen = online, gelb = spielt gerade).
 
@@ -44,7 +47,7 @@ Ab jetzt seht ihr, wer online ist (gruen = online, gelb = spielt gerade).
 Gemeinsame Welt anlegen (einmalig)
 ----------------------------------
 Eine Welt ist ein Spielstand, den ihr zu zweit teilt.
-1. Die Kachel "LEGO Batman" waehlen und "+ Neue Welt" druecken.
+1. Die Kachel "LEGO Batman" waehlen, "Freunde" (F) oeffnen und unten "+ Neue Welt" druecken.
 2. Namen eingeben (z. B. "Gotham"), den Freund waehlen und festlegen, ob ihr
    neu anfangt oder einen deiner Spielstaende als Start nehmt.
 3. Die Welt erscheint bei euch beiden. Dein eigener Spielstand bleibt

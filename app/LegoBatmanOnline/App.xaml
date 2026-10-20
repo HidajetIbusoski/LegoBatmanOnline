@@ -121,7 +121,7 @@
                                             <Setter TargetName="b" Property="Background" Value="{StaticResource CardHover}"/>
                                         </Trigger>
                                         <Trigger Property="IsSelected" Value="True">
-                                            <Setter TargetName="b" Property="BorderBrush" Value="{StaticResource Accent}"/>
+                                            <Setter TargetName="b" Property="BorderBrush" Value="#E6FFFFFF"/>
                                         </Trigger>
                                     </ControlTemplate.Triggers>
                                 </ControlTemplate>

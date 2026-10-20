@@ -12,3 +12,4 @@ app/**/bin/
 app/**/obj/
 dist-neu/
 dist-b2/
+dist-ps5/

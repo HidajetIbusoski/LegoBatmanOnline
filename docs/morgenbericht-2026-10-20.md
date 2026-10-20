@@ -37,7 +37,10 @@
 ## 2. Launcher
 
 ![Batman 2 gewählt](bilder/launcher-batman2.jpg)
-![Platzhalter gewählt](bilder/launcher-platzhalter.jpg)
+![Details](bilder/launcher-details.jpg)
+![Freunde](bilder/launcher-freunde.jpg)
+
+*Nachtrag 20.10. vormittags:* Startseite auf Wunsch nach einem PS5-Startbildschirm umgebaut (Kachelreihe unten, Reiter, Benachrichtigung, Freunde-Seitenleiste, Detailansicht). Paket: `dist-ps5\LegoBatmanOnline.zip`.
 
 - **Vorlage:** Pinterest, Suche „game UI menu“. Ohne Anmeldung zeigt Pinterest nur die Vorschaubilder der Suchergebnisse; anmelden durfte ich mich nicht. Von 15 Ergebnissen waren zwei am futuristischsten: ein Sci-Fi-Einstellungsmenü mit runder Symbolleiste und ein holografisches Panel mit Eckwinkeln. Beides ist nachgebaut, dazu die PS5-Anordnung, die du wolltest.
 - **Aufbau:** oben die Reihe quadratischer Spielkacheln. Die gewählte ist größer und leuchtet, dahinter liegt das Vollbild des Spiels mit Überblendung. Unten links stehen Logo, Status, Beschreibung und „Zusammen spielen“, rechts ein Glas-Panel mit Welten (Batman 1) und Freunden, oben Freundescode, Name und Uhr.

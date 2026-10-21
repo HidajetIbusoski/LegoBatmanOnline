@@ -86,8 +86,7 @@ startet Steam bei Bedarf selbst und wartet auf die Anmeldung.
 1. Die Kachel "LEGO Batman 2" waehlen und "Zusammen spielen" druecken,
    dann den Freund waehlen (oder beim Freund direkt "Einladen"). Der andere
    drueckt "Annehmen und spielen".
-2. Das Spiel startet bei beiden. Die erste Minute (Logos, Titelbild) laeuft
-   absichtlich langsam, das haelt beide Spiele im Gleichschritt.
+2. Das Spiel startet bei beiden.
 3. Der Einladende bedient die Menues: "Neues Spiel", dann "Ohne zu speichern
    fortfahren". Spielstaende gibt es bei Batman 2 noch nicht.
 4. Im Level drueckt der Eingeladene START und steigt als Robin ein.

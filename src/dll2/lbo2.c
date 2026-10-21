@@ -3213,7 +3213,9 @@ static void init(void)
         g_loopgate = g_iowait = g_nodinput = 1;
         g_rng_reset = 0;
         if (g_fps_cap <= 0) g_fps_cap = 60;
-        if (!g_slow_start) g_slow_start = 320;   // Intro-Start bei Frame 283/284 haengt sonst am Tempo
+        // Kein Langsamstart mehr (frueher 320 Frames x 50 ms, etwa 15 s zaehe Logos): Den seltenen 1-Frame-Versatz des
+        // Intros (Frame 283/284) gleicht die Schranke am Levelstart aus (Test S2, 22.10.: Gast 1 Frame frueher, danach
+        // alles gleich). LBO_SLOWSTART=320 schaltet ihn wieder ein.
         input_init(GetProcAddress(LoadLibraryA("xinput1_3.dll"), (LPCSTR)2), logf_);   // Ordinal 2 = XInputGetState
     }
     if (g_mode == MODE_SCRIPT && GetEnvironmentVariableA("LBO_SCRIPT", buf, sizeof buf)) load_script(buf);

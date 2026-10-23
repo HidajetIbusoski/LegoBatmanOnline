@@ -11,9 +11,13 @@
 #include <shlobj.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
+#include <restartmanager.h>
 #include <stdio.h>
 #include <string.h>
+#include <wchar.h>
 #include "online.h"
+#include "../common/b2cfg.h"
+#pragma comment(lib, "rstrtmgr.lib")
 
 // --b2: LEGO Batman 2 statt LEGO Batman (eigene DLL lbo2.dll, siehe docs/batman2-phase0.md)
 static int g_b2;
@@ -185,7 +189,7 @@ static int launch(const char *game, const char *dll, const char *args, int wait)
     }
 
     ResumeThread(pi.hThread);
-    printf("lbo-launch: Spiel gestartet (PID %lu), lbo.dll bei 0x%08lx\n", pi.dwProcessId, mod);
+    printf("lbo-launch: Spiel gestartet (PID %lu), Mod-DLL bei 0x%08lx\n", pi.dwProcessId, mod);
     fflush(stdout);
 
     DWORD code = 0;
@@ -222,6 +226,136 @@ static void press_enter(void)
 }
 
 static int run_session(ONLINE *o, const char *game, const char *dll, int autoload_slot, const char *host_saves);
+
+// --- LEGO Batman 2: gemeinsame Einstellungen (pcconfig.txt) -------------------------------------
+// Desync 23.10.2026: Die pcconfig.txt des Hosts war beim Start kurz nicht lesbar, es ging keine Datei an den Gast,
+// und beide Spiele nahmen still ihre eigene. Jetzt einigen sich beide hier auf genau einen Satz Bytes:
+//  Host: liest die Datei robust (b2cfg_load); sonst die zuletzt gute Kopie, sonst den eingebauten Standard. Er
+//        schickt immer genau diese eine Datei und benutzt selbst dieselben Bytes.
+//  Gast: verlangt genau eine Datei "pcconfig.txt".
+//  Beide: schreiben die Bytes nach <logdir>\netz_basis.txt (liest sonst niemand), pruefen sie per Zuruecklesen,
+//        setzen LBO_HOSTCONFIG/LBO_CFGHASH fuer lbo2.dll und vergleichen den Hash an der Bereit-Schranke.
+static const char *u8(const wchar_t *w, char *out, int n)
+{
+    if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, out, n, NULL, NULL)) strcpy(out, "?");
+    return out;
+}
+
+static const char *src_name(unsigned src)
+{
+    return src == B2CFG_SRC_ECHT ? "pcconfig.txt des Hosts" : src == B2CFG_SRC_KOPIE ? "zuletzt gute Kopie des Hosts"
+         : src == B2CFG_SRC_STANDARD ? "eingebauter Grafik-Standard" : "unbekannt";
+}
+
+// Wer haelt die Datei offen? (Restart Manager, nur fuers Log)
+static void log_lock_owner(const wchar_t *path)
+{
+    DWORD sess, reason = 0;
+    WCHAR key[CCH_RM_SESSION_KEY + 1];
+    RM_PROCESS_INFO info[8];
+    UINT need = 0, n = 8, i;
+    LPCWSTR files[1];
+    char name[400];
+    files[0] = path;
+    if (RmStartSession(&sess, 0, key) != ERROR_SUCCESS) return;
+    if (RmRegisterResources(sess, 1, files, 0, NULL, 0, NULL) == ERROR_SUCCESS) {
+        DWORD r = RmGetList(sess, &need, &n, info, &reason);
+        if (r == ERROR_SUCCESS) {
+            for (i = 0; i < n && i < 8; i++)
+                printf("Einstellungen: Datei ist offen bei %s (PID %lu)\n", u8(info[i].strAppName, name, sizeof name), info[i].Process.dwProcessId);
+            if (!n) printf("Einstellungen: kein Prozess haelt die Datei offen (laut Restart Manager)\n");
+        } else if (r == ERROR_MORE_DATA) {
+            printf("Einstellungen: Datei ist bei %u Prozessen offen\n", need);
+        }
+    }
+    RmEndSession(sess);
+}
+
+static void cfg_read_error(int attempt, DWORD err, const wchar_t *path)
+{
+    char p[MAX_PATH * 3];
+    if (attempt == 1 || attempt % 5 == 0)
+        printf("Einstellungen: %s nicht lesbar (Versuch %d, Fehler %lu)\n", u8(path, p, sizeof p), attempt, err);
+    if (attempt == 1 && (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION || err == ERROR_ACCESS_DENIED))
+        log_lock_owner(path);
+}
+
+static int write_file_w(const wchar_t *path, const void *data, DWORD len)
+{
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD w = 0;
+    BOOL ok;
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    ok = WriteFile(h, data, len, &w, NULL) && w == len;
+    if (!CloseHandle(h)) ok = FALSE;
+    return ok;
+}
+
+// Rueckgabe 1: hash (SHA-256 der benutzten Bytes) und *src gesetzt, LBO_HOSTCONFIG/LBO_CFGHASH gesetzt
+static int b2_settings(ONLINE *o, const char *logdir, unsigned char hash[32], unsigned *src)
+{
+    static char buf[B2CFG_MAX], back[B2CFG_MAX];
+    wchar_t real[MAX_PATH], cache[MAX_PATH], tmp[MAX_PATH], dir[MAX_PATH], basis[MAX_PATH];
+    DWORD len = 0, err = 0, err_real = 0, blen = 0;
+    unsigned char h2[32];
+    char hex[65], p[MAX_PATH * 3];
+    *src = B2CFG_SRC_NONE;
+    if (o->role == 0) {
+        if (SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, real) != S_OK) real[0] = 0;
+        else wcscat_s(real, MAX_PATH, L"\\Warner Bros. Interactive Entertainment\\LEGO Batman 2\\pcconfig.txt");
+        if (SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, cache) != S_OK) cache[0] = 0;
+        else {
+            wcscat_s(cache, MAX_PATH, L"\\LegoBatmanOnline");
+            CreateDirectoryW(cache, NULL);
+            wcscat_s(cache, MAX_PATH, L"\\host-einstellungen");
+            CreateDirectoryW(cache, NULL);
+            wcscat_s(cache, MAX_PATH, L"\\letzte_pcconfig.txt");
+        }
+        if (b2cfg_load(real, buf, sizeof buf, &len, &err_real, 15, cfg_read_error)) {
+            *src = B2CFG_SRC_ECHT;
+            // zuletzt gute Kopie fuer das naechste Mal (erst schreiben, dann ersetzen)
+            if (cache[0]) {
+                swprintf(tmp, MAX_PATH, L"%ls.neu", cache);
+                if (!write_file_w(tmp, buf, len) || !MoveFileExW(tmp, cache, MOVEFILE_REPLACE_EXISTING))
+                    printf("Einstellungen: Kopie %s nicht gespeichert (Fehler %lu)\n", u8(cache, p, sizeof p), GetLastError());
+            }
+        } else if (cache[0] && b2cfg_load(cache, buf, sizeof buf, &len, &err, 3, NULL)) {
+            *src = B2CFG_SRC_KOPIE;
+            printf("Einstellungen: pcconfig.txt nicht lesbar (Fehler %lu), nehme die zuletzt gute Kopie\n", err_real);
+        } else {
+            *src = B2CFG_SRC_STANDARD;
+            len = (DWORD)strlen(k_b2cfg_default);
+            memcpy(buf, k_b2cfg_default, len + 1);
+            printf("Einstellungen: pcconfig.txt nicht lesbar (Fehler %lu), keine Kopie - Grafik-Standard verwendet\n", err_real);
+        }
+        if (!online_send_blob(o, "pcconfig.txt", buf, len)) { printf("ERROR Einstellungen konnten nicht gesendet werden.\n"); return 0; }
+    } else {
+        unsigned ulen = 0;
+        if (!online_receive_blob(o, "pcconfig.txt", buf, sizeof buf - 1, &ulen)) {
+            printf("ERROR Einstellungen des Hosts nicht empfangen.\n");
+            return 0;
+        }
+        len = ulen;
+        buf[len] = 0;
+    }
+    b2_sha256(buf, len, hash);
+    b2_hex(hash, hex);
+    // Dieselben Bytes fuer die eigene DLL: Datei im Log-Ordner, die sonst niemand oeffnet; zuruecklesen und pruefen
+    if (!MultiByteToWideChar(CP_ACP, 0, logdir, -1, dir, MAX_PATH)) { printf("ERROR Log-Ordner ungueltig.\n"); return 0; }
+    swprintf(basis, MAX_PATH, L"%ls\\netz_basis.txt", dir);
+    if (!write_file_w(basis, buf, len)) {
+        printf("ERROR Einstellungen nicht speicherbar (%s, Fehler %lu).\n", u8(basis, p, sizeof p), GetLastError());
+        return 0;
+    }
+    if (!b2cfg_load(basis, back, sizeof back, &blen, &err, 5, NULL) || (b2_sha256(back, blen, h2), memcmp(h2, hash, 32))) {
+        printf("ERROR Einstellungen fehlerhaft (%s, Fehler %lu).\n", u8(basis, p, sizeof p), err);
+        return 0;
+    }
+    SetEnvironmentVariableW(L"LBO_HOSTCONFIG", basis);
+    SetEnvironmentVariableA("LBO_CFGHASH", hex);
+    printf("Einstellungen: %s, %lu Bytes, SHA-256 %.16s\n", o->role == 0 ? src_name(*src) : "vom Host empfangen", len, hex);
+    return 1;
+}
 
 // Immer Vollbild (unabhaengig von der Einstellung im Spiel). Nur Tests mit zwei Spielen auf
 // einem PC laufen im Fenster (LBO_WINDOWED=1).
@@ -311,8 +445,12 @@ static int run_session(ONLINE *o_, const char *game, const char *dll, int autolo
 {
     char save_dir[MAX_PATH], guest_saves[MAX_PATH], logdir[MAX_PATH], peer[64], buf[64], appdata[MAX_PATH];
     SYSTEMTIME st;
-    int delay;
+    int delay, rb;
+    unsigned char cfg[32], peer_cfg[32];
+    unsigned src = B2CFG_SRC_NONE, peer_src = B2CFG_SRC_NONE;
     ONLINE o = *o_;
+    memset(cfg, 0, sizeof cfg);
+    memset(peer_cfg, 0, sizeof peer_cfg);
     printf("STATUS ping\n");
     if (online_measure_ping(&o) < 0) { printf("ERROR Ping-Messung fehlgeschlagen.\n"); online_close(); return 1; }
     // Eingabeverzoegerung: halbe Rundlaufzeit plus Puffer, in 60-Hz-Frames
@@ -337,23 +475,10 @@ static int run_session(ONLINE *o_, const char *game, const char *dll, int autolo
     // LEGO Batman 2: noch kein Spielstand-Austausch. Beide starten ohne Spielstaende (die DLL leitet
     // Lesen und Schreiben im Netzmodus um), der Host waehlt "Neues Spiel". Uebertragen wird nur die pcconfig.txt
     // des Hosts: Andere Grafikeinstellungen lassen Figuren auseinanderlaufen (Test CA, 23.10.: Gast mit niedrigen
-    // Einstellungen, ab Frame 912 nach Levelstart andere Positionen). Die DLL liest daraus alle Einstellungen
-    // ausser Aufloesung, Fenster, Lautstaerke und Steuerung.
+    // Einstellungen, ab Frame 912 nach Levelstart andere Positionen). Die DLL baut daraus die Einstellungen
+    // beider Spiele (eigene nur Aufloesung, Fenster, Lautstaerke und Steuerung), siehe b2_settings.
     if (g_b2) {
-        char cfgdir[MAX_PATH];
-        SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, cfgdir);
-        strcat(cfgdir, "\\Warner Bros. Interactive Entertainment\\LEGO Batman 2");
-        if (o.role == 0) {
-            if (!online_send_saves(&o, cfgdir, "pcconfig.txt")) { printf("ERROR Einstellungen konnten nicht gesendet werden.\n"); online_close(); return 1; }
-        } else {
-            char cfg[MAX_PATH];
-            strcat(guest_saves, "\\host-einstellungen");
-            CreateDirectoryA(guest_saves, NULL);
-            snprintf(cfg, sizeof cfg, "%s\\pcconfig.txt", guest_saves);
-            DeleteFileA(cfg);   // nur die Datei dieses Hosts verwenden
-            if (!online_receive_saves(&o, guest_saves)) { printf("ERROR Einstellungen des Hosts nicht empfangen.\n"); online_close(); return 1; }
-            if (GetFileAttributesA(cfg) != INVALID_FILE_ATTRIBUTES) SetEnvironmentVariableA("LBO_HOSTCONFIG", cfg);
-        }
+        if (!b2_settings(&o, logdir, cfg, &src)) { online_close(); return 1; }
     } else if (o.role == 0) {
         if (!online_send_saves(&o, save_dir, "SaveGame*")) { printf("ERROR Spielstand konnte nicht gesendet werden.\n"); online_close(); return 1; }
     } else {
@@ -376,7 +501,19 @@ static int run_session(ONLINE *o_, const char *game, const char *dll, int autolo
         }
         if (!online_receive_saves(&o, guest_saves)) { printf("ERROR Spielstand nicht empfangen.\n"); online_close(); return 1; }
     }
-    if (!online_ready_barrier(&o, &delay)) { printf("ERROR Mitspieler hat nicht bestaetigt.\n"); online_close(); return 1; }
+    rb = online_ready_barrier(&o, &delay, cfg, src, peer_cfg, &peer_src);
+    if (rb == -2) { printf("ERROR Dein Mitspieler hat eine andere Version von LEGO Online - bitte beide aktualisieren.\n"); online_close(); return 1; }
+    if (rb == -1) {
+        char mine[65], theirs[65];
+        b2_hex(cfg, mine);
+        b2_hex(peer_cfg, theirs);
+        printf("ERROR Einstellungen verschieden (Host %.8s / Gast %.8s) - bitte neu einladen.\n",
+               o.role == 0 ? mine : theirs, o.role == 0 ? theirs : mine);
+        online_close();
+        return 1;
+    }
+    if (rb != 1) { printf("ERROR Mitspieler hat nicht bestaetigt.\n"); online_close(); return 1; }
+    if (g_b2 && o.role == 1) printf("Einstellungen des Hosts: %s (gleich, SHA-256 geprueft)\n", src_name(peer_src));
     snprintf(peer, sizeof peer, "%s:%d", inet_ntoa(o.peer.sin_addr), ntohs(o.peer.sin_port));
     online_close();
 
@@ -525,7 +662,11 @@ static int app_mode(int argc, char **argv)
     // normalerweise vorher, das hier ist der Rueckfall)
     if (g_b2) ensure_steam();
     printf("STATUS verbinde\n");
-    if (!online_connect(&o, hash, 60)) { printf("ERROR Keine Verbindung zum Partner\n"); online_close(); return 1; }
+    if (!online_connect(&o, hash, 60)) {
+        printf("ERROR %s\n", online_error[0] ? online_error : "Keine Verbindung zum Partner");
+        online_close();
+        return 1;
+    }
     printf("STATUS verbunden\n");
     return run_session(&o, game, dll, slot, savedir);
 }

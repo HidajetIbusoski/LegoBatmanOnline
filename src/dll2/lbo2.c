@@ -29,6 +29,10 @@
 //   LBO_VCLOCK     1 = virtuelle Uhr: Der Spiel-Timer liefert im Hauptthread Frame x 1/60 statt Echtzeit
 //   LBO_TRACERNG   von,bis: Aufrufer von 0x51a1d0 (rng_a) je Frame nach rngtrace.txt
 //   LBO_WINDOWED   1 = Fenstermodus erzwingen (Direct3D Windowed=1)
+//   LBO_HOSTCONFIG Netz: gemeinsame pcconfig.txt-Bytes vom Launcher (<LBO_DIR>\netz_basis.txt), siehe net_pcconfig
+//   LBO_CFGHASH    Netz: SHA-256 (hex) dieser Bytes; passt er nicht, gilt der eingebaute Standard
+//   LBO_OWNCONFIG  Test: eigene Einstellungen (Aufloesung, Ton, Steuerung) aus dieser Datei statt %APPDATA%
+//   LBO_PCCONFIG   Test: pcconfig.txt roh aus dieser Datei (ohne netz_pcconfig.txt)
 #define COBJMACROS
 #include <windows.h>
 #include <xmmintrin.h>
@@ -40,6 +44,7 @@
 #include <tlhelp32.h>
 #include <intrin.h>
 #include "../dll/net.h"
+#include "../common/b2cfg.h"
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
 
@@ -600,84 +605,207 @@ static int is_pcconfig(const char *path)
 }
 
 // Netz: Gleiche Grafikeinstellungen auf beiden Seiten. Test CA (23.10.): Gast mit niedrigen Shader-/Schatten-/
-// Effekt-Stufen, ab Frame 912 nach Levelstart liefen Figuren anders. Beide lesen deshalb eine Datei aus der
-// pcconfig.txt des Hosts (Gast: LBO_HOSTCONFIG, vom Launcher empfangen); nur diese Schluessel bleiben die eigenen.
-// IgnoreVendorPresets=1, damit das Spiel nicht je nach Grafikkarte eigene Stufen waehlt. ScreenRefreshRate ist fest
-// 60: Die Rate waehlt den Anzeigemodus und wirkt auf die Spielzeit (Test KH, 23.10.: Host 120 Hz, Gast 60 Hz, ab
-// Frame 1785 nach Levelstart eine andere Position von Spieler 1; Aufloesung und VSync allein blieben gleich).
-static const char *const k_own_keys[] = {
-    "ScreenWidth", "ScreenHeight", "WindowWidth", "WindowHeight", "WindowLeft", "WindowTop",
-    "VerticalSync", "Brightness", "SFXVolume", "MusicVolume", "MasterVolume", "MusicEnabled", "SubtitlesEnabled",
-    "MouseSensitivity", "InvertY", "Vibration", NULL };
+// Effekt-Stufen, ab Frame 912 nach Levelstart liefen Figuren anders. Beide bauen deshalb netz_pcconfig.txt aus
+// derselben Datei des Hosts, die der Launcher beiden gegeben hat (LBO_HOSTCONFIG, SHA-256 in LBO_CFGHASH).
+// Desync 23.10.2026 16:02: Die Datei des Hosts war kurz nicht lesbar, beide nahmen still ihre eigene. Deshalb gibt
+// es keinen Rueckfall auf die eigene Datei mehr: Fehlt die Datei des Launchers oder stimmt ihr Hash nicht, gilt der
+// eingebaute Standard (g_cfg_bad, lautes Log); bei F30 vergleichen beide Seiten ihre Einstellungen (cfg_check).
+// netz_pcconfig.txt entsteht aus einer festen Vorlage (Reihenfolge und Format wie die Datei des Spiels):
+//  H = vom Host, nur diese Schluessel, Werte als Ganzzahl geklemmt (unbekannte Zeilen fallen weg)
+//  E = aus der eigenen pcconfig.txt (Aufloesung, Fenster, VSync, Ton, Steuerung), fehlend -> Standard
+//  F = fest auf beiden Seiten: IgnoreVendorPresets 1 (das Spiel waehlt sonst je nach Grafikkarte eigene Stufen),
+//      ScreenRefreshRate 60 (die Rate wirkt auf die Spielzeit; Test KH, 23.10.: Host 120 Hz, Gast 60 Hz, ab Frame
+//      1785 nach Levelstart eine andere Position von Spieler 1), Technik-Schalter auf dem Standard des Spiels.
+// Bereiche: Setter-Tabelle 0x1152b88 (Schluessel -> Setter, alle atoi ohne Pruefung; AspectRatio/SoftParticles
+// wirken nur bei FileVersion <= 2 bzw. < 5).
+typedef struct { const char *key; char kind; int lo, hi, def; } CFGKEY;
+#define OWN_LO (-65536)
+#define OWN_HI 65536
+static const CFGKEY k_cfg_tpl[] = {
+    { "FileVersion", 'F', 5, 5, 5 },
+    { "ScreenWidth", 'E', OWN_LO, OWN_HI, 1280 },
+    { "ScreenHeight", 'E', OWN_LO, OWN_HI, 720 },
+    { "WindowWidth", 'E', OWN_LO, OWN_HI, 1280 },
+    { "WindowHeight", 'E', OWN_LO, OWN_HI, 720 },
+    { "WindowLeft", 'E', OWN_LO, OWN_HI, -1 },
+    { "WindowTop", 'E', OWN_LO, OWN_HI, -1 },
+    { "ScreenRefreshRate", 'F', 60, 60, 60 },
+    { "VerticalSync", 'E', OWN_LO, OWN_HI, 0 },
+    { "AspectRatio", 'H', 0, 3, 1 },
+    { "FSAA", 'H', 0, 8, 0 },
+    { "ShaderQuality", 'H', 0, 3, 2 },
+    { "ShadowQuality", 'H', 0, 3, 3 },
+    { "TextureQuality", 'H', 0, 3, 1 },
+    { "SoftParticles", 'H', 0, 1, 1 },
+    { "Brightness", 'B', 0, 100, 10 },   // eigene, Gleitkomma wie im Original ("%f")
+    { "SFXVolume", 'E', OWN_LO, OWN_HI, 7 },
+    { "MusicVolume", 'E', OWN_LO, OWN_HI, 7 },
+    { "MasterVolume", 'E', OWN_LO, OWN_HI, 10 },
+    { "MusicEnabled", 'E', OWN_LO, OWN_HI, 1 },
+    { "SubtitlesEnabled", 'E', OWN_LO, OWN_HI, 0 },
+    { "MouseSensitivity", 'E', OWN_LO, OWN_HI, 10 },
+    { "InvertY", 'E', OWN_LO, OWN_HI, 0 },
+    { "Vibration", 'E', OWN_LO, OWN_HI, 0 },
+    { "BloomEnabled", 'H', 0, 1, 1 },
+    { "ExposureControlEnabled", 'H', 0, 1, 1 },
+    { "DoFEnabled", 'H', 0, 1, 1 },
+    { "SoftShadowsEnabled", 'H', 0, 1, 1 },
+    { "SpeedBlurEnabled", 'H', 0, 1, 1 },
+    { "MotionBlurEnabled", 'H', 0, 1, 1 },
+    { "ProcessColourEnabled", 'H', 0, 1, 1 },
+    { "WaterDistortionEnabled", 'H', 0, 1, 1 },
+    { "EdgeAAEnabled", 'H', 0, 1, 0 },
+    { "GPAAEnabled", 'H', 0, 1, 1 },
+    { "SSAOEnabled", 'H', 0, 1, 1 },
+    { "RingEffectEnabled", 'H', 0, 1, 1 },
+    { "LensFilterEnabled", 'H', 0, 1, 1 },
+    { "ScreenSpaceReflectionsEnabled", 'H', 0, 1, 1 },
+    { "UseHires", 'H', 0, 1, 1 },
+    { "UseHiresPending", 'H', 0, 1, 1 },
+    { "ForceMultithreadedD3D", 'F', 0, 0, 0 },
+    { "IgnoreVendorPresets", 'F', 1, 1, 1 },
+    { "DisableShaderCaching", 'F', 0, 0, 0 },
+    { "DisableMultithreadedShaders", 'F', 0, 0, 0 },
+    { "AllowVendorExtensions", 'F', 1, 1, 1 },
+};
 
-static int cfg_key(const char *line, char *key, size_t n)
-{
-    size_t i = 0;
-    while (line[i] && !isspace((unsigned char)line[i]) && i + 1 < n) { key[i] = line[i]; i++; }
-    key[i] = 0;
-    return i > 0;
-}
+static unsigned g_cfg_file_hash;   // FNV-1a ueber die logikrelevanten Zeilen (H und F) von netz_pcconfig.txt
+static int g_cfg_bad;              // Datei des Launchers fehlte oder Hash falsch: eingebauter Standard benutzt
+// Einstellungs-Abgleich mit dem Partner (net_set_cfg): {Datei-Hash, Laufzeit-Hash, Hz, Flags}
+#define CFG_FLAG_RT  1   // Laufzeitwerte enthalten (ab F30)
+#define CFG_FLAG_BAD 2   // eingebauter Standard statt der Datei des Launchers
 
-static int cfg_own_key(const char *key)
+// Wert zu key aus einem Puffer ("Schluessel  Wert" je Zeile); das letzte Vorkommen gilt, wie beim Spiel, das die
+// Zeilen nacheinander anwendet
+static int cfg_value(const char *buf, const char *key, char *out, size_t n)
 {
-    int i;
-    for (i = 0; k_own_keys[i]; i++) if (!_stricmp(key, k_own_keys[i])) return 1;
-    return 0;
-}
-
-// Liefert die Zeile zu key aus own (oder NULL)
-static const char *cfg_find(char lines[][160], int n, const char *key)
-{
-    char k[64];
-    int i;
-    for (i = 0; i < n; i++) if (cfg_key(lines[i], k, sizeof k) && !_stricmp(k, key)) return lines[i];
-    return NULL;
-}
-
-static int cfg_read(const char *path, char lines[][160], int max)
-{
-    FILE *f = fopen(path, "r");
-    int n = 0;
-    if (!f) return -1;
-    while (n < max && fgets(lines[n], 160, f)) {
-        size_t l = strlen(lines[n]);
-        while (l && (lines[n][l - 1] == '\n' || lines[n][l - 1] == '\r')) lines[n][--l] = 0;
-        if (l) n++;
+    const char *p = buf;
+    size_t kl = strlen(key);
+    int found = 0;
+    while (p && *p) {
+        const char *e = strchr(p, '\n');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l > kl && !_strnicmp(p, key, kl) && (p[kl] == ' ' || p[kl] == '\t')) {
+            const char *q = p + kl;
+            size_t vl;
+            while (q < p + l && (*q == ' ' || *q == '\t')) q++;
+            vl = (size_t)(p + l - q);
+            while (vl && (q[vl - 1] == '\r' || q[vl - 1] == ' ' || q[vl - 1] == '\t')) vl--;
+            if (vl >= n) vl = n - 1;
+            memcpy(out, q, vl);
+            out[vl] = 0;
+            found = 1;
+        }
+        p = e ? e + 1 : NULL;
     }
-    fclose(f);
-    return n;
+    return found;
+}
+
+static int cfg_int(const char *buf, const char *key, long *v)
+{
+    char s[64], *end;
+    long x;
+    if (!buf || !cfg_value(buf, key, s, sizeof s) || !s[0]) return 0;
+    x = strtol(s, &end, 10);
+    if (end == s || *end) return 0;
+    *v = x;
+    return 1;
+}
+
+// Baut netz_pcconfig.txt (out != NULL) aus Host- und eigenem Puffer und liefert den Hash der Zeilen H und F
+static unsigned cfg_build(const char *host, const char *own, FILE *out)
+{
+    unsigned h = 2166136261u;
+    char line[96];
+    size_t i, k;
+    for (i = 0; i < sizeof k_cfg_tpl / sizeof k_cfg_tpl[0]; i++) {
+        const CFGKEY *c = &k_cfg_tpl[i];
+        if (c->kind == 'B') {
+            char s[64], *end;
+            double b = c->def;
+            if (own && cfg_value(own, c->key, s, sizeof s)) {
+                double x = strtod(s, &end);
+                if (end != s && !*end && x == x) b = x;   // x == x: keine NaN
+            }
+            if (b < c->lo) b = c->lo;
+            if (b > c->hi) b = c->hi;
+            snprintf(line, sizeof line, "%-29s %f", c->key, b);
+        } else {
+            long v = c->def;
+            if (c->kind == 'H') cfg_int(host, c->key, &v);
+            else if (c->kind == 'E') cfg_int(own, c->key, &v);
+            if (v < c->lo) v = c->lo;
+            if (v > c->hi) v = c->hi;
+            snprintf(line, sizeof line, "%-29s %ld", c->key, v);
+        }
+        if (out) fprintf(out, "%s\r\n", line);
+        if (c->kind == 'H' || c->kind == 'F')
+            for (k = 0; line[k]; k++) h = (h ^ (unsigned char)line[k]) * 16777619u;
+    }
+    return h;
+}
+
+// Pfad fuers Log (UTF-8; %ls bricht bei Zeichen ausserhalb der Codepage ab)
+static const char *w2u(const wchar_t *w, char *out, int n)
+{
+    if (!w || !w[0] || !WideCharToMultiByte(CP_UTF8, 0, w, -1, out, n, NULL, NULL)) strcpy(out, "-");
+    return out;
+}
+
+static void cfg_load_error(int attempt, DWORD err, const wchar_t *path)
+{
+    char p[MAX_PATH * 3];
+    if (attempt == 1 || attempt % 5 == 0) logf_("Netz-Einstellungen: %s nicht lesbar (Versuch %d, Fehler %lu)", w2u(path, p, sizeof p), attempt, err);
 }
 
 static void net_pcconfig(void)
 {
-    static char host[96][160], own[96][160];
-    char path[MAX_PATH], hostpath[MAX_PATH], out[MAX_PATH], key[64];
-    int nh, no, i, ignore = 0;
+    static char host[B2CFG_MAX], own[B2CFG_MAX];
+    wchar_t hostpath[MAX_PATH], ownpath[MAX_PATH];
+    char out[MAX_PATH], want[80], hex[65], p1[MAX_PATH * 3], p2[MAX_PATH * 3];
+    unsigned char sha[32];
+    DWORD hlen = 0, olen = 0, err = 0;
+    int have_host = 0, have_own = 0;
+    const char *why = NULL;
     FILE *f;
-    if (!GetEnvironmentVariableA("APPDATA", path, MAX_PATH - 80)) return;
-    strcat(path, "\\Warner Bros. Interactive Entertainment\\LEGO Batman 2\\pcconfig.txt");
-    if (!GetEnvironmentVariableA("LBO_HOSTCONFIG", hostpath, sizeof hostpath)) strcpy(hostpath, path);
-    GetEnvironmentVariableA("LBO_OWNCONFIG", path, sizeof path);   // Test: eigene Einstellungen aus dieser Datei
-    no = cfg_read(path, own, 96);
-    nh = cfg_read(hostpath, host, 96);
-    if (nh <= 0) { logf_("Netz-Einstellungen: keine pcconfig.txt des Hosts (%s), Spiel nimmt eigene", hostpath); return; }
-    snprintf(out, sizeof out, "%s\\netz_pcconfig.txt", g_dir);
-    f = fopen(out, "w");
-    if (!f) return;
-    for (i = 0; i < nh; i++) {
-        const char *line = host[i], *mine;
-        if (!cfg_key(line, key, sizeof key)) continue;
-        if (!_stricmp(key, "IgnoreVendorPresets")) { fprintf(f, "IgnoreVendorPresets 1\n"); ignore = 1; continue; }
-        if (!_stricmp(key, "ScreenRefreshRate")) { fprintf(f, "ScreenRefreshRate 60\n"); continue; }
-        if (cfg_own_key(key) && no > 0 && (mine = cfg_find(own, no, key)) != NULL) line = mine;
-        fprintf(f, "%s\n", line);
+    // Einstellungen des Hosts: nur die Datei des Launchers mit passendem Hash
+    if (!GetEnvironmentVariableW(L"LBO_HOSTCONFIG", hostpath, MAX_PATH)) { hostpath[0] = 0; why = "LBO_HOSTCONFIG fehlt (alter Launcher?)"; }
+    else if (!b2cfg_load(hostpath, host, sizeof host, &hlen, &err, 5, cfg_load_error)) why = "Datei nicht lesbar";
+    else if (!GetEnvironmentVariableA("LBO_CFGHASH", want, sizeof want)) why = "LBO_CFGHASH fehlt";
+    else {
+        b2_sha256(host, hlen, sha);
+        b2_hex(sha, hex);
+        if (_stricmp(hex, want)) why = "SHA-256 passt nicht";
+        else have_host = 1;
     }
-    for (i = 0; i < no; i++)   // eigene Schluessel, die in der Host-Datei fehlen
-        if (cfg_key(own[i], key, sizeof key) && cfg_own_key(key) && !cfg_find(host, nh, key)) fprintf(f, "%s\n", own[i]);
-    if (!ignore) fprintf(f, "IgnoreVendorPresets 1\n");
+    if (!have_host) {
+        g_cfg_bad = 1;
+        logf_("NETZ-EINSTELLUNGEN FEHLEN/FALSCH (%s: %s, Fehler %lu) - eingebauter Standard, Vergleich mit dem Partner bei F30",
+              w2u(hostpath, p1, sizeof p1), why, err);
+    }
+    // Eigene Einstellungen (Aufloesung, Ton, Steuerung); LBO_OWNCONFIG: Test
+    if (!GetEnvironmentVariableW(L"LBO_OWNCONFIG", ownpath, MAX_PATH)) {
+        if (GetEnvironmentVariableW(L"APPDATA", ownpath, MAX_PATH - 80))
+            wcscat_s(ownpath, MAX_PATH, L"\\Warner Bros. Interactive Entertainment\\LEGO Batman 2\\pcconfig.txt");
+        else ownpath[0] = 0;
+    }
+    have_own = ownpath[0] && b2cfg_load(ownpath, own, sizeof own, &olen, &err, 5, cfg_load_error);
+    if (!have_own) logf_("Netz-Einstellungen: eigene pcconfig.txt nicht lesbar (Fehler %lu), Aufloesung/Ton/Steuerung vom Standard", err);
+    snprintf(out, sizeof out, "%s\\netz_pcconfig.txt", g_dir);
+    f = fopen(out, "wb");
+    if (!f) {
+        // Ohne eigene Datei liest das Spiel seine pcconfig.txt; der Vergleich bei F30 meldet das (Hash 0)
+        logf_("NETZ-EINSTELLUNGEN: %s nicht schreibbar (Fehler %lu)", out, GetLastError());
+        g_cfg_bad = 1;
+        g_cfg_file_hash = 0;
+        return;
+    }
+    g_cfg_file_hash = cfg_build(have_host ? host : k_b2cfg_default, have_own ? own : NULL, f);
     fclose(f);
     strcpy(g_pcconfig, out);
-    logf_("Netz-Einstellungen: Grafik aus %s, Aufloesung/Ton/Steuerung aus %s, 60 Hz -> %s", hostpath, path, out);
+    logf_("Netz-Einstellungen: Grafik aus %s%s, Aufloesung/Ton/Steuerung aus %s, 60 Hz -> %s, Logik-Hash %08x",
+          have_host ? w2u(hostpath, p1, sizeof p1) : "dem eingebauten Standard", have_host ? " (SHA-256 geprueft)" : "",
+          have_own ? w2u(ownpath, p2, sizeof p2) : "dem Standard", out, g_cfg_file_hash);
 }
 
 static HANDLE WINAPI hook_createfile(LPCSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
@@ -1685,12 +1813,22 @@ __declspec(naked) static void stub_poll_device(void)
 
 // Hinweise an den Spieler (eigener Thread, damit das Spiel weiterlaeuft): 1 = nicht mehr synchron,
 // 2 = Partner antwortet nicht mehr, 3 = Spiel des Partners kommt nicht ueber den Start hinaus (lebt aber),
-// 4 = Partner weg, bevor sein Spiel ueberhaupt lief (Playtest 20.10. abends: vermutlich Steam bei ihm aus)
+// 4 = Partner weg, bevor sein Spiel ueberhaupt lief (Playtest 20.10. abends: vermutlich Steam bei ihm aus),
+// 5 = Einstellungen verschieden (Vergleich bei F30)
 static DWORD WINAPI net_notice(void *arg)
 {
     int kind = (int)(INT_PTR)arg;
+    static const char *const names[] = { "Verbindung verloren", "nicht mehr synchron", "?", "Mitspieler startet nicht",
+                                         "Mitspieler-Spiel beendet", "Einstellungen verschieden" };
+    logf_("Hinweisfenster %d (%s) angezeigt", kind, kind >= 0 && kind <= 5 ? names[kind] : "?");
     MessageBeep(MB_ICONEXCLAMATION);
-    if (kind == 3)
+    if (kind == 5)
+        MessageBoxW(NULL,
+            L"Eure Einstellungen sind verschieden - bitte neu einladen.\n\n"
+            L"Mit unterschiedlichen Grafik-Einstellungen laufen eure Spiele nach einiger Zeit auseinander. "
+            L"Beendet beide das Spiel und startet in der App erneut \"Zusammen spielen\".",
+            L"LEGO Online \u2013 Einstellungen verschieden", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+    else if (kind == 3)
         MessageBoxW(NULL,
             L"Das Spiel deines Mitspielers ist auch nach 45 Sekunden noch nicht gestartet.\n\n"
             L"Meist l\u00e4uft bei ihm Steam nicht oder ein Steam-Fenster (Anmeldung, Update) wartet auf ihn. "
@@ -1716,6 +1854,74 @@ static DWORD WINAPI net_notice(void *arg)
 }
 
 static void net_notice_cb(int kind) { CreateThread(NULL, 0, net_notice, (void *)(INT_PTR)kind, 0, NULL); }
+
+// --- Einstellungs-Vergleich bei F30 --------------------------------------------------------------------
+// Beide Seiten stehen nach net_sync_point am selben Frame. Verglichen werden der Logik-Hash von netz_pcconfig.txt
+// und Laufzeitwerte nach CreateDevice und der Hz-Korrektur: Bildwiederholrate 0x1154304, ShaderQuality 0x1154314,
+// ShadowQuality 0x1154318, TextureQuality 0x1154320 (Setter 0x638da0/0x6346c0/0x6346e0) und IgnoreVendorPresets
+// 0x1154325. Austausch ueber Paket Art 6 im Lebenszeichen-Thread (net.c), nicht ueber eine Schranke: Lockstep und
+// Epochen bleiben unberuehrt. Bei Abweichung: lautes Log und Hinweis 5, danach keine Reparaturen mehr.
+static int g_cfg_pending;      // 1 = Werte des Partners kamen bei F30 nicht rechtzeitig, weiter je Frame pruefen
+static int g_net_gave_up;      // Hinweis gezeigt (nicht synchron / Einstellungen verschieden): keine Reparaturen mehr
+static unsigned g_cfg_mine[4];
+
+static unsigned cfg_runtime_hash(unsigned *hz)
+{
+    unsigned h = 2166136261u;
+    int v[5], i;
+    __try {
+        v[0] = *(volatile int *)0x01154304;
+        v[1] = *(volatile int *)0x01154314;
+        v[2] = *(volatile int *)0x01154318;
+        v[3] = *(volatile int *)0x01154320;
+        v[4] = *(volatile unsigned char *)0x01154325;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { for (i = 0; i < 5; i++) v[i] = -1; }
+    *hz = (unsigned)v[0];
+    logf_("Einstellungen zur Laufzeit: %d Hz, Shader %d, Schatten %d, Texturen %d, IgnoreVendorPresets %d", v[0], v[1], v[2], v[3], v[4]);
+    for (i = 0; i < 5; i++) h = (h ^ (unsigned)v[i]) * 16777619u;
+    return h;
+}
+
+static void cfg_compare(const unsigned peer[4])
+{
+    if (peer[0] == g_cfg_mine[0] && peer[1] == g_cfg_mine[1]) {
+        logf_("Netz: Einstellungen gleich (Datei %08x, Laufzeit %08x, %u Hz)%s", g_cfg_mine[0], g_cfg_mine[1], g_cfg_mine[2],
+              (g_cfg_mine[3] | peer[3]) & CFG_FLAG_BAD ? " - eingebauter Standard auf mindestens einer Seite" : "");
+        return;
+    }
+    logf_("EINSTELLUNGEN VERSCHIEDEN: lokal Datei %08x / Laufzeit %08x / %u Hz%s, Partner Datei %08x / Laufzeit %08x / %u Hz%s",
+          g_cfg_mine[0], g_cfg_mine[1], g_cfg_mine[2], g_cfg_mine[3] & CFG_FLAG_BAD ? " (Standard)" : "",
+          peer[0], peer[1], peer[2], peer[3] & CFG_FLAG_BAD ? " (Standard)" : "");
+    if (!g_net_gave_up) {
+        g_net_gave_up = 1;
+        CreateThread(NULL, 0, net_notice, (void *)5, 0, NULL);
+    }
+}
+
+static void cfg_check_start(void)
+{
+    unsigned peer[4];
+    g_cfg_mine[0] = g_cfg_file_hash;
+    g_cfg_mine[1] = cfg_runtime_hash(&g_cfg_mine[2]);
+    g_cfg_mine[3] = CFG_FLAG_RT | (g_cfg_bad ? CFG_FLAG_BAD : 0);
+    net_set_cfg(g_cfg_mine);
+    g_in_wait = 1;
+    if (net_wait_peer_cfg(peer, CFG_FLAG_RT, 3000)) cfg_compare(peer);
+    else {
+        g_cfg_pending = 1;
+        logf_("Netz: Einstellungen des Partners noch nicht da (3 s), pruefe weiter je Frame");
+    }
+    g_in_wait = 0;
+}
+
+static void cfg_check_poll(void)
+{
+    unsigned peer[4];
+    if (g_cfg_pending && net_peer_cfg(peer) && (peer[3] & CFG_FLAG_RT)) {
+        g_cfg_pending = 0;
+        cfg_compare(peer);
+    }
+}
 
 // Lokale Eingabe abtasten (Skript zum Testen, sonst echter Controller) und mit dem Partner tauschen
 static void net_exchange(long F)
@@ -3139,7 +3345,11 @@ static void __cdecl on_frame_end(void)
         if (g_net && hz != 60) { *(volatile int *)0x01154304 = 60; last_hz = 60; }
     }
     if (g_rng_reset && F == g_rng_reset) reset_rng();
-    if (g_net && F == SYNC_EARLY_FRAME) net_sync_point(F, "nach dem Start");
+    if (g_net && F == SYNC_EARLY_FRAME) {
+        net_sync_point(F, "nach dem Start");
+        cfg_check_start();
+    }
+    if (g_net && g_cfg_pending) cfg_check_poll();
     if (g_anchor_mode && g_anchor < 0 && G_CHAR_COUNT > 2) {
         // Schranke am Levelstart: Vorher duerfen die Frames durch Ladezeiten leicht auseinanderliegen.
         // Der Gast uebernimmt den Zustand des Hosts, danach zaehlt der Lockstep ab dem Anker neu.
@@ -3203,28 +3413,39 @@ static void __cdecl on_frame_end(void)
                 logf_("Zufall je Verbraucher: LCG16 0x11a1844 trotzdem veraendert (%04x) - Zugriff fehlt in der Tabelle", G_RNG_LCG16);
             }
             char_snapshot(&k);
-            ck = ((unsigned long long)k.hash << 32) ^ (unsigned)k.n ^ G_RNG_LCG16 ^ ((unsigned long long)G_RNG_A << 16) ^
-                 ((unsigned long long)G_RNG_PM_DEFAULT << 40) ^ crt_rand_state();
+            // Pruefsumme in zwei Teilen (Desync 23.10.2026: Figuren und Zufall wichen zugleich ab, drei Reparaturen
+            // halfen nicht): obere 32 Bit = Figuren (Positions-Hash und Anzahl), untere 32 Bit = Zufall. Die
+            // Zufallsstroeme je Verbraucher (lcg_streams_hash) bleiben absichtlich draussen: kosmetische
+            // Verbraucher (Zeichnen, Musik) sollen keinen Alarm ausloesen.
+            ck = ((unsigned long long)(k.hash ^ ((unsigned)k.n * 0x9E3779B1u)) << 32) |
+                 (unsigned)(G_RNG_LCG16 ^ _rotl(G_RNG_A, 16) ^ _rotl(G_RNG_PM_DEFAULT, 8) ^ crt_rand_state());
             net_checksum((int)NF, ck);
             {
-                // Abweichung nach der letzten Reparatur: Host plant eine Reparatur 36-54 Frames voraus (der Gast
-                // erfaehrt es mit den Eingaben). Erst wenn drei Reparaturen nacheinander nicht helfen, Hinweis.
-                static int notified;
+                // Abweichung nach der letzten Reparatur: Weicht nur der Zufall ab, plant der Host eine Reparatur
+                // 36-54 Frames voraus (der Gast erfaehrt es mit den Eingaben); erst wenn drei Reparaturen nacheinander
+                // nicht helfen, Hinweis. Weichen die Figuren ab, hilft eine Reparatur nicht (sie setzt nur den
+                // Zufall): sofort Hinweis. Nach dem Hinweis keine Reparaturen mehr.
                 int last = net_last_desync();
-                if (last > g_last_repair && last != g_seen_desync) {
+                if (last > g_last_repair && last != g_seen_desync && !g_net_gave_up) {
                     g_seen_desync = last;
-                    if (g_last_repair && last - g_last_repair > 600) g_repairs = 0;   // neuer Vorfall
-                    if (g_repairs < 3) {
-                        if (net_role() == 0 && net_repair_frame() <= NF) {
-                            // Vorlauf: der Gast kann um seine Verzoegerung plus die Laufzeit voraus sein (WLAN: bis ~30)
-                            int lead = 30 + 2 * net_delay();
-                            net_schedule_repair((int)NF + lead);
-                            logf_("Netz: Abweichung bei Frame %d, Reparatur bei Frame %ld geplant", last, NF + lead);
-                        }
-                    } else if (!notified) {
-                        notified = 1;
-                        logf_("NICHT SYNCHRON: Hinweis an den Spieler");
+                    if (net_last_desync_parts() & 2) {
+                        g_net_gave_up = 1;
+                        logf_("NICHT SYNCHRON: Figuren weichen ab (Frame %d), keine Reparatur - Hinweis an den Spieler", last);
                         CreateThread(NULL, 0, net_notice, (void *)1, 0, NULL);
+                    } else {
+                        if (g_last_repair && last - g_last_repair > 600) g_repairs = 0;   // neuer Vorfall
+                        if (g_repairs < 3) {
+                            if (net_role() == 0 && net_repair_frame() <= NF) {
+                                // Vorlauf: der Gast kann um seine Verzoegerung plus die Laufzeit voraus sein (WLAN: bis ~30)
+                                int lead = 30 + 2 * net_delay();
+                                net_schedule_repair((int)NF + lead);
+                                logf_("Netz: Abweichung bei Frame %d (Zufall), Reparatur bei Frame %ld geplant", last, NF + lead);
+                            }
+                        } else {
+                            g_net_gave_up = 1;
+                            logf_("NICHT SYNCHRON: drei Reparaturen ohne Erfolg - Hinweis an den Spieler");
+                            CreateThread(NULL, 0, net_notice, (void *)1, 0, NULL);
+                        }
                     }
                 }
             }
@@ -3311,6 +3532,33 @@ static int patch_jmp(DWORD at, void *to, const unsigned char *expect)
     return 1;
 }
 
+// Bytes ersetzen, wenn an der Stelle genau expect steht (n_expect >= n_new)
+static int patch_bytes(DWORD at, const unsigned char *expect, size_t n_expect, const unsigned char *repl, size_t n_new)
+{
+    DWORD old;
+    unsigned char *p = (unsigned char *)at;
+    if (memcmp(p, expect, n_expect)) return 0;
+    VirtualProtect(p, n_new, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(p, repl, n_new);
+    VirtualProtect(p, n_new, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, n_new);
+    return 1;
+}
+
+// Netz: 60 Hz schon vor CreateDevice (Desync 23.10.2026: Der Host lief mit 120 Hz durch CreateDevice, die
+// Korrektur im Frame-Ende kam erst danach). Die Bildwiederholrate 0x1154304 setzen nur zwei Stellen:
+//  - 0x634660, Setter von ScreenRefreshRate beim Lesen der pcconfig.txt (Tabelle 0x1152bc4):
+//      mov eax,[esp+4] / push eax / call atoi 0x5623a0 / add esp,4 / mov [0x1154304],eax / ret
+//    -> mov dword [0x1154304],60 / ret (der Wert aus der Datei zaehlt nicht mehr)
+//  - 0x63fee7 im Anzeigemodus-Aufbau: mov [0x1154304],edx (Rate des gewaehlten Modus, wenn [ebp+0x160] == 0)
+//    -> 6 x nop. Der Modus selbst (und damit die echte Bildrate des Monitors) bleibt, nur die Spielvariable nicht.
+// Die Korrektur im Frame-Ende bleibt als Netz.
+static const unsigned char k_hz_set_orig[19] = { 0x8B, 0x44, 0x24, 0x04, 0x50, 0xE8, 0x36, 0xDD, 0xF2, 0xFF,
+                                                 0x83, 0xC4, 0x04, 0xA3, 0x04, 0x43, 0x15, 0x01, 0xC3 };
+static const unsigned char k_hz_set_new[11] = { 0xC7, 0x05, 0x04, 0x43, 0x15, 0x01, 0x3C, 0x00, 0x00, 0x00, 0xC3 };
+static const unsigned char k_hz_mode_orig[6] = { 0x89, 0x15, 0x04, 0x43, 0x15, 0x01 };
+static const unsigned char k_hz_mode_new[6] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+
 // --- Haken setzen, sobald die Huelle entschluesselt hat -----------------------------------------
 static DWORD WINAPI installer(void *arg)
 {
@@ -3321,9 +3569,10 @@ static DWORD WINAPI installer(void *arg)
     static const unsigned char vdt_orig[6] = { 0xD9, 0x1D, 0xDC, 0xF0, 0x1C, 0x01 };
     int vdt_done = !g_videodt, rng_done = !g_trace_to, rrng_done = !g_render_rng, poll_done = !g_net && !g_nodinput, post_done = !g_loadsync;
     int mutex_done = !g_multi, frame_done = 0, xinput_done = 0, d3d_done = 0, file_done = 0, fmv_done = !g_no_movies;
+    int hz_done = !g_net;
     (void)arg;
     // Eng pollen: Die Importtabelle wird von der Huelle befuellt, der Mutex kurz danach angelegt
-    while ((!mutex_done || !frame_done || !xinput_done || !d3d_done || !file_done || !fmv_done || !vdt_done || !rng_done || !rrng_done || !poll_done || !post_done) && GetTickCount() - start < 120000) {
+    while ((!mutex_done || !frame_done || !xinput_done || !d3d_done || !file_done || !fmv_done || !vdt_done || !rng_done || !rrng_done || !poll_done || !post_done || !hz_done) && GetTickCount() - start < 120000) {
         __try {
             if (!mutex_done && *(void **)IAT_CREATEMUTEXA == mutex_fn) {
                 patch_iat(IAT_CREATEMUTEXA, (void *)hook_createmutex, (void **)&real_createmutex);
@@ -3400,6 +3649,11 @@ static DWORD WINAPI installer(void *arg)
                             ONCE(p[8], patch_abs32(0x0094D212, 0x011A1844, &g_rr_music_lcg3)) &
                             ONCE(p[9], patch_render_rng_a_sites());
             }
+            if (!hz_done) {
+                static int p[2];
+                hz_done = ONCE(p[0], patch_bytes(0x00634660, k_hz_set_orig, sizeof k_hz_set_orig, k_hz_set_new, sizeof k_hz_set_new)) &
+                          ONCE(p[1], patch_bytes(0x0063FEE7, k_hz_mode_orig, sizeof k_hz_mode_orig, k_hz_mode_new, sizeof k_hz_mode_new));
+            }
             if (!fmv_done) fmv_done = patch_call(FMV_FIND_CALL, FMV_FIND, (void *)no_movie_find);
             if (!vdt_done && !memcmp((void *)VIDEO_DT_STORE, vdt_orig, 6)) {
                 // fstp [0x11cf0dc] -> fstp st(0) + 4 x nop
@@ -3415,8 +3669,8 @@ static DWORD WINAPI installer(void *arg)
         if (mutex_done && file_done) Sleep(1); else SwitchToThread();
     }
     logf_("Haken: Frame-Ende %d, XInput %d, Mutex %d, D3D %d, Dateien %d, Videos %d, Video-dt %d, Zufall %d, Zeichen-Zufall %d, "
-          "Eingabe %d, Nach-Frame %d (nach %lu ms)", frame_done, xinput_done, mutex_done, d3d_done, file_done, fmv_done, vdt_done,
-          rng_done, rrng_done, poll_done, post_done, GetTickCount() - start);
+          "Eingabe %d, Nach-Frame %d, 60 Hz %d (nach %lu ms, Rate jetzt %d)", frame_done, xinput_done, mutex_done, d3d_done, file_done,
+          fmv_done, vdt_done, rng_done, rrng_done, poll_done, post_done, hz_done, GetTickCount() - start, *(volatile int *)0x01154304);
     return 0;
 }
 
@@ -3497,6 +3751,23 @@ static void init(void)
     // Netzmodus: alle Schalter, die den Ablauf deterministisch machen, sind Pflicht (docs/batman2-phase0.md)
     g_net = net_init(logf_);
     if (g_net && !g_pcconfig[0]) net_pcconfig();
+    else if (g_net) {
+        // Test mit LBO_PCCONFIG: das Spiel liest diese Datei roh; fuer den Vergleich bei F30 ihr Logik-Hash
+        static char b[B2CFG_MAX];
+        wchar_t w[MAX_PATH];
+        DWORD len = 0, err = 0;
+        if (MultiByteToWideChar(CP_ACP, 0, g_pcconfig, -1, w, MAX_PATH) && b2cfg_load(w, b, sizeof b, &len, &err, 5, NULL))
+            g_cfg_file_hash = cfg_build(b, NULL, NULL);
+        else g_cfg_bad = 1;
+        logf_("Netz-Einstellungen (Test): pcconfig.txt aus %s, Logik-Hash %08x", g_pcconfig, g_cfg_file_hash);
+    }
+    if (g_net) {
+        // Abgleich mit dem Partner: Datei-Hash schon jetzt (Lebenszeichen-Thread), Laufzeitwerte bei F30
+        unsigned v[4] = { 0, 0, 0, 0 };
+        v[0] = g_cfg_file_hash;
+        v[3] = g_cfg_bad ? CFG_FLAG_BAD : 0;
+        net_set_cfg(v);
+    }
     if (g_net) net_set_partner_timeout(30000);
     if (g_net) net_set_wait_callback(av_hitch);
     if (g_net) net_set_notice_callback(net_notice_cb);   // danach alleine weiter statt endlos einfrieren

@@ -33,6 +33,13 @@ int net_partner_lost(void);
 void net_schedule_repair(int frame);   // nur Host
 int net_repair_frame(void);            // Host: eigener Plan, Gast: zuletzt angekuendigter (0 = keiner)
 int net_last_desync(void);             // Pruefsummen-Frame der letzten Abweichung dieser Epoche (0 = keine)
+int net_last_desync_parts(void);       // dabei verschieden: 1 = untere 32 Bit der Pruefsumme, 2 = obere, 3 = beide
+// Einstellungs-Abgleich (LEGO Batman 2): eigene 4 Werte (Datei-Hash, Laufzeit-Hash, Hz, Flags) setzen; der
+// Lebenszeichen-Thread schickt sie alle halbe Sekunde (Paket Art 6). net_peer_cfg: 1 = Werte des Partners da.
+// net_wait_peer_cfg wartet hoechstens timeout_ms, bis der Partner Werte mit allen Bits need_flag in v[3] schickt.
+void net_set_cfg(const unsigned v[4]);
+int net_peer_cfg(unsigned v[4]);
+int net_wait_peer_cfg(unsigned v[4], unsigned need_flag, int timeout_ms);
 void net_set_frame_offset(long offset);   // fuer das Log: Spiel-Frame = Lockstep-Frame + offset
 void net_set_wait_callback(void (*cb)(unsigned long start));   // waehrend net_frame auf den Partner wartet
 void net_set_notice_callback(void (*cb)(int kind));   // Hinweis an den Spieler: 3 = Spiel des Partners startet nicht

@@ -817,10 +817,19 @@ public sealed class Lobby : Bindable
             try
             {
                 var log = ReadShared(Path.Combine(_logDir, "lbo.log"));
-                if (!log.Contains("NICHT SYNCHRON")) continue;
+                bool cfgDiff = log.Contains("EINSTELLUNGEN VERSCHIEDEN");
+                if (!log.Contains("NICHT SYNCHRON") && !cfgDiff) continue;
                 _desyncShown = true;
-                SessionText = "⚠ Eure Spiele sind nicht mehr synchron. Speichert (Einladender) und beendet das Spiel, dann neu starten.";
-                AddLog("Desync erkannt – die Spiele laufen auseinander");
+                if (cfgDiff)
+                {
+                    SessionText = "⚠ Eure Einstellungen sind verschieden. Beendet das Spiel und ladet neu ein.";
+                    AddLog("Einstellungen verschieden – die Spiele würden auseinanderlaufen");
+                }
+                else
+                {
+                    SessionText = "⚠ Eure Spiele sind nicht mehr synchron. Speichert (Einladender) und beendet das Spiel, dann neu starten.";
+                    AddLog("Desync erkannt – die Spiele laufen auseinander");
+                }
                 AlertRequested?.Invoke();
             }
             catch { }
@@ -852,7 +861,8 @@ public sealed class Lobby : Bindable
             // Neuere DLL: "DESYNC bei Frame <Lockstep> (Spiel-Frame <F>)"; frames.csv zaehlt Spiel-Frames
             var m = System.Text.RegularExpressions.Regex.Match(log, @"DESYNC bei Frame (\d+)(?: \(Spiel-Frame (\d+)\))?");
             bool trouble = b2 && (code != 0 || log.Length == 0 || !log.Contains("Levelanker") || log.Contains("Partner verloren")
-                                  || log.Contains("startet nicht") || log.Contains("kam nicht an der Schranke"));
+                                  || log.Contains("startet nicht") || log.Contains("kam nicht an der Schranke")
+                                  || log.Contains("EINSTELLUNGEN VERSCHIEDEN") || log.Contains("NETZ-EINSTELLUNGEN"));
             if (!m.Success && !trouble) return;
             int f0 = m.Success ? int.Parse(m.Groups[2].Success ? m.Groups[2].Value : m.Groups[1].Value) : -1;
             string[] csvLines = Array.Empty<string>();
@@ -890,6 +900,9 @@ public sealed class Lobby : Bindable
             try { cfg = File.ReadAllText(cfgPath); } catch { }
             // Online liest das Spiel die gemeinsame Datei aus dem Log-Ordner (Grafik des Hosts, eigene Aufloesung)
             try { if (logDir != null) cfg += "\n--- netz_pcconfig.txt (im Spiel benutzt) ---\n" + ReadShared(Path.Combine(logDir, "netz_pcconfig.txt")); } catch { }
+            // Die Bytes, auf die sich die Launcher geeinigt haben (Host-Datei, Kopie oder Standard; SHA-256 an der Schranke)
+            string basis = "";
+            try { if (logDir != null) basis = ReadShared(Path.Combine(logDir, "netz_basis.txt")); } catch { }
             try
             {
                 cpu = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\CentralProcessor\0",
@@ -901,7 +914,8 @@ public sealed class Lobby : Bindable
                 ["frame"] = f0, ["dir"] = logDir != null ? Path.GetFileName(logDir) : "",
                 ["log"] = string.Join("\n", excerpt), ["csv"] = string.Join("\n", rows),
                 ["app"] = string.Join("\n", Log.TakeLast(80)), ["code"] = code,
-                ["cfg"] = cfg, ["sys"] = $"{cpu.Trim()} | {Environment.ProcessorCount} Threads | {Environment.OSVersion}",
+                ["cfg"] = cfg, ["basis"] = basis,
+                ["sys"] = $"{cpu.Trim()} | {Environment.ProcessorCount} Threads | {Environment.OSVersion}",
             };
             using var ms = new MemoryStream();
             using (var gz = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionLevel.SmallestSize))
@@ -913,20 +927,35 @@ public sealed class Lobby : Bindable
         catch (Exception e) { AddLog("Fehlerdaten konnten nicht gesendet werden: " + e.Message); }
     }
 
+    // Fehlerdaten des Partners: hoechstens 1 MB Base64 und 16 MB entpackt (sonst legt eine kleine Gzip-Bombe die App lahm)
+    private const int DiagMaxBase64 = 1 << 20, DiagMaxUnpacked = 16 << 20;
+
     private void OnDiag(string fromName, JsonObject c)
     {
         try
         {
-            using var gz = new System.IO.Compression.GZipStream(new MemoryStream(Convert.FromBase64String((string)c["d"]!)),
+            var b64 = (string?)c["d"];
+            if (b64 == null || b64.Length > DiagMaxBase64) { AddLog($"Fehlerdaten von {fromName} zu groß, verworfen"); return; }
+            using var gz = new System.IO.Compression.GZipStream(new MemoryStream(Convert.FromBase64String(b64)),
                 System.IO.Compression.CompressionMode.Decompress);
             using var outMs = new MemoryStream();
-            gz.CopyTo(outMs);
+            var chunk = new byte[81920];
+            int n;
+            while ((n = gz.Read(chunk, 0, chunk.Length)) > 0)
+            {
+                if (outMs.Length + n > DiagMaxUnpacked) { AddLog($"Fehlerdaten von {fromName} entpackt zu groß, verworfen"); return; }
+                outMs.Write(chunk, 0, n);
+            }
             var doc = JsonNode.Parse(outMs.ToArray())!.AsObject();
-            var dir = Path.Combine(Profile.BaseDir, "logs", $"{DateTime.Now:yyyyMMdd-HHmmss}-partner");
+            // Eindeutiger Ordner: zwei Meldungen in derselben Sekunde ueberschrieben sich frueher
+            var stamp = $"{DateTime.Now:yyyyMMdd-HHmmss}-partner";
+            var dir = Path.Combine(Profile.BaseDir, "logs", stamp);
+            for (int i = 2; Directory.Exists(dir); i++) dir = Path.Combine(Profile.BaseDir, "logs", $"{stamp}-{i}");
             Directory.CreateDirectory(dir);
             File.WriteAllText(Path.Combine(dir, "partner_lbo.log"), (string?)doc["log"] ?? "");
             File.WriteAllText(Path.Combine(dir, "partner_frames.csv"), (string?)doc["csv"] ?? "");
             File.WriteAllText(Path.Combine(dir, "partner_pcconfig.txt"), (string?)doc["cfg"] ?? "");
+            File.WriteAllText(Path.Combine(dir, "partner_netz_basis.txt"), (string?)doc["basis"] ?? "");
             File.WriteAllText(Path.Combine(dir, "partner_app.txt"), (string?)doc["app"] ?? "");
             int frame = (int?)doc["frame"] ?? -1;
             File.WriteAllText(Path.Combine(dir, "info.txt"),
@@ -960,8 +989,11 @@ public sealed class Lobby : Bindable
             };
         }
         else if (line.StartsWith("ERROR ")) AddLog(line[6..]);
-        else if (line.StartsWith("Ping:") || line.StartsWith("Verbunden") || line.StartsWith("Steam") || line.StartsWith("Warte auf Steam"))
-            AddLog(line);
+        else if (line.StartsWith("Ping:") || line.StartsWith("Verbunden") || line.StartsWith("Steam") || line.StartsWith("Warte auf Steam")
+                 // Uebertragung und Einstellungen (Desync 23.10.2026: "Sende 0 Datei(en)" fehlte im Protokoll)
+                 || line.StartsWith("Sende") || line.StartsWith("Empfange") || line.StartsWith("Einstellungen")
+                 || line.StartsWith("Dateien") || line.StartsWith("Datei ") || line.StartsWith("Fehler") || line.StartsWith("  "))
+            AddLog(line.Trim());
     }
 
     // --- Testhilfen -------------------------------------------------------------------

@@ -9,19 +9,25 @@
 //  6. Der Host schickt seinen Spielstand-Ordner, damit beide Spiele denselben Stand laden.
 // Danach schliesst der Launcher den Socket; die DLL im Spiel bindet denselben Port neu, die
 // Zuordnung im Router bleibt dabei erhalten (Keepalive bis zum ersten Frame).
+//
+// Sicherheit (23.10.2026): Nach dem Verbinden zaehlen nur Pakete von der Adresse des Partners; Dateipakete werden
+// gegen Groesse, Stueckzahl und Laenge geprueft, Dateinamen nur aus [A-Za-z0-9._ -].
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <bcrypt.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "online.h"
 
 #define LMAGIC 0x4C4E4C42u  // Launcher-Pakete "BLNL"
-#define MOD_VERSION 1
+// 2: READY mit Einstellungs-Hash, Batman 2 schickt immer genau eine pcconfig.txt (Desync 23.10.2026)
+#define MOD_VERSION 2
 enum { M_HELLO = 1, M_PING, M_PONG, M_FILE, M_HAVE, M_READY };
+#define MAX_FILE_SIZE (1000 * 512)   // 512 Stuecke a 1000 Byte (Bitfeld in HAVE)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -39,9 +45,20 @@ typedef struct {
     unsigned char data[1000];
 } FILEPKT;
 typedef struct { unsigned magic, type, key; unsigned file; unsigned char bits[64]; unsigned done; } HAVE;
+// Bereit-Meldung: t = Verzoegerung (Host gibt sie vor), cfg = SHA-256 der Netz-Einstellungen (Batman 1: Nullen),
+// src = Quelle beim Host (B2CFG_SRC_*). Version 1 schickte nur PING-Groesse.
+typedef struct {
+    unsigned magic, type, key;
+    unsigned seq;
+    unsigned long long t;
+    unsigned version, src;
+    unsigned char cfg[32];
+} READY;
 #pragma pack(pop)
+#define FILEPKT_HDR ((int)offsetof(FILEPKT, data))
 
 static SOCKET s_sock = INVALID_SOCKET;
+char online_error[160];   // Grund, wenn online_connect an Version, Spiel oder Rolle scheitert (sonst leer)
 static struct sockaddr_in s_peer;
 static unsigned s_key_me, s_key_peer;
 
@@ -62,6 +79,25 @@ static int recv_any(void *buf, int size, struct sockaddr_in *from, int timeout_m
 static void send_to(const struct sockaddr_in *to, const void *buf, int len)
 {
     sendto(s_sock, (const char *)buf, len, 0, (const struct sockaddr *)to, sizeof *to);
+}
+
+// Nach online_connect: nur Pakete von der Adresse, ueber die die Verbindung steht
+static int from_peer(const struct sockaddr_in *from, const ONLINE *o)
+{
+    return from->sin_addr.s_addr == o->peer.sin_addr.s_addr && from->sin_port == o->peer.sin_port;
+}
+
+// Dateinamen vom Host: nur [A-Za-z0-9._ -], kein "..", nicht leer (keine Pfade, NTFS-Streams, Geraetenamen mit ':')
+static int valid_name(const char *n)
+{
+    size_t i, l = strlen(n);
+    if (!l || l >= 64 || strstr(n, "..")) return 0;
+    for (i = 0; i < l; i++) {
+        char c = n[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ' ' || c == '-'))
+            return 0;
+    }
+    return 1;
 }
 
 int online_sha256_file(const char *path, unsigned char out[32])
@@ -340,9 +376,22 @@ int online_connect(ONLINE *o, const unsigned char exe_hash[32], int timeout_s)
             printf("Verbunden mit %s:%d\n", inet_ntoa(from.sin_addr), ntohs(from.sin_port));
         }
         got_hello = 1;
-        if (in.version != MOD_VERSION) { printf("Fehler: unterschiedliche Mod-Versionen (%u vs. %u).\n", MOD_VERSION, in.version); return 0; }
-        if (memcmp(in.exe_hash, exe_hash, 32)) { printf("Fehler: Die Spielversionen unterscheiden sich (LEGOBatman.exe). Beide brauchen die aktuelle Steam-Version.\n"); return 0; }
-        if (in.role == o->role) { printf("Fehler: Beide sind %s. Einer muss hosten, einer beitreten.\n", o->role ? "Gast" : "Host"); return 0; }
+        if (in.version != MOD_VERSION) {
+            snprintf(online_error, sizeof online_error, "Ihr habt verschiedene Versionen der Mod (%u und %u). Bitte beide die neueste installieren.",
+                     MOD_VERSION, in.version);
+            printf("Fehler: %s\n", online_error);
+            return 0;
+        }
+        if (memcmp(in.exe_hash, exe_hash, 32)) {
+            snprintf(online_error, sizeof online_error, "Die Spielversionen unterscheiden sich. Beide brauchen die aktuelle Steam-Version.");
+            printf("Fehler: %s\n", online_error);
+            return 0;
+        }
+        if (in.role == o->role) {
+            snprintf(online_error, sizeof online_error, "Beide sind %s. Einer muss hosten, einer beitreten.", o->role ? "Gast" : "Host");
+            printf("Fehler: %s\n", online_error);
+            return 0;
+        }
         if (in.seq) got_ack = 1;
         if (got_ack) {
             int i;
@@ -371,7 +420,7 @@ int online_measure_ping(ONLINE *o)
         p.magic = LMAGIC; p.type = M_PING; p.key = s_key_me; p.seq = i; p.t = (unsigned long long)t.QuadPart;
         send_to(&o->peer, &p, sizeof p);
         while ((n = recv_any(&in, sizeof in, &from, 150)) > 0) {
-            if (n != (int)sizeof in || in.magic != LMAGIC || in.key != s_key_peer) continue;
+            if (n != (int)sizeof in || !from_peer(&from, o) || in.magic != LMAGIC || in.key != s_key_peer) continue;
             if (in.type == M_PING) { in.type = M_PONG; in.key = s_key_me; send_to(&o->peer, &in, sizeof in); continue; }
             if (in.type == M_PONG && in.seq == (unsigned)i) {
                 QueryPerformanceCounter(&t);
@@ -385,7 +434,7 @@ int online_measure_ping(ONLINE *o)
     start = GetTickCount();
     while (GetTickCount() - start < 1500) {
         n = recv_any(&in, sizeof in, &from, 50);
-        if (n == (int)sizeof in && in.magic == LMAGIC && in.key == s_key_peer && in.type == M_PING) {
+        if (n == (int)sizeof in && from_peer(&from, o) && in.magic == LMAGIC && in.key == s_key_peer && in.type == M_PING) {
             in.type = M_PONG; in.key = s_key_me; send_to(&o->peer, &in, sizeof in);
         }
     }
@@ -399,49 +448,27 @@ int online_measure_ping(ONLINE *o)
     return o->ping_ms;
 }
 
-// --- Spielstand uebertragen (Host -> Gast) ---------------------------------------------
-int online_send_saves(ONLINE *o, const char *save_dir, const char *file_pattern)
+// --- Dateien uebertragen (Host -> Gast) -----------------------------------------------
+// Datei 0..n-1 nacheinander, danach eine Abschluss-Runde (file == nfiles, ohne Daten). Der Gast meldet per HAVE,
+// welche Stuecke er hat, und "done", wenn eine Datei vollstaendig ist. Eine leere Datei ist ein Stueck mit Laenge 0.
+static int send_files(ONLINE *o, int nfiles, char names[][64], unsigned char **data, const unsigned *sizes)
 {
-    char pattern[MAX_PATH], path[MAX_PATH];
-    WIN32_FIND_DATAA fd;
-    HANDLE fh;
-    char names[16][64];
-    unsigned char *data[16];
-    unsigned sizes[16];
-    int nfiles = 0, i;
-    snprintf(pattern, sizeof pattern, "%s\\%s", save_dir, file_pattern);
-    fh = FindFirstFileA(pattern, &fd);
-    if (fh != INVALID_HANDLE_VALUE) {
-        do {
-            FILE *f;
-            if (nfiles >= 16 || fd.nFileSizeLow > 1000 * 64 * 8 || strlen(fd.cFileName) >= 64) continue;
-            snprintf(path, sizeof path, "%s\\%s", save_dir, fd.cFileName);
-            f = fopen(path, "rb");
-            if (!f) continue;
-            data[nfiles] = (unsigned char *)malloc(fd.nFileSizeLow + 1);
-            sizes[nfiles] = (unsigned)fread(data[nfiles], 1, fd.nFileSizeLow, f);
-            fclose(f);
-            strcpy(names[nfiles], fd.cFileName);
-            nfiles++;
-        } while (FindNextFileA(fh, &fd));
-        FindClose(fh);
-    }
+    int i;
     printf("Sende %d Datei(en) an den Gast ...\n", nfiles);
-    // Datei 0..n-1 nacheinander; Gast meldet per HAVE, welche Stuecke fehlen. Leere Liste: nfiles=0.
     for (i = 0; i <= nfiles; i++) {
         unsigned nch = i < nfiles ? (sizes[i] + 999) / 1000 : 1;
         unsigned char have[64];
         DWORD start = GetTickCount();
+        if (nch == 0) nch = 1;
         memset(have, 0, sizeof have);
         for (;;) {
             unsigned c;
             HAVE in;
             struct sockaddr_in from;
-            int n, all = 1;
+            int n, done = 0;
             for (c = 0; c < nch; c++) {
                 FILEPKT p;
                 if (have[c / 8] & (1 << (c % 8))) continue;
-                all = 0;
                 memset(&p, 0, sizeof p);
                 p.magic = LMAGIC; p.type = M_FILE; p.key = s_key_me;
                 p.file = i; p.nfiles = nfiles; p.chunk = c; p.nchunks = nch;
@@ -451,34 +478,85 @@ int online_send_saves(ONLINE *o, const char *save_dir, const char *file_pattern)
                     p.len = (unsigned short)(c + 1 < nch ? 1000 : sizes[i] - c * 1000);
                     memcpy(p.data, data[i] + c * 1000, p.len);
                 }
-                send_to(&o->peer, &p, (int)(sizeof p - sizeof p.data + p.len));
+                send_to(&o->peer, &p, FILEPKT_HDR + p.len);
             }
             while ((n = recv_any(&in, sizeof in, &from, 60)) > 0) {
-                if (n >= 12 && in.magic == LMAGIC && in.key == s_key_peer && in.type == M_READY) {
-                    // Der Gast ist schon fertig und wartet; seine letzte Meldung ging verloren
-                    for (; i < nfiles; i++) free(data[i]);
-                    printf("Dateien uebertragen.\n");
-                    return 1;
+                if (n < 12 || !from_peer(&from, o) || in.magic != LMAGIC || in.key != s_key_peer) continue;
+                if (in.type == M_READY) {
+                    // Gast wartet schon an der Bereit-Schranke: Nur in der Abschluss-Runde heisst das "fertig" (seine
+                    // letzte Meldung ging verloren). Vorher waere es ein Gast ohne Empfang (alte Version), dann
+                    // entscheidet der Hash-Vergleich an der Schranke bzw. die Zeitgrenze hier.
+                    if (i == nfiles) { printf("Dateien uebertragen.\n"); return 1; }
+                    continue;
                 }
-                if (n != (int)sizeof in || in.magic != LMAGIC || in.key != s_key_peer || in.type != M_HAVE || in.file != (unsigned)i) continue;
+                if (n != (int)sizeof in || in.type != M_HAVE) continue;
+                if (in.file > (unsigned)i && in.file <= (unsigned)nfiles) { done = 1; break; }   // Gast ist schon bei der naechsten
+                if (in.file != (unsigned)i) continue;
                 memcpy(have, in.bits, sizeof have);
-                if (in.done) { all = 1; break; }
+                if (in.done) { done = 1; break; }
             }
-            if (all && i <= nfiles) {
-                // fertig, wenn der Gast "done" fuer diese Datei gemeldet hat
-                int k, complete = 1;
-                for (k = 0; k < (int)nch; k++) if (!(have[k / 8] & (1 << (k % 8)))) complete = 0;
-                if (complete) break;
+            if (done) break;
+            if (GetTickCount() - start > 30000) {
+                printf("Fehler: Uebertragung abgebrochen (Gast bestaetigt Datei %d von %d nicht).\n", i + 1, nfiles);
+                return 0;
             }
-            if (GetTickCount() - start > 30000) { printf("Fehler: Spielstand-Uebertragung abgebrochen.\n"); return 0; }
         }
-        if (i < nfiles) free(data[i]);
     }
     printf("Dateien uebertragen.\n");
     return 1;
 }
 
-int online_receive_saves(ONLINE *o, const char *dest_dir)
+int online_send_saves(ONLINE *o, const char *save_dir, const char *file_pattern)
+{
+    char pattern[MAX_PATH], path[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE fh;
+    char names[16][64];
+    unsigned char *data[16];
+    unsigned sizes[16];
+    int nfiles = 0, i, ok;
+    snprintf(pattern, sizeof pattern, "%s\\%s", save_dir, file_pattern);
+    fh = FindFirstFileA(pattern, &fd);
+    if (fh != INVALID_HANDLE_VALUE) {
+        do {
+            FILE *f;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (nfiles >= 16 || fd.nFileSizeLow > MAX_FILE_SIZE || !valid_name(fd.cFileName)) {
+                printf("Datei %s wird nicht gesendet (zu gross, zu viele oder ungueltiger Name).\n", fd.cFileName);
+                continue;
+            }
+            snprintf(path, sizeof path, "%s\\%s", save_dir, fd.cFileName);
+            f = fopen(path, "rb");
+            if (!f) { printf("Datei %s nicht lesbar (Fehler %lu), wird nicht gesendet.\n", fd.cFileName, GetLastError()); continue; }
+            data[nfiles] = (unsigned char *)malloc(fd.nFileSizeLow + 1);
+            if (!data[nfiles]) { fclose(f); continue; }
+            sizes[nfiles] = (unsigned)fread(data[nfiles], 1, fd.nFileSizeLow, f);
+            fclose(f);
+            if (sizes[nfiles] != fd.nFileSizeLow) printf("Datei %s nur teilweise gelesen (%u von %lu Bytes).\n", fd.cFileName, sizes[nfiles], fd.nFileSizeLow);
+            strcpy(names[nfiles], fd.cFileName);
+            nfiles++;
+        } while (FindNextFileA(fh, &fd));
+        FindClose(fh);
+    }
+    ok = send_files(o, nfiles, names, data, sizes);
+    for (i = 0; i < nfiles; i++) free(data[i]);
+    return ok;
+}
+
+int online_send_blob(ONLINE *o, const char *name, const void *data, unsigned size)
+{
+    char names[1][64];
+    unsigned char *d[1];
+    if (size > MAX_FILE_SIZE || !valid_name(name)) return 0;
+    strcpy(names[0], name);
+    d[0] = (unsigned char *)data;
+    return send_files(o, 1, names, d, &size);
+}
+
+typedef int (*STOREFN)(void *ctx, const char *name, const unsigned char *data, unsigned size);
+
+// Empfang. want_nfiles >= 0: genau so viele Dateien, want_name: nur dieser Name (sonst Abbruch). max_size <= 512000.
+static int recv_files(ONLINE *o, unsigned max_size, int want_nfiles, const char *want_name, STOREFN store, void *ctx)
 {
     int file = 0, nfiles = -1;
     unsigned char have[64];
@@ -486,7 +564,7 @@ int online_receive_saves(ONLINE *o, const char *dest_dir)
     unsigned size = 0, nch = 0;
     char name[64] = "";
     DWORD start = GetTickCount(), last_have = 0;
-    CreateDirectoryA(dest_dir, NULL);
+    if (max_size > MAX_FILE_SIZE) max_size = MAX_FILE_SIZE;
     memset(have, 0, sizeof have);
     printf("Empfange Dateien des Hosts ...\n");
     while (GetTickCount() - start < 40000) {
@@ -495,16 +573,38 @@ int online_receive_saves(ONLINE *o, const char *dest_dir)
         int n = recv_any(&p, sizeof p, &from, 50);
         HAVE h;
         int complete = 0, k;
-        if (n > 0 && p.magic == LMAGIC && p.key == s_key_peer && p.type == M_FILE && p.file == (unsigned)file && p.chunk < 512) {
-            if (nfiles < 0) nfiles = (int)p.nfiles;
-            if (!buf && p.file < p.nfiles) {
-                size = p.size; nch = p.nchunks;
-                memcpy(name, p.name, sizeof name); name[63] = 0;
-                buf = (unsigned char *)calloc(size + 1, 1);
+        if (n >= FILEPKT_HDR && from_peer(&from, o) && p.magic == LMAGIC && p.key == s_key_peer && p.type == M_FILE &&
+            p.file == (unsigned)file && p.len <= 1000 && n == FILEPKT_HDR + p.len && p.nfiles <= 16) {
+            if (nfiles < 0) {
+                nfiles = (int)p.nfiles;
+                if (want_nfiles >= 0 && nfiles != want_nfiles) {
+                    printf("Fehler: Der Host schickt %d Datei(en), erwartet %d (alte Version beim Host?).\n", nfiles, want_nfiles);
+                    return 0;
+                }
             }
-            if (p.file >= p.nfiles) nch = 1;
-            if (buf && p.chunk * 1000 + p.len <= size) memcpy(buf + p.chunk * 1000, p.data, p.len);
-            have[p.chunk / 8] |= (unsigned char)(1 << (p.chunk % 8));
+            if (p.nfiles != (unsigned)nfiles) {
+                // passt nicht zum ersten Paket: verwerfen
+            } else if (p.file >= p.nfiles) {
+                if (p.chunk == 0) { nch = 1; have[0] |= 1; }   // Abschluss-Runde
+            } else if (p.size <= max_size && p.nchunks == (p.size ? (p.size + 999) / 1000 : 1) && p.chunk < p.nchunks) {
+                p.name[63] = 0;
+                if (!buf) {
+                    if (!valid_name(p.name) || (want_name && _stricmp(p.name, want_name))) {
+                        printf("Fehler: Der Host schickt eine unerwartete Datei (%s).\n", valid_name(p.name) ? p.name : "ungueltiger Name");
+                        return 0;
+                    }
+                    size = p.size; nch = p.nchunks;
+                    strcpy(name, p.name);
+                    buf = (unsigned char *)calloc(size + 1, 1);
+                    if (!buf) { printf("Fehler: kein Speicher fuer %s.\n", name); return 0; }
+                }
+                // Jedes Stueck muss zu Groesse, Name und seiner Position passen
+                if (p.size == size && p.nchunks == nch && !strcmp(p.name, name) &&
+                    p.len == (p.chunk + 1 < nch ? 1000u : size - p.chunk * 1000)) {
+                    memcpy(buf + p.chunk * 1000, p.data, p.len);
+                    have[p.chunk / 8] |= (unsigned char)(1 << (p.chunk % 8));
+                }
+            }
         }
         if (nch) {
             complete = 1;
@@ -520,12 +620,8 @@ int online_receive_saves(ONLINE *o, const char *dest_dir)
         if (complete) {
             int i;
             for (i = 0; i < 3; i++) send_to(&o->peer, &h, sizeof h);
-            if (buf && strchr(name, '\\') == NULL && strchr(name, '/') == NULL && strstr(name, "..") == NULL) {
-                char path[MAX_PATH];
-                FILE *f;
-                snprintf(path, sizeof path, "%s\\%s", dest_dir, name);
-                f = fopen(path, "wb");
-                if (f) { fwrite(buf, 1, size, f); fclose(f); }
+            if (buf) {
+                if (!store(ctx, name, buf, size)) { free(buf); return 0; }
                 printf("  %s (%u Bytes)\n", name, size);
             }
             free(buf); buf = NULL; nch = 0;
@@ -534,32 +630,94 @@ int online_receive_saves(ONLINE *o, const char *dest_dir)
             if (file > nfiles) { printf("Dateien empfangen.\n"); return 1; }
         }
     }
-    printf("Fehler: Dateien des Hosts nicht vollstaendig empfangen.\n");
+    free(buf);
+    printf("Fehler: Dateien des Hosts nicht vollstaendig empfangen (%s).\n",
+           nfiles < 0 ? "nichts angekommen" : "Zeitgrenze 40 s");
     return 0;
 }
 
-int online_ready_barrier(ONLINE *o, int *delay)
+static int store_to_dir(void *ctx, const char *name, const unsigned char *data, unsigned size)
 {
-    // Beide melden "bereit"; danach starten beide ihr Spiel.
-    PING p, in;
+    char path[MAX_PATH];
+    FILE *f;
+    size_t w;
+    snprintf(path, sizeof path, "%s\\%s", (const char *)ctx, name);
+    f = fopen(path, "wb");
+    if (!f) { printf("Fehler: %s kann nicht geschrieben werden (Fehler %lu).\n", path, GetLastError()); return 0; }
+    w = fwrite(data, 1, size, f);
+    if (fclose(f) != 0 || w != size) { printf("Fehler: %s nicht vollstaendig geschrieben.\n", path); return 0; }
+    return 1;
+}
+
+int online_receive_saves(ONLINE *o, const char *dest_dir)
+{
+    CreateDirectoryA(dest_dir, NULL);
+    return recv_files(o, MAX_FILE_SIZE, -1, NULL, store_to_dir, (void *)dest_dir);
+}
+
+typedef struct { unsigned char *buf; unsigned cap, len; } RXBUF;
+
+static int store_to_blob(void *ctx, const char *name, const unsigned char *data, unsigned size)
+{
+    RXBUF *b = (RXBUF *)ctx;
+    (void)name;
+    if (size > b->cap) return 0;
+    memcpy(b->buf, data, size);
+    b->len = size;
+    return 1;
+}
+
+int online_receive_blob(ONLINE *o, const char *name, void *buf, unsigned cap, unsigned *len)
+{
+    RXBUF b;
+    b.buf = (unsigned char *)buf; b.cap = cap; b.len = 0;
+    *len = 0;
+    if (!recv_files(o, cap, 1, name, store_to_blob, &b)) return 0;
+    *len = b.len;
+    return 1;
+}
+
+int online_ready_barrier(ONLINE *o, int *delay, const unsigned char my_cfg[32], unsigned my_src,
+                         unsigned char peer_cfg[32], unsigned *peer_src)
+{
+    // Beide melden "bereit" mit dem Hash ihrer Einstellungen; danach starten beide ihr Spiel. Weichen die Hashes
+    // ab, startet keiner (beide sehen den Hash des anderen: wer die Abweichung zuerst sieht, schickt seine Meldung
+    // noch fuenfmal, damit der Partner sie auch bekommt).
+    READY p, in;
     struct sockaddr_in from;
     DWORD start = GetTickCount(), last = 0;
     int got = 0, n;
     memset(&p, 0, sizeof p);
     p.magic = LMAGIC; p.type = M_READY; p.key = s_key_me;
     p.t = (unsigned long long)*delay;  // Host gibt die Verzoegerung vor
+    p.version = MOD_VERSION;
+    p.src = my_src;
+    if (my_cfg) memcpy(p.cfg, my_cfg, 32);
     while (GetTickCount() - start < 30000) {
         if (GetTickCount() - last > 50) { p.seq = got; send_to(&o->peer, &p, sizeof p); last = GetTickCount(); }
         n = recv_any(&in, sizeof in, &from, 20);
-        if (n == (int)sizeof in && in.magic == LMAGIC && in.key == s_key_peer && in.type == M_READY) {
-            got = 1;
-            if (o->role == 1 && in.t >= 1 && in.t <= 16) *delay = (int)in.t;
-            if (in.seq) {
-                int i;
-                p.seq = 1;
-                for (i = 0; i < 5; i++) send_to(&o->peer, &p, sizeof p);
-                return 1;
-            }
+        if (n < 12 || !from_peer(&from, o) || in.magic != LMAGIC || in.key != s_key_peer || in.type != M_READY) continue;
+        if (n == (int)sizeof(PING) || (n == (int)sizeof in && in.version != MOD_VERSION)) {
+            printf("Fehler: Dein Mitspieler hat eine andere Version von LEGO Online (Bereit-Meldung Version %u, hier %u).\n",
+                   n == (int)sizeof in ? in.version : 1, MOD_VERSION);
+            return -2;
+        }
+        if (n != (int)sizeof in) continue;
+        got = 1;
+        if (peer_cfg) memcpy(peer_cfg, in.cfg, 32);
+        if (peer_src) *peer_src = in.src;
+        if (memcmp(in.cfg, p.cfg, 32)) {
+            int i;
+            p.seq = 1;
+            for (i = 0; i < 5; i++) send_to(&o->peer, &p, sizeof p);
+            return -1;
+        }
+        if (o->role == 1 && in.t >= 1 && in.t <= 16) *delay = (int)in.t;
+        if (in.seq) {
+            int i;
+            p.seq = 1;
+            for (i = 0; i < 5; i++) send_to(&o->peer, &p, sizeof p);
+            return 1;
         }
     }
     return 0;

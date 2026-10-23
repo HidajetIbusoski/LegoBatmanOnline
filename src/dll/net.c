@@ -100,6 +100,14 @@ static int g_my_ck_frame[RING], g_peer_ck_frame[RING];
 static int g_last_ck_sent;
 static long g_stalls, g_desyncs;
 static int g_last_desync;              // Pruefsummen-Frame der letzten Abweichung (in der laufenden Epoche)
+static int g_last_desync_parts;        // dabei verschieden: 1 = untere 32 Bit, 2 = obere 32 Bit der Pruefsumme
+// Einstellungs-Abgleich (LEGO Batman 2), Paket Art 6 {MAGIC, 6, Datei-Hash, Laufzeit-Hash, Hz, Flags}: Der
+// Lebenszeichen-Thread schickt es alle halbe Sekunde, receive() merkt sich das des Partners. Wirkt nicht auf
+// Eingaben, Frames oder Epochen; alte Builds verwerfen die unbekannte Art.
+#define CFG_WORDS 4
+static unsigned g_cfg_my[CFG_WORDS], g_cfg_peer[CFG_WORDS];
+static volatile LONG g_cfg_my_set, g_cfg_peer_got;
+static CRITICAL_SECTION g_cfg_cs;   // g_cfg_my: Hauptthread schreibt, Lebenszeichen-Thread sendet
 static int g_repair_out, g_repair_in;  // Reparatur-Frame: vom Host geplant / vom Host empfangen
 static long g_frame_offset;            // Spiel-Frame = Lockstep-Frame + Versatz (nur fuer das Log)
 static void (*g_log)(const char *fmt, ...);
@@ -195,13 +203,29 @@ static void raw_send(const void *buf, int len)
 static volatile LONG g_started, g_ka_running_start;
 static HANDLE g_keepalive;
 static void send_inputs(void);
+
+static void send_cfg(void)
+{
+    unsigned p[2 + CFG_WORDS];
+    int i;
+    if (!g_cfg_my_set || g_partner_lost) return;
+    p[0] = MAGIC;
+    p[1] = 6;
+    EnterCriticalSection(&g_cfg_cs);
+    for (i = 0; i < CFG_WORDS; i++) p[2 + i] = g_cfg_my[i];
+    LeaveCriticalSection(&g_cfg_cs);
+    raw_send(p, sizeof p);
+}
+
 static DWORD WINAPI keepalive(void *arg)
 {
+    int tick = 0;
     (void)arg;
     while (!g_started) {
         InterlockedExchange(&g_ka_running_start, 1);
         if (!g_started) send_inputs();
         InterlockedExchange(&g_ka_running_start, 0);
+        if (++tick % 3 == 0) send_cfg();
         Sleep(200);
     }
     // Danach (nur mit Partner-Zeitgrenze) ein Lebenszeichen je halbe Sekunde, auch wenn das Spiel steht
@@ -212,6 +236,7 @@ static DWORD WINAPI keepalive(void *arg)
             unsigned ping[2] = { MAGIC, 5 };
             raw_send(ping, sizeof ping);
         }
+        send_cfg();
         Sleep(500);
     }
     return 0;
@@ -279,6 +304,7 @@ int net_init(void (*logger)(const char *fmt, ...))
               g_sim_lat, g_sim_jit, g_sim_spike, g_sim_period, g_sim_loss);
     }
     g_last_rx = GetTickCount();
+    InitializeCriticalSection(&g_cfg_cs);
     g_keepalive = CreateThread(NULL, 0, keepalive, NULL, 0, NULL);
     g_log("Netz: Rolle %s, Port %d, Partner %s:%d, Verzoegerung %d Frames%s",
           g_role ? "Client (Spieler 2)" : "Host (Spieler 1)", ntohs(me.sin_port), host, peer_port, g_delay,
@@ -443,16 +469,20 @@ int net_wait_sync(int F, void *data, int len, int timeout_ms)
 static void compare_checksum(int f)
 {
     if (g_my_ck_frame[f % RING] == f && g_peer_ck_frame[f % RING] == f && g_my_ck[f % RING] != g_peer_ck[f % RING]) {
+        unsigned long long d = g_my_ck[f % RING] ^ g_peer_ck[f % RING];
+        int parts = ((unsigned)d ? 1 : 0) | ((unsigned)(d >> 32) ? 2 : 0);
         g_desyncs++;
-        if (f > g_last_desync) g_last_desync = f;
-        g_log("DESYNC bei Frame %d (Spiel-Frame %ld): lokal %016llx, Partner %016llx", f, f + g_frame_offset,
-              g_my_ck[f % RING], g_peer_ck[f % RING]);
+        if (f > g_last_desync) { g_last_desync = f; g_last_desync_parts = parts; }
+        // Die ersten 30 einzeln, danach jede 100. (nach dem Hinweis kam sonst alle 20 Frames eine Zeile)
+        if (g_desyncs <= 30 || g_desyncs % 100 == 0)
+            g_log("DESYNC bei Frame %d (Spiel-Frame %ld): lokal %016llx, Partner %016llx (verschieden: %s)", f, f + g_frame_offset,
+              g_my_ck[f % RING], g_peer_ck[f % RING], parts == 3 ? "beide Teile" : parts == 2 ? "oberer Teil" : "unterer Teil");
     }
 }
 
 static void receive(void)
 {
-    union { PACKET p; SYNCPACKET s; unsigned u[2]; } u;
+    union { PACKET p; SYNCPACKET s; unsigned u[2 + CFG_WORDS]; } u;
     int n, i, f;
     DWORD call = now_ms(), gap = g_last_recv_call ? call - g_last_recv_call : 1000;
     g_last_recv_call = call;
@@ -474,6 +504,12 @@ static void receive(void)
                 if (!g_bar_seen || u.s.frame != g_bar_in.frame) g_bar_in = u.s;
                 if (g_bar_out.magic && g_bar_resend > 600) g_bar_seen = 1;   // nur, solange wir an der Schranke stehen
             }
+            continue;
+        }
+        if (kind == 6 && n == (int)sizeof(unsigned) * (2 + CFG_WORDS)) {
+            int i;
+            for (i = 0; i < CFG_WORDS; i++) g_cfg_peer[i] = u.u[2 + i];
+            InterlockedExchange(&g_cfg_peer_got, 1);
             continue;
         }
         if (kind != 1 || n < PACKET_HDR) continue;
@@ -631,6 +667,41 @@ void net_set_wait_callback(void (*cb)(DWORD start)) { g_wait_cb = cb; }
 void net_set_notice_callback(void (*cb)(int kind)) { g_notice_cb = cb; }
 
 int net_last_desync(void) { return g_last_desync; }
+
+int net_last_desync_parts(void) { return g_last_desync_parts; }
+
+void net_set_cfg(const unsigned v[4])
+{
+    int i;
+    if (g_sock == INVALID_SOCKET) return;
+    EnterCriticalSection(&g_cfg_cs);
+    for (i = 0; i < CFG_WORDS; i++) g_cfg_my[i] = v[i];
+    LeaveCriticalSection(&g_cfg_cs);
+    InterlockedExchange(&g_cfg_my_set, 1);
+    send_cfg();
+}
+
+int net_peer_cfg(unsigned v[4])
+{
+    int i;
+    receive();
+    if (!g_cfg_peer_got) return 0;
+    for (i = 0; i < CFG_WORDS; i++) v[i] = g_cfg_peer[i];
+    return 1;
+}
+
+int net_wait_peer_cfg(unsigned v[4], unsigned need_flag, int timeout_ms)
+{
+    DWORD start = GetTickCount(), last_send = 0;
+    for (;;) {
+        DWORD now = GetTickCount();
+        if (net_peer_cfg(v) && (v[3] & need_flag) == need_flag) return 1;
+        if (now - start > (DWORD)timeout_ms || g_partner_lost) return 0;
+        if (now - last_send >= 100) { send_inputs(); send_cfg(); last_send = now; }
+        if (g_wait_cb) g_wait_cb(start);
+        wait_packet(2);
+    }
+}
 
 void net_schedule_repair(int frame) { g_repair_out = frame; }
 

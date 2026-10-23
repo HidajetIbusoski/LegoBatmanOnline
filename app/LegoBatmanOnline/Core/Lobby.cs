@@ -882,7 +882,14 @@ public sealed class Lobby : Bindable
             }
             else excerpt = logLines.Count <= 400 ? logLines : logLines.Take(120).Append("[...]").Concat(logLines.TakeLast(280));
             string cfg = "", cpu = "";
-            try { cfg = File.ReadAllText(Path.Combine(Path.GetDirectoryName(GameBridge.SaveDir)!, "pcconfig.txt")); } catch { }
+            // Batman 2 hat seine eigene pcconfig.txt unter %APPDATA% (bisher kam hier versehentlich die von Batman 1 mit)
+            var cfgPath = b2
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "Warner Bros. Interactive Entertainment", "LEGO Batman 2", "pcconfig.txt")
+                : Path.Combine(Path.GetDirectoryName(GameBridge.SaveDir)!, "pcconfig.txt");
+            try { cfg = File.ReadAllText(cfgPath); } catch { }
+            // Online liest das Spiel die gemeinsame Datei aus dem Log-Ordner (Grafik des Hosts, eigene Aufloesung)
+            try { if (logDir != null) cfg += "\n--- netz_pcconfig.txt (im Spiel benutzt) ---\n" + ReadShared(Path.Combine(logDir, "netz_pcconfig.txt")); } catch { }
             try
             {
                 cpu = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\CentralProcessor\0",

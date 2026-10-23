@@ -23,7 +23,8 @@ int online_prepare_direct(ONLINE *o);                   // Direktmodus: fester P
 int online_set_peer_ip(ONLINE *o, const char *text);    // "IP" oder "IP:Port"
 int online_connect(ONLINE *o, const unsigned char exe_hash[32], int timeout_s);
 int online_measure_ping(ONLINE *o);                     // Median-RTT in ms, -1 bei Fehler
-int online_send_saves(ONLINE *o, const char *save_dir);
+// pattern: Dateimuster im Ordner, z. B. "SaveGame*" (Batman 1) oder "pcconfig.txt" (Batman 2)
+int online_send_saves(ONLINE *o, const char *save_dir, const char *pattern);
 int online_receive_saves(ONLINE *o, const char *dest_dir);
 int online_ready_barrier(ONLINE *o, int *delay);  // Gast uebernimmt die Verzoegerung des Hosts
 void online_close(void);

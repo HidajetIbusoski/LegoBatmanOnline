@@ -87,11 +87,27 @@ static int process_running(const char *exe)
     return found;
 }
 
+// Bereit: angemeldeter Benutzer UND die in ActiveProcess\pid eingetragene Steam-Instanz laeuft wirklich (ActiveUser
+// allein bleibt vom letzten Lauf stehen; im Playtest 22.10. galt Steam so zu frueh als bereit)
 static DWORD steam_active_user(void)
 {
-    DWORD user = 0, len = sizeof user;
+    DWORD user = 0, pid = 0, len = sizeof user;
+    HANDLE h;
+    char name[MAX_PATH];
+    DWORD nlen = sizeof name;
     if (RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam\\ActiveProcess", "ActiveUser", RRF_RT_REG_DWORD, NULL, &user, &len))
         return 0;
+    len = sizeof pid;
+    if (!user || RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam\\ActiveProcess", "pid", RRF_RT_REG_DWORD, NULL, &pid, &len) || !pid)
+        return 0;
+    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return 0;
+    if (!QueryFullProcessImageNameA(h, 0, name, &nlen)) { CloseHandle(h); return 0; }
+    CloseHandle(h);
+    {
+        size_t n = strlen(name);
+        if (n < 9 || _stricmp(name + n - 9, "steam.exe")) return 0;
+    }
     return user;
 }
 
@@ -99,7 +115,7 @@ static void ensure_steam(void)
 {
     char exe[MAX_PATH];
     DWORD len = sizeof exe, t0;
-    int asked = 0;
+    int asked = 0, started = 0;
     if (process_running("steam.exe") && steam_active_user()) return;
     printf("STATUS steam\n");
     if (!process_running("steam.exe")) {
@@ -108,12 +124,15 @@ static void ensure_steam(void)
         } else {
             printf("Steam laeuft nicht, starte Steam ...\n");
             ShellExecuteA(NULL, "open", exe, "-silent", NULL, SW_SHOWMINNOACTIVE);
+            started = 1;
         }
     }
     fflush(stdout);
     t0 = GetTickCount();
     while (GetTickCount() - t0 < 120000) {
-        if (process_running("steam.exe") && steam_active_user()) {
+        // Selbst gestartet: mindestens 20 s und bis die Steam-Oberflaeche laeuft
+        if (process_running("steam.exe") && steam_active_user() &&
+            (!started || (GetTickCount() - t0 > 20000 && process_running("steamwebhelper.exe")))) {
             printf("Steam ist bereit.\n");
             fflush(stdout);
             Sleep(3000);   // Steam braucht nach der Anmeldung noch einen Moment fuer seine Dienste
@@ -316,10 +335,27 @@ static int run_session(ONLINE *o_, const char *game, const char *dll, int autolo
 
     printf("STATUS spielstand\n");
     // LEGO Batman 2: noch kein Spielstand-Austausch. Beide starten ohne Spielstaende (die DLL leitet
-    // Lesen und Schreiben im Netzmodus um), der Host waehlt "Neues Spiel".
+    // Lesen und Schreiben im Netzmodus um), der Host waehlt "Neues Spiel". Uebertragen wird nur die pcconfig.txt
+    // des Hosts: Andere Grafikeinstellungen lassen Figuren auseinanderlaufen (Test CA, 23.10.: Gast mit niedrigen
+    // Einstellungen, ab Frame 912 nach Levelstart andere Positionen). Die DLL liest daraus alle Einstellungen
+    // ausser Aufloesung, Fenster, Lautstaerke und Steuerung.
     if (g_b2) {
+        char cfgdir[MAX_PATH];
+        SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, cfgdir);
+        strcat(cfgdir, "\\Warner Bros. Interactive Entertainment\\LEGO Batman 2");
+        if (o.role == 0) {
+            if (!online_send_saves(&o, cfgdir, "pcconfig.txt")) { printf("ERROR Einstellungen konnten nicht gesendet werden.\n"); online_close(); return 1; }
+        } else {
+            char cfg[MAX_PATH];
+            strcat(guest_saves, "\\host-einstellungen");
+            CreateDirectoryA(guest_saves, NULL);
+            snprintf(cfg, sizeof cfg, "%s\\pcconfig.txt", guest_saves);
+            DeleteFileA(cfg);   // nur die Datei dieses Hosts verwenden
+            if (!online_receive_saves(&o, guest_saves)) { printf("ERROR Einstellungen des Hosts nicht empfangen.\n"); online_close(); return 1; }
+            if (GetFileAttributesA(cfg) != INVALID_FILE_ATTRIBUTES) SetEnvironmentVariableA("LBO_HOSTCONFIG", cfg);
+        }
     } else if (o.role == 0) {
-        if (!online_send_saves(&o, save_dir)) { printf("ERROR Spielstand konnte nicht gesendet werden.\n"); online_close(); return 1; }
+        if (!online_send_saves(&o, save_dir, "SaveGame*")) { printf("ERROR Spielstand konnte nicht gesendet werden.\n"); online_close(); return 1; }
     } else {
         strcat(guest_saves, "\\gast-spielstand");
         // alte Dateien entfernen, damit nur der Stand des Hosts sichtbar ist
@@ -360,7 +396,24 @@ static int run_session(ONLINE *o_, const char *game, const char *dll, int autolo
         printf("%s\n", o.role ? "Der Host bedient die Menues (Neues Spiel). Im Level mit Start einsteigen."
                               : "Du bedienst die Menues: Neues Spiel, ohne zu speichern fortfahren. Dein Mitspieler steigt mit Start ein.");
         printf("STATUS spiel\n");
-        launch(game, dll, "", 1);
+        {
+            // Beendet sich das Spiel in den ersten 20 s von selbst, hat meist der Steam-Kopierschutz es ueber Steam neu
+            // gestartet (Steam war noch nicht bereit). Dann einmal erneut starten; der Partner wartet so lange.
+            DWORD t0 = GetTickCount();
+            launch(game, dll, "", 1);
+            if (GetTickCount() - t0 < 20000) {
+                printf("Spiel hat sich sofort beendet - starte es in 10 s noch einmal.\n");
+                fflush(stdout);
+                Sleep(10000);
+                if (process_running("LEGOBatman2.exe")) {
+                    // Steam hat es selbst neu gestartet, dann aber ohne Mod: nicht noch ein zweites daneben starten
+                    printf("ERROR Steam hat LEGO Batman 2 ohne Mod gestartet. Bitte das Spiel schliessen und neu einladen.\n");
+                } else {
+                    ensure_steam();
+                    launch(game, dll, "", 1);
+                }
+            }
+        }
         printf("STATUS beendet\n");
         return 0;
     }

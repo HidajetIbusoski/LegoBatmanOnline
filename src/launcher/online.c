@@ -400,7 +400,7 @@ int online_measure_ping(ONLINE *o)
 }
 
 // --- Spielstand uebertragen (Host -> Gast) ---------------------------------------------
-int online_send_saves(ONLINE *o, const char *save_dir)
+int online_send_saves(ONLINE *o, const char *save_dir, const char *file_pattern)
 {
     char pattern[MAX_PATH], path[MAX_PATH];
     WIN32_FIND_DATAA fd;
@@ -409,7 +409,7 @@ int online_send_saves(ONLINE *o, const char *save_dir)
     unsigned char *data[16];
     unsigned sizes[16];
     int nfiles = 0, i;
-    snprintf(pattern, sizeof pattern, "%s\\SaveGame*", save_dir);
+    snprintf(pattern, sizeof pattern, "%s\\%s", save_dir, file_pattern);
     fh = FindFirstFileA(pattern, &fd);
     if (fh != INVALID_HANDLE_VALUE) {
         do {
@@ -426,7 +426,7 @@ int online_send_saves(ONLINE *o, const char *save_dir)
         } while (FindNextFileA(fh, &fd));
         FindClose(fh);
     }
-    printf("Sende %d Spielstand-Datei(en) an den Gast ...\n", nfiles);
+    printf("Sende %d Datei(en) an den Gast ...\n", nfiles);
     // Datei 0..n-1 nacheinander; Gast meldet per HAVE, welche Stuecke fehlen. Leere Liste: nfiles=0.
     for (i = 0; i <= nfiles; i++) {
         unsigned nch = i < nfiles ? (sizes[i] + 999) / 1000 : 1;
@@ -457,7 +457,7 @@ int online_send_saves(ONLINE *o, const char *save_dir)
                 if (n >= 12 && in.magic == LMAGIC && in.key == s_key_peer && in.type == M_READY) {
                     // Der Gast ist schon fertig und wartet; seine letzte Meldung ging verloren
                     for (; i < nfiles; i++) free(data[i]);
-                    printf("Spielstand uebertragen.\n");
+                    printf("Dateien uebertragen.\n");
                     return 1;
                 }
                 if (n != (int)sizeof in || in.magic != LMAGIC || in.key != s_key_peer || in.type != M_HAVE || in.file != (unsigned)i) continue;
@@ -474,7 +474,7 @@ int online_send_saves(ONLINE *o, const char *save_dir)
         }
         if (i < nfiles) free(data[i]);
     }
-    printf("Spielstand uebertragen.\n");
+    printf("Dateien uebertragen.\n");
     return 1;
 }
 
@@ -488,7 +488,7 @@ int online_receive_saves(ONLINE *o, const char *dest_dir)
     DWORD start = GetTickCount(), last_have = 0;
     CreateDirectoryA(dest_dir, NULL);
     memset(have, 0, sizeof have);
-    printf("Empfange den Spielstand des Hosts ...\n");
+    printf("Empfange Dateien des Hosts ...\n");
     while (GetTickCount() - start < 40000) {
         FILEPKT p;
         struct sockaddr_in from;
@@ -531,10 +531,10 @@ int online_receive_saves(ONLINE *o, const char *dest_dir)
             free(buf); buf = NULL; nch = 0;
             memset(have, 0, sizeof have);
             file++;
-            if (file > nfiles) { printf("Spielstand empfangen.\n"); return 1; }
+            if (file > nfiles) { printf("Dateien empfangen.\n"); return 1; }
         }
     }
-    printf("Fehler: Spielstand nicht vollstaendig empfangen.\n");
+    printf("Fehler: Dateien des Hosts nicht vollstaendig empfangen.\n");
     return 0;
 }
 

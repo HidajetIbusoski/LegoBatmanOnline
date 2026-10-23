@@ -22,6 +22,8 @@
 //   LBO_VIDEODT    1 = dt waehrend Videos nicht durch die Videouhr ersetzen (bleibt 1/60)
 //   LBO_RENDERRNG  1 = Zufallsaufrufe beim Zeichnen (0x5e0d52, 0x5e0db8, 0x598619) und im Musiktakt
 //                  (0x94cdf0) auf eigene Zustaende
+//   LBO_CUTSKIP    0 = Zwischensequenzen nicht zusaetzlich freischalten (Standard: alle ueberspringbar)
+//   LBO_LCGSPLIT   0 = Zufall je Verbraucher (eigener LCG16-Zustand je Funktion) aus; Standard wie LBO_RENDERRNG
 //   LBO_WATCHLCG   1 = Hardware-Haltepunkt auf den LCG 0x11a1844: Schreibstellen im LBO_TRACERNG-Fenster
 //   LBO_WATCHADDR  Adresse (hex): wie LBO_WATCHLCG, aber fuer einen anderen 4-Byte-Wert
 //   LBO_VCLOCK     1 = virtuelle Uhr: Der Spiel-Timer liefert im Hauptthread Frame x 1/60 statt Echtzeit
@@ -589,10 +591,102 @@ static void redirected(const char *path, char *out)
 }
 
 static int is_save_dir(const char *path);
+static char g_pcconfig[MAX_PATH];   // LBO_PCCONFIG: pcconfig.txt aus dieser Datei lesen (Netz: Einstellungen des Hosts)
+
+static int is_pcconfig(const char *path)
+{
+    size_t n = path ? strlen(path) : 0;
+    return n >= 12 && !_stricmp(path + n - 12, "pcconfig.txt") && (n == 12 || path[n - 13] == '\\' || path[n - 13] == '/');
+}
+
+// Netz: Gleiche Grafikeinstellungen auf beiden Seiten. Test CA (23.10.): Gast mit niedrigen Shader-/Schatten-/
+// Effekt-Stufen, ab Frame 912 nach Levelstart liefen Figuren anders. Beide lesen deshalb eine Datei aus der
+// pcconfig.txt des Hosts (Gast: LBO_HOSTCONFIG, vom Launcher empfangen); nur diese Schluessel bleiben die eigenen.
+// IgnoreVendorPresets=1, damit das Spiel nicht je nach Grafikkarte eigene Stufen waehlt. ScreenRefreshRate ist fest
+// 60: Die Rate waehlt den Anzeigemodus und wirkt auf die Spielzeit (Test KH, 23.10.: Host 120 Hz, Gast 60 Hz, ab
+// Frame 1785 nach Levelstart eine andere Position von Spieler 1; Aufloesung und VSync allein blieben gleich).
+static const char *const k_own_keys[] = {
+    "ScreenWidth", "ScreenHeight", "WindowWidth", "WindowHeight", "WindowLeft", "WindowTop",
+    "VerticalSync", "Brightness", "SFXVolume", "MusicVolume", "MasterVolume", "MusicEnabled", "SubtitlesEnabled",
+    "MouseSensitivity", "InvertY", "Vibration", NULL };
+
+static int cfg_key(const char *line, char *key, size_t n)
+{
+    size_t i = 0;
+    while (line[i] && !isspace((unsigned char)line[i]) && i + 1 < n) { key[i] = line[i]; i++; }
+    key[i] = 0;
+    return i > 0;
+}
+
+static int cfg_own_key(const char *key)
+{
+    int i;
+    for (i = 0; k_own_keys[i]; i++) if (!_stricmp(key, k_own_keys[i])) return 1;
+    return 0;
+}
+
+// Liefert die Zeile zu key aus own (oder NULL)
+static const char *cfg_find(char lines[][160], int n, const char *key)
+{
+    char k[64];
+    int i;
+    for (i = 0; i < n; i++) if (cfg_key(lines[i], k, sizeof k) && !_stricmp(k, key)) return lines[i];
+    return NULL;
+}
+
+static int cfg_read(const char *path, char lines[][160], int max)
+{
+    FILE *f = fopen(path, "r");
+    int n = 0;
+    if (!f) return -1;
+    while (n < max && fgets(lines[n], 160, f)) {
+        size_t l = strlen(lines[n]);
+        while (l && (lines[n][l - 1] == '\n' || lines[n][l - 1] == '\r')) lines[n][--l] = 0;
+        if (l) n++;
+    }
+    fclose(f);
+    return n;
+}
+
+static void net_pcconfig(void)
+{
+    static char host[96][160], own[96][160];
+    char path[MAX_PATH], hostpath[MAX_PATH], out[MAX_PATH], key[64];
+    int nh, no, i, ignore = 0;
+    FILE *f;
+    if (!GetEnvironmentVariableA("APPDATA", path, MAX_PATH - 80)) return;
+    strcat(path, "\\Warner Bros. Interactive Entertainment\\LEGO Batman 2\\pcconfig.txt");
+    if (!GetEnvironmentVariableA("LBO_HOSTCONFIG", hostpath, sizeof hostpath)) strcpy(hostpath, path);
+    GetEnvironmentVariableA("LBO_OWNCONFIG", path, sizeof path);   // Test: eigene Einstellungen aus dieser Datei
+    no = cfg_read(path, own, 96);
+    nh = cfg_read(hostpath, host, 96);
+    if (nh <= 0) { logf_("Netz-Einstellungen: keine pcconfig.txt des Hosts (%s), Spiel nimmt eigene", hostpath); return; }
+    snprintf(out, sizeof out, "%s\\netz_pcconfig.txt", g_dir);
+    f = fopen(out, "w");
+    if (!f) return;
+    for (i = 0; i < nh; i++) {
+        const char *line = host[i], *mine;
+        if (!cfg_key(line, key, sizeof key)) continue;
+        if (!_stricmp(key, "IgnoreVendorPresets")) { fprintf(f, "IgnoreVendorPresets 1\n"); ignore = 1; continue; }
+        if (!_stricmp(key, "ScreenRefreshRate")) { fprintf(f, "ScreenRefreshRate 60\n"); continue; }
+        if (cfg_own_key(key) && no > 0 && (mine = cfg_find(own, no, key)) != NULL) line = mine;
+        fprintf(f, "%s\n", line);
+    }
+    for (i = 0; i < no; i++)   // eigene Schluessel, die in der Host-Datei fehlen
+        if (cfg_key(own[i], key, sizeof key) && cfg_own_key(key) && !cfg_find(host, nh, key)) fprintf(f, "%s\n", own[i]);
+    if (!ignore) fprintf(f, "IgnoreVendorPresets 1\n");
+    fclose(f);
+    strcpy(g_pcconfig, out);
+    logf_("Netz-Einstellungen: Grafik aus %s, Aufloesung/Ton/Steuerung aus %s, 60 Hz -> %s", hostpath, path, out);
+}
 
 static HANDLE WINAPI hook_createfile(LPCSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
                                      DWORD disp, DWORD flags, HANDLE tmpl)
 {
+    if (g_pcconfig[0] && is_pcconfig(path) && !(access & (GENERIC_WRITE | GENERIC_ALL))) {
+        logf_("pcconfig.txt gelesen aus %s", g_pcconfig);
+        return real_createfile(g_pcconfig, access, share, sa, disp, flags, tmpl);
+    }
     // Netzmodus: Auch Lesen der Spielstaende umleiten, damit beide Spiele dieselben (leeren) Plaetze sehen
     if (((access & (GENERIC_WRITE | GENERIC_ALL)) && is_protected(path)) || (g_net && is_save_dir(path))) {
         char red[MAX_PATH];
@@ -661,6 +755,50 @@ static int WINAPI hook_shcreatedir(HWND w, LPCSTR path, const SECURITY_ATTRIBUTE
 {
     if (is_save_dir(path)) { logf_("Ordner nicht angelegt: %s", path); return ERROR_SUCCESS; }
     return real_shcreatedir(w, path, sa);
+}
+
+// Das Spiel sucht seine Spielstaende per FindFirstFileA: erst die Ordner SavedGames\Slot1..4, dann
+// Slot1\GAME1..10.LEGOBatman2SaveGameData. LBO_SAVEFIND=1 (Test, nur Netzmodus): Slot1 liegt virtuell in LBO_DIR
+// (umgeleitet_GAMEn...), so laden zwei Testspiele einen mitgebrachten Spielstand, ohne den echten Ordner anzufassen.
+typedef HANDLE (WINAPI *FindFirstFileAFn)(LPCSTR, WIN32_FIND_DATAA *);
+typedef DWORD (WINAPI *GetFileAttributesAFn)(LPCSTR);
+static FindFirstFileAFn real_findfirst;
+static GetFileAttributesAFn real_getattr;
+static int g_savefind;
+
+static HANDLE WINAPI hook_findfirst(LPCSTR pat, WIN32_FIND_DATAA *fd)
+{
+    HANDLE h;
+    if (g_savefind && g_net && is_save_dir(pat)) {
+        const char *base = strrchr(pat, '\\') ? strrchr(pat, '\\') + 1 : pat;
+        char low[MAX_PATH], q[MAX_PATH];
+        size_t i;
+        for (i = 0; pat[i] && i < MAX_PATH - 1; i++) low[i] = (char)tolower((unsigned char)pat[i]);
+        low[i] = 0;
+        h = INVALID_HANDLE_VALUE;
+        if (!_stricmp(base, "Slot1")) {
+            snprintf(q, sizeof q, "%s\\umgeleitet_GAME*.LEGOBatman2SaveGameData", g_dir);
+            h = real_findfirst(q, fd);
+            if (h != INVALID_HANDLE_VALUE) { FindClose(h); h = real_findfirst(g_dir, fd); }
+        } else if (strstr(low, "\\slot1\\")) {
+            redirected(pat, q);
+            h = real_findfirst(q, fd);
+        }
+        if (h != INVALID_HANDLE_VALUE) { strncpy(fd->cFileName, base, MAX_PATH - 1); fd->cFileName[MAX_PATH - 1] = 0; }
+        else SetLastError(ERROR_FILE_NOT_FOUND);
+        logf_("Suche %s -> %s (Testordner)", pat, h == INVALID_HANDLE_VALUE ? "nichts" : "gefunden");
+        return h;
+    }
+    h = real_findfirst(pat, fd);
+    if (is_save_dir(pat)) logf_("Suche %s -> %s", pat, h == INVALID_HANDLE_VALUE ? "nichts" : fd->cFileName);
+    return h;
+}
+
+static DWORD WINAPI hook_getattr(LPCSTR path)
+{
+    DWORD a = real_getattr(path);
+    if (is_save_dir(path)) logf_("Attribute %s -> %08lx", path, a);
+    return a;
 }
 
 // --- Virtuelle Uhr --------------------------------------------------------------------------------
@@ -1208,13 +1346,19 @@ static void av_sync(void)
         ratio = a->ratio > 0 ? a->ratio : 1.0f;
         rate = a->rate * ratio;
         ahead = (a->rtot - a->vtot) * 1000.0 / rate;   // positiv: echter Ton ist vorn
-        if (!g_avsync) corr = 1.0f;
-        else if (ahead > 15) corr = (float)(1.0 - (ahead - 15 > 60 ? 60 : ahead - 15) / 400.0);
-        else if (ahead < -15) corr = (float)(1.0 + (-ahead - 15 > 40 ? 40 : -ahead - 15) / 400.0);
+        // Nur Mono-Stimmen (Sprache, aber auch die Musik-Streams: 44,1 kHz mono) werden nachgefuehrt, hoechstens
+        // 0,5 % (unter der Hoerschwelle fuer Tonhoehen) und langsam: Frueher bis 15 % bzw. 4,6 %, sprunghaft und mit
+        // Anhalten; die Musik klang dadurch wie ein Lautstaerkeregler, der hoch und runter gedreht wird (Playtest
+        // 22.10.). 0,5 % holen 300 ms in einer Minute auf; groessere Abstaende entstehen nur bei langen Haengern.
+        if (!g_avsync || a->channels != 1) corr = 1.0f;
+        else if (ahead > 20) corr = (float)(1.0 - (ahead - 20 > 100 ? 100 : ahead - 20) / 20000.0);
+        else if (ahead < -20) corr = (float)(1.0 + (-ahead - 20 > 100 ? 100 : -ahead - 20) / 20000.0);
         else corr = 1.0f;
+        if (corr - a->corr > 0.0005f) corr = a->corr + 0.0005f;   // je Frame hoechstens 0,05 % aendern
+        if (a->corr - corr > 0.0005f) corr = a->corr - 0.0005f;
         if (corr * ratio > a->maxr) corr = a->maxr / ratio;
-        if (corr - a->corr > 0.004f || a->corr - corr > 0.004f) { a->corr = corr; setratio = 1; }
-        if (g_avsync && !a->held && ahead > 150 && st.BuffersQueued) { a->held = 1; act = 1; g_av_holds++; }
+        if (corr - a->corr > 0.0004f || a->corr - corr > 0.0004f || (corr == 1.0f && a->corr != 1.0f)) { a->corr = corr; setratio = 1; }
+        if (g_avsync && a->channels == 1 && !a->held && ahead > 400 && st.BuffersQueued) { a->held = 1; act = 1; g_av_holds++; }
         else if (a->held && ahead < 20) { a->held = 0; act = 2; }
         if (g_avlog && (ahead - g_av_last[i] > 20 || g_av_last[i] - ahead > 20)) {
             logf_("Ton-Abstand: Stimme %d (%u Hz, %u Kan.) echter Ton %+.0f ms vorn, Faktor %.3f%s, Puffer %d/%u",
@@ -1235,7 +1379,7 @@ static void av_sync(void)
     }
 }
 
-// Haenger: Dauert eine Wartestelle der Mod (Laden, Netz) laenger als 60 ms, haelt der Hauptthread selbst alle laufenden
+// Haenger: Dauert eine Wartestelle der Mod (Laden, Netz) laenger als 300 ms, haelt der Hauptthread selbst alle laufenden
 // Stimmen an, va_tick setzt sie im naechsten Frame fort. So steht der Ton mit dem Bild, statt vorzulaufen. Nur der
 // Hauptthread ruft dafuer XAudio2 (ein eigener Waechter-Thread verklemmte sich mit ihm, siehe av_sync).
 static int g_av_paused;
@@ -1246,7 +1390,8 @@ static void av_hitch(DWORD start)
 {
     int i, n = 0;
     void *list[64];
-    if (!g_vaudio || !g_avsync || g_av_paused || GetCurrentThreadId() != g_main_tid || GetTickCount() - start < 60) return;
+    // Erst ab 300 ms: kurze Wartephasen (WLAN, Laden) liessen den Ton sonst staendig aussetzen und wieder einsetzen
+    if (!g_vaudio || !g_avsync || g_av_paused || GetCurrentThreadId() != g_main_tid || GetTickCount() - start < 300) return;
     EnterCriticalSection(&g_va_cs);
     for (i = 0; i < 64; i++) {
         VA_VOICE *a = &g_va[i];
@@ -1404,11 +1549,14 @@ static unsigned *crt_rand_ptr(void)
 
 // Alle bekannten Zufallszustaende auf feste Werte setzen. Online uebernimmt der Gast sie spaeter vom Host;
 // lokal ersetzt das den Abgleich, weil Intro und Menues die Zustaende unterschiedlich weit vorruecken.
+static void lcg_reset_streams(void);
+
 static void reset_rng(void)
 {
     unsigned *crt = crt_rand_ptr();
     G_RNG_PM_SEED = 0x1F3AD27F;
     G_RNG_LCG16 = 12345;
+    lcg_reset_streams();
     G_RNG_PM_DEFAULT = 1;
     G_RNG_A = 0x1234;
     G_RNG_B = 0x5678;
@@ -1461,6 +1609,7 @@ static void net_sync_point(long F, const char *what)
         if (got) sync_apply(&s);
         if (got != F) logf_("Netz: Abgleich %s bei Frame %ld passt nicht (Host-Frame %d)", what, F, got);
     }
+    lcg_reset_streams();   // Zufall je Verbraucher: auf beiden Seiten fest, statt ihn zu uebertragen
     logf_("Netz: Abgleich %s bei Frame %ld", what, F);
 }
 
@@ -1488,6 +1637,7 @@ static void net_meet(long F, const char *what)
         if (len) logf_("Netz: Zustand wich vor der Schranke ab:%s", diff);
         sync_apply(&s);
     }
+    lcg_reset_streams();
     g_anchor = F;
     net_set_frame_offset(F - 1);
     g_repairs = g_last_repair = g_repair_done = g_seen_desync = 0;
@@ -1500,6 +1650,25 @@ static void net_meet(long F, const char *what)
 // LBO_NODINPUT=1: dasselbe im lokalen Test (sonst Standard nur im Netz). Die Tastatur-/DirectInput-Abfrage
 // aenderte im Paartest bei Frame 269 Eingabe-Zustaende (0x13655a4) und verschob den Spielstart um 1 Frame.
 static int g_nodinput;
+
+// Zwischensequenzen ueberspringbar (LBO_CUTSKIP, Standard an): Das Level-Skript schaltet das Ueberspringen mit
+// "allowcutskip" frei, es landet im Byte +0xdc des Szenen-Objekts *0x11bdf70. Die virtuelle Pruefung 0x925360
+// (Vtable 0xf52600) erlaubt dann jede Sequenz ohne eigenes Sperr-Flag (0x10 in +0x16d), auch das lange Intro.
+// Das Spiel zeigt dabei seine eigene Ueberspringen-Anzeige; die Taste kommt wie jede Eingabe ueber den Lockstep,
+// beide springen also im selben Frame.
+static int g_cutskip = 1;
+
+static void force_cutskip(void)
+{
+    static int logged;
+    __try {
+        unsigned char *scene = *(unsigned char *volatile *)0x011BDF70;
+        if (scene && !scene[0xDC]) {
+            scene[0xDC] = 1;
+            if (!logged) { logged = 1; logf_("Zwischensequenzen ueberspringbar (Szene %p)", (void *)scene); }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
 
 __declspec(naked) static void stub_poll_device(void)
 {
@@ -2473,6 +2642,110 @@ static int patch_abs32(DWORD at, DWORD expect, void *to)
     return 1;
 }
 
+// --- Zufall je Verbraucher (LCG16 0x11a1844) -----------------------------------------------------------
+// Bisher teilten sich 135 Funktionen und 55 Aufrufer der Hilfsfunktion 0x88cdd0 einen Zustand. Zog ein einziger
+// Verbraucher auf einem PC einmal mehr oder einen Frame frueher (Musiktakt 20.10., offene Welt 22.10.: beim
+// Partner genau einen Frame spaeter), verschob das die Zahlen aller anderen, auch der Spiellogik. Jetzt hat jede
+// Funktion und jeder Aufrufer von 0x88cdd0 einen eigenen Zustand: Ein abweichender Verbraucher (Zeichnen,
+// Musik, Nachladen in der offenen Welt) verstellt nur noch seine eigenen Zahlen. Die Tabelle erzeugt
+// tools/gen_lcg_sites.py aus dem Spielabbild. An jedem Abgleich setzen beide Seiten alle Zustaende neu.
+#include "lcg_sites.h"
+#define LCG_NSTREAM (LCG_NFUNC + LCG_NRAND16 + 1)   // letzter: Aufrufe von 0x88cdd0 ohne Tabelleneintrag
+static unsigned g_lcg[LCG_NSTREAM];
+static int g_lcg_split = -1;   // LBO_LCGSPLIT=0/1, sonst wie LBO_RENDERRNG
+static int patch_jmp(DWORD at, void *to, const unsigned char *expect);
+
+static void lcg_reset_streams(void)
+{
+    int i;
+    for (i = 0; i < LCG_NSTREAM; i++) g_lcg[i] = (12345u + 7919u * i) & 0xFFFF;
+    G_RNG_LCG16 = 12345;   // wird nicht mehr benutzt, bleibt fuer Logs und Pruefsumme fest
+}
+
+// Hash ueber alle Zustaende (nur fuer frames.csv, nicht fuer die Pruefsumme)
+static unsigned lcg_streams_hash(void)
+{
+    unsigned h = 2166136261u;
+    int i;
+    for (i = 0; i < LCG_NSTREAM; i++) h = (h ^ g_lcg[i]) * 16777619u;
+    return h;
+}
+
+static unsigned *__stdcall lcg_rand16_stream(DWORD ret)
+{
+    int lo = 0, hi = LCG_NRAND16 - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2;
+        if (k_lcg_rand16_rets[m] == ret) return &g_lcg[LCG_NFUNC + m];
+        if (k_lcg_rand16_rets[m] < ret) lo = m + 1; else hi = m - 1;
+    }
+    return &g_lcg[LCG_NSTREAM - 1];
+}
+
+// Ersatz fuer 0x88cdd0 (mov eax,[lcg]; imul 0x24cd; inc; and 0xffff; mov [lcg],eax; ret): nur eax aendert sich
+__declspec(naked) static void stub_rand16(void)
+{
+    __asm {
+        push ecx
+        push edx
+        push dword ptr [esp + 8]
+        call lcg_rand16_stream
+        mov edx, dword ptr [eax]
+        imul edx, edx, 24CDh
+        inc edx
+        and edx, 0FFFFh
+        mov dword ptr [eax], edx
+        mov eax, edx
+        pop edx
+        pop ecx
+        ret
+    }
+}
+
+// Ersatz fuer "mov dword ptr [0x11a1844], 0x3039" in 0x9d5630 (Zufall fuer ein neues Level zuruecksetzen)
+__declspec(naked) static void stub_lcg_reset(void)
+{
+    __asm {
+        pushad
+        pushfd
+        call lcg_reset_streams
+        popfd
+        popad
+        ret
+    }
+}
+
+static int patch_lcg_sites(void)
+{
+    static const unsigned char pro_rand16[5] = { 0xA1, 0x44, 0x18, 0x1A, 0x01 };
+    static const unsigned char reset_orig[10] = { 0xC7, 0x05, 0x44, 0x18, 0x1A, 0x01, 0x39, 0x30, 0x00, 0x00 };
+    static unsigned char done[sizeof k_lcg_sites / sizeof k_lcg_sites[0]];
+    static int rand_done, reset_done, logged;
+    int i, n = 0, all = 1;
+    for (i = 0; i < (int)(sizeof k_lcg_sites / sizeof k_lcg_sites[0]); i++) {
+        if (!done[i]) done[i] = (unsigned char)patch_abs32(k_lcg_sites[i].at, 0x011A1844, &g_lcg[k_lcg_sites[i].s]);
+        all &= done[i];
+        n += done[i];
+    }
+    if (!rand_done) rand_done = patch_jmp(0x0088CDD0, (void *)stub_rand16, pro_rand16);
+    if (!reset_done && !memcmp((void *)0x009D576F, reset_orig, 10)) {
+        unsigned char *p = (unsigned char *)0x009D576F;
+        DWORD old;
+        VirtualProtect(p, 10, PAGE_EXECUTE_READWRITE, &old);
+        p[0] = 0xE8;
+        *(DWORD *)(p + 1) = (DWORD)stub_lcg_reset - (0x009D576F + 5);
+        memset(p + 5, 0x90, 5);
+        VirtualProtect(p, 10, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 10);
+        reset_done = 1;
+    }
+    if (all && rand_done && reset_done && !logged) {
+        logged = 1;
+        logf_("Zufall je Verbraucher: %d Zugriffe in %d Funktionen, %d Aufrufer von 0x88cdd0", n, LCG_NFUNC, LCG_NRAND16);
+    }
+    return all && rand_done && reset_done;
+}
+
 __declspec(naked) static void render_rand(void)
 {
     __asm {
@@ -2857,6 +3130,14 @@ static void __cdecl on_frame_end(void)
         logf_("NuBgProc synchron (Warteschlange %p)", (void *)G_BGPROC);
     }
     if (g_devchange) { g_devchange = 0; notify_devchange(); }
+    if (g_cutskip) force_cutskip();
+    {
+        static int last_hz = -1;
+        int hz = *(volatile int *)0x01154304;   // Bildwiederholrate aus pcconfig.txt bzw. vom gewaehlten Anzeigemodus
+        if (hz != last_hz) { logf_("Bildwiederholrate %d Hz%s", hz, g_net && hz != 60 ? " -> 60" : ""); last_hz = hz; }
+        // Netz: 0x63fee7 kann den Wert aus dem Anzeigemodus uebernehmen; beide Seiten muessen dieselbe Rate sehen
+        if (g_net && hz != 60) { *(volatile int *)0x01154304 = 60; last_hz = 60; }
+    }
     if (g_rng_reset && F == g_rng_reset) reset_rng();
     if (g_net && F == SYNC_EARLY_FRAME) net_sync_point(F, "nach dem Start");
     if (g_anchor_mode && g_anchor < 0 && G_CHAR_COUNT > 2) {
@@ -2894,8 +3175,8 @@ static void __cdecl on_frame_end(void)
             g_wt[6] += qpc_now() - tn;
         }
         if (g_test_desync && g_anchor >= 0 && NF == g_test_desync) {
-            G_RNG_LCG16 ^= 0x5555;
-            logf_("Test: LCG16 bei Frame %ld verstellt", NF);
+            if (g_lcg_split) G_RNG_A ^= 0x5555; else G_RNG_LCG16 ^= 0x5555;
+            logf_("Test: %s bei Frame %ld verstellt", g_lcg_split ? "rng_a" : "LCG16", NF);
         }
         // Selbstheilung: Am angekuendigten Reparatur-Frame schickt der Host seine Zustaende, der Gast uebernimmt sie
         // (beide an derselben Stelle des Frame-Endes). Im Playtest wich nach dem Laden zuerst nur der LCG16 ab.
@@ -2916,6 +3197,11 @@ static void __cdecl on_frame_end(void)
         if (g_anchor >= 0 && NF % 20 == 0) {
             CHARSNAP k;
             unsigned long long ck;
+            static int lcg_warned;
+            if (g_lcg_split && G_RNG_LCG16 != 12345 && !lcg_warned) {
+                lcg_warned = 1;   // ein Verbraucher, der nicht in lcg_sites.h steht (Pruefsumme sieht ihn weiter)
+                logf_("Zufall je Verbraucher: LCG16 0x11a1844 trotzdem veraendert (%04x) - Zugriff fehlt in der Tabelle", G_RNG_LCG16);
+            }
             char_snapshot(&k);
             ck = ((unsigned long long)k.hash << 32) ^ (unsigned)k.n ^ G_RNG_LCG16 ^ ((unsigned long long)G_RNG_A << 16) ^
                  ((unsigned long long)G_RNG_PM_DEFAULT << 40) ^ crt_rand_state();
@@ -2952,7 +3238,7 @@ static void __cdecl on_frame_end(void)
             int *cur = (int *)G_BGPROC_CURRENT;
             fprintf(g_csv, "%ld,%d,%.6f,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%d,%d,%08x,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
                     "%d,%d,%d,%d,%d,%d,%ld,%08x,%d,%d,%ld,%lu,%ld,%08lx,%04x,%08x,%ld\n", F, G_FRAMECOUNT,
-                    G_DT, G_RNG_PM_SEED, G_RNG_LCG16, G_RNG_PM_DEFAULT, G_RNG_A, G_RNG_B, G_RNG_C, crt_rand_state(), g_polls, cs.n, cs.hash,
+                    G_DT, G_RNG_PM_SEED, g_lcg_split ? lcg_streams_hash() : G_RNG_LCG16, G_RNG_PM_DEFAULT, G_RNG_A, G_RNG_B, G_RNG_C, crt_rand_state(), g_polls, cs.n, cs.hash,
                     cs.p1[0], cs.p1[1], cs.p1[2], cs.p2[0], cs.p2[1], cs.p2[2],
                     *(int *)0x011CF178, *(int *)0x0131356C, *(int *)0x01313574, *(int *)0x0131359C, *(int *)0x013135B0,
                     *(int *)0x01313568, q ? *(LONG *)(q + BGPROC_PENDING) : -1, cur ? cur[2] : 0, ll ? ll[2] : -1, inflight,
@@ -3051,6 +3337,8 @@ static DWORD WINAPI installer(void *arg)
                 patch_iat(IAT_QPC, (void *)hook_qpc, (void **)&real_qpc);
                 patch_iat(0x00C55388, (void *)hook_cocreate, (void **)&real_cocreate);          // CoCreateInstance
                 patch_iat(0x00C551C0, (void *)hook_createdir, (void **)&real_createdir);        // CreateDirectoryA
+                patch_iat(0x00C55200, (void *)hook_findfirst, (void **)&real_findfirst);        // FindFirstFileA
+                patch_iat(0x00C55250, (void *)hook_getattr, (void **)&real_getattr);            // GetFileAttributesA
                 patch_iat(0x00C5526C, (void *)hook_shcreatedir, (void **)&real_shcreatedir);    // SHCreateDirectoryExA
                 file_done = 1;
             }
@@ -3097,10 +3385,13 @@ static DWORD WINAPI installer(void *arg)
                             ONCE(p[2], patch_call(0x0063D8EE, 0x0063B6F0, (void *)stub_poll_device));
             }
             if (!rrng_done) {
-                static int p[10];
+                static int p[11];
+                // Mit Zufall je Verbraucher bekommen die Musik-Funktionen ihre Zustaende aus der Tabelle
+                if (g_lcg_split && !p[3]) p[3] = p[4] = p[5] = p[6] = p[7] = p[8] = 1;
                 rrng_done = ONCE(p[0], patch_call(0x005E0D52, 0x00BD1C9D, (void *)render_rand)) &
                             ONCE(p[1], patch_call(0x005E0DB8, 0x00BD1C9D, (void *)render_rand)) &
                             ONCE(p[2], patch_call(0x00598619, 0x0051A1D0, (void *)render_rng_a)) &
+                            ONCE(p[10], !g_lcg_split || patch_lcg_sites()) &
                             ONCE(p[3], patch_abs32(0x0094CEC4, 0x011A1844, &g_rr_music_lcg)) &
                             ONCE(p[4], patch_abs32(0x0094CED5, 0x011A1844, &g_rr_music_lcg)) &
                             ONCE(p[5], patch_abs32(0x0094CC92, 0x011A1844, &g_rr_music_lcg2)) &
@@ -3160,6 +3451,7 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_BREAKW", buf, sizeof buf)) { g_breakat = strtoul(buf, NULL, 16); g_break_write = 1; }
     if (GetEnvironmentVariableA("LBO_BREAKFROM", buf, sizeof buf)) g_break_from = atol(buf);
     if (GetEnvironmentVariableA("LBO_RENDERRNG", buf, sizeof buf)) g_render_rng = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_LCGSPLIT", buf, sizeof buf)) g_lcg_split = atoi(buf);
     if (GetEnvironmentVariableA("LBO_ANCHOR", buf, sizeof buf)) g_anchor_mode = atoi(buf);
     if (GetEnvironmentVariableA("LBO_IOWAIT", buf, sizeof buf)) g_iowait = atoi(buf);
     if (GetEnvironmentVariableA("LBO_SLOWSTART", buf, sizeof buf)) g_slow_start = atoi(buf);
@@ -3167,6 +3459,8 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_GATE", buf, sizeof buf)) g_gate = atoi(buf);
     if (GetEnvironmentVariableA("LBO_LOOPGATE", buf, sizeof buf)) g_loopgate = atoi(buf);
     if (GetEnvironmentVariableA("LBO_NODINPUT", buf, sizeof buf)) g_nodinput = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_CUTSKIP", buf, sizeof buf)) g_cutskip = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_SAVEFIND", buf, sizeof buf)) g_savefind = atoi(buf);
     if (GetEnvironmentVariableA("LBO_MEMDUMP", buf, sizeof buf) && sscanf(buf, "%ld,%ld,%ld", &g_memdump_from, &g_memdump_to, &g_memdump_step) >= 2)
         g_memdump = open_out("memdump.bin", "wb");
     if (GetEnvironmentVariableA("LBO_GATESET", buf, sizeof buf)) {
@@ -3180,6 +3474,7 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_TESTDESYNC", buf, sizeof buf)) g_test_desync = atol(buf);
     if (GetEnvironmentVariableA("LBO_TESTMEET", buf, sizeof buf)) g_test_meet = atol(buf);
     if (GetEnvironmentVariableA("LBO_LOADPROBE", buf, sizeof buf)) g_loadprobe = atoi(buf);
+    GetEnvironmentVariableA("LBO_PCCONFIG", g_pcconfig, sizeof g_pcconfig);
     if (GetEnvironmentVariableA("LBO_PAUSE", buf, sizeof buf)) sscanf(buf, "%ld,%d", &g_pause_at, &g_pause_ms);
     if (GetEnvironmentVariableA("LBO_AUDIOLOG", buf, sizeof buf)) g_audiolog = atoi(buf);
     if (GetEnvironmentVariableA("LBO_VAUDIO", buf, sizeof buf)) g_vaudio = atoi(buf);
@@ -3201,6 +3496,7 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_RNGRESET", buf, sizeof buf)) g_rng_reset = atoi(buf);
     // Netzmodus: alle Schalter, die den Ablauf deterministisch machen, sind Pflicht (docs/batman2-phase0.md)
     g_net = net_init(logf_);
+    if (g_net && !g_pcconfig[0]) net_pcconfig();
     if (g_net) net_set_partner_timeout(30000);
     if (g_net) net_set_wait_callback(av_hitch);
     if (g_net) net_set_notice_callback(net_notice_cb);   // danach alleine weiter statt endlos einfrieren
@@ -3232,6 +3528,9 @@ static void init(void)
     logf_("NuBgProc synchron %d, ohne Videos %d, Zufalls-Reset bei Frame %d, Lade-Sync %d, Video-dt fest %d, virtuelle Uhr %d", g_bgsync,
           g_no_movies, g_rng_reset, g_loadsync, g_videodt, g_vclock);
     if (g_loopgate) g_loop_sem = CreateSemaphoreA(NULL, 0, 100000, NULL);
+    if (g_lcg_split < 0) g_lcg_split = g_render_rng;
+    if (!g_render_rng) g_lcg_split = 0;   // die Tabelle haengt am Patch-Durchlauf von LBO_RENDERRNG
+    lcg_reset_streams();
     CreateThread(NULL, 0, installer, NULL, 0, NULL);
 }
 

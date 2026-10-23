@@ -30,17 +30,25 @@ public static class GameBridge
     /// Start oder wartet auf ein Steam-Fenster; im Playtest 20.10. abends kam das Spiel des Mitspielers so nicht
     /// ueber den Start hinaus. Startet Steam bei Bedarf und wartet hoechstens 2 Minuten auf die Anmeldung.
     /// </summary>
+    // Bereit heisst: Steam laeuft genau als der Prozess, den Steam selbst in ActiveProcess\pid eintraegt, und dort ist ein
+    // Benutzer angemeldet. ActiveUser allein reicht nicht: Der Wert bleibt vom letzten Lauf stehen. Im Playtest 22.10.
+    // galt Steam beim Mitspieler so 5 s nach dem Start als bereit, und sein Spiel beendete sich nach 1 s wieder.
     public static bool SteamReady()
     {
-        var user = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam\ActiveProcess", "ActiveUser", 0);
-        return Process.GetProcessesByName("steam").Length > 0 && user is int u && u != 0;
+        var key = @"HKEY_CURRENT_USER\Software\Valve\Steam\ActiveProcess";
+        if (Registry.GetValue(key, "ActiveUser", 0) is not int user || user == 0) return false;
+        if (Registry.GetValue(key, "pid", 0) is not int pid || pid == 0) return false;
+        try { return Process.GetProcessById(pid).ProcessName.Equals("steam", StringComparison.OrdinalIgnoreCase); }
+        catch { return false; }
     }
 
     public static async Task<bool> EnsureSteamAsync(Action<string> status, CancellationToken ct = default)
     {
         if (SteamReady()) return true;
+        bool started = false;
         if (Process.GetProcessesByName("steam").Length == 0)
         {
+            started = true;
             var exe = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamExe", null) as string;
             if (exe == null) { status("Steam wurde nicht gefunden. LEGO Batman 2 braucht Steam."); return false; }
             try { Process.Start(new ProcessStartInfo(exe, "-silent") { UseShellExecute = true }); }
@@ -53,7 +61,13 @@ public static class GameBridge
         {
             await Task.Delay(500, ct).ContinueWith(_ => { });
             if (ct.IsCancellationRequested) return false;
-            if (SteamReady()) { await Task.Delay(3000); return true; }
+            // Selbst gestartet: mindestens 20 s und bis die Steam-Oberflaeche laeuft, sonst prueft der Kopierschutz zu frueh
+            if (SteamReady() && (!started || (DateTime.Now - start > TimeSpan.FromSeconds(20)
+                                              && Process.GetProcessesByName("steamwebhelper").Length > 0)))
+            {
+                await Task.Delay(3000);
+                return true;
+            }
             if (DateTime.Now - start > TimeSpan.FromSeconds(15)) status("Warte auf Steam – bitte bei Steam anmelden, falls ein Fenster offen ist …");
         }
         status("Steam ist nach 2 Minuten nicht bereit.");

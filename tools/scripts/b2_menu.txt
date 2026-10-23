@@ -1,0 +1,3 @@
+# LEGO Batman 2: nur Pads verbinden, Menue live steuern (Test mit mitgebrachtem Spielstand, LBO_SAVEFIND=1)
+connect 0
+connect 1

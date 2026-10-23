@@ -98,6 +98,14 @@ Kommt das Spiel des Mitspielers nicht in Gang, erscheint nach 45 Sekunden ein
 Hinweis (meist ist dann Steam bei ihm nicht angemeldet).
 Nur Controller oder die Tastatur der App werden uebertragen; die Tastatur
 des Spiels selbst ist im Online-Modus aus.
+Grafik: Online spielen beide mit den Grafikeinstellungen des Einladenden
+(Schatten, Effekte, Qualitaet). Unterschiedliche Einstellungen haben die
+Spiele auseinanderlaufen lassen. Aufloesung, Lautstaerke und Steuerung bleiben
+deine eigenen.
+Zwischensequenzen: Jede Zwischensequenz laesst sich ueberspringen, auch das
+lange Intro. START druecken (Tastatur: Enter), unten rechts erscheint
+"Ueberspringen", dann Y druecken (Tastatur: L). Bei beiden geht es an
+derselben Stelle weiter.
 
 
 Steuerung ohne Controller (Tastatur)

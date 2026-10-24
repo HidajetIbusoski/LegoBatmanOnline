@@ -43,7 +43,8 @@ Auf einem einzelnen PC tritt der Versatz nur selten auf. Deshalb waren die lokal
   - Ohne Fix (`LBO_SCENEBARRIER=0`): Desync bei rel 1785, bit-gleich mit dem früheren Ausreißer.
   - Mit Fix: zweimal synchron.
 - **Offene Welt:** dreimal 23.005 Frames synchron, auch mit künstlichem Versatz.
-- **Weitere Läufe:** Level ohne Schalter synchron; Launcher-Ablauf synchron; Batman 1 identisch (Ergebnisse des Testers).
+- **Level ohne Schalter:** Hier trat der Versatz sogar von selbst auf (Szenenstart Host F6318 / Gast F6319). Die Schranke hat ihn ausgeglichen, der Lauf blieb synchron.
+- **Weitere Läufe:** Launcher-Ablauf synchron, Batman 1 identisch.
 
 ## Offen
 

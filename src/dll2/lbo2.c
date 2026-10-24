@@ -33,6 +33,15 @@
 //   LBO_CFGHASH    Netz: SHA-256 (hex) dieser Bytes; passt er nicht, gilt der eingebaute Standard
 //   LBO_OWNCONFIG  Test: eigene Einstellungen (Aufloesung, Ton, Steuerung) aus dieser Datei statt %APPDATA%
 //   LBO_PCCONFIG   Test: pcconfig.txt roh aus dieser Datei (ohne netz_pcconfig.txt)
+//   LBO_INITBARRIER  Netz: 1 = Schranke beim Level-Init (Leerung 0xb26410, siehe on_scene_init); Standard 0
+//   LBO_SCENEBARRIER Netz: 0 = keine Schranke beim Szenenstart (Figuren nach kurzem Wechsel wieder da); Standard 1
+//   LBO_TESTLOADSHIFT Test (Netz, wo gesetzt): n,Frame = ab Frame n Frames lang keine Lade-Fenster (Laden endet spaeter, wie
+//                  ein langsamerer PC), siehe post_frame_end_inner
+//   LBO_TESTAUDIOSHIFT Test (Netz, wo gesetzt): n,Frame = ab Frame n Frames lang steht die virtuelle Ton-Wiedergabe
+//                  (Zwischenszenen folgen dem Ton und wechseln n Frames spaeter), siehe va_tick
+//   LBO_SYNCCOUNTERS Netz: 0 = Frame-Zaehler/Spielzeit an den Schranken nicht vom Host uebernehmen; Standard 1
+//   LBO_TESTPROGSHIFT Test (Netz, wo gesetzt): n[,Frame] = ab Frame (Standard 7000) n-mal den Logik-Schritt auslassen, damit der
+//                  Gast das naechste Level n Frames spaeter betritt (wie Playtest 23.10. 18:04), siehe logic_step_test
 #define COBJMACROS
 #include <windows.h>
 #include <xmmintrin.h>
@@ -83,6 +92,14 @@ static void window_ms(double ms)
 #define G_DT                (*(volatile float *)0x011CF0DC)   // gemessenes dt dieses Frames
 #define G_DT_OVERRIDE       (*(volatile float *)0x011CF0F8)   // != 0: ersetzt dt
 #define G_FRAMECOUNT        (*(volatile int *)0x011CF0E4)
+// Weitere Zaehler und Uhren des Spiels (Abgleich an den Schranken, siehe sync_capture):
+#define G_FRAMECOUNT_COPY   (*(volatile int *)0x011E0458)     // Kopie von G_FRAMECOUNT (0x5986bd), Leser 0x5e7a8e
+#define G_LOGIC_TICK        (*(volatile int *)0x011CF0EC)     // Logik-Tick im Frame: 0x59a5f0 setzt 0, 0x59a5d8 +1 je Tick
+#define G_LOAD_COUNTDOWN    (*(volatile int *)0x011CF0B8)     // Lade-Schritt-Countdown, im Frame-Ende 0x552bdd -1
+#define G_GAME_TIME         (*(volatile float *)0x011CF104)   // Spielzeit += dt (0x552c04..16), nie zurueckgesetzt
+#define G_GAME_TIME_PREV    (*(volatile float *)0x011CF108)   // Spielzeit des Vorframes
+#define G_LOGIC_TIME        (*(volatile float *)0x011E0460)   // Logik-Zeit += dt je Tick (0x59a479)
+#define G_FC_DEADLINE       (*(volatile int *)0x011A43A0)     // Frame-Stempel (0x908a67 schreibt G_FRAMECOUNT), -1 = keiner
 #define G_RNG_PM_SEED       (*(volatile unsigned *)0x011A1840) // 0x1f3ad27f
 #define G_RNG_LCG16         (*(volatile unsigned *)0x011A1844) // 12345
 #define G_RNG_PM_DEFAULT    (*(volatile unsigned *)0x0102B358) // Park-Miller-Standardzustand (XOR 0x75bd924)
@@ -152,6 +169,8 @@ static struct { DWORD base, off; int deref; } g_probes[32];
 static int g_nprobe;
 static long g_live_pos;
 static volatile LONG g_F;
+// Netz: Lockstep-Frame (NF = g_F - g_lock_base); jede Schranke beginnt eine Epoche mit NF 1
+static long g_lock_base, g_NF;
 static int g_connected[4];
 static LINE *g_lines;
 static int g_nlines, g_caplines;
@@ -376,6 +395,18 @@ static HRESULT STDMETHODCALLTYPE h_createdevice(IDirect3D9 *d3d, UINT a, D3DDEVT
                                                 D3DPRESENT_PARAMETERS *pp, IDirect3DDevice9 **out)
 {
     HRESULT hr;
+    {   // Diagnose Cross-PC: Grafikkarte und Treiber (beide Seiten im Log vergleichbar)
+        D3DADAPTER_IDENTIFIER9 id;
+        D3DCAPS9 caps;
+        if (SUCCEEDED(IDirect3D9_GetAdapterIdentifier(d3d, a, 0, &id)))
+            logf_("Grafikkarte %u: %s, Vendor %04lx Device %04lx SubSys %08lx Rev %lu, Treiber %s %u.%u.%u.%u", a, id.Description,
+                  id.VendorId, id.DeviceId, id.SubSysId, id.Revision, id.Driver, HIWORD(id.DriverVersion.HighPart),
+                  LOWORD(id.DriverVersion.HighPart), HIWORD(id.DriverVersion.LowPart), LOWORD(id.DriverVersion.LowPart));
+        if (SUCCEEDED(IDirect3D9_GetDeviceCaps(d3d, a, t, &caps)))
+            logf_("D3D-Faehigkeiten: PS %lx, VS %lx, Texturen %lu, MaxTex %lux%lu, Anisotropie %lu, RT %lu, Caps2 %08lx",
+                  caps.PixelShaderVersion & 0xFFFF, caps.VertexShaderVersion & 0xFFFF, caps.MaxSimultaneousTextures,
+                  caps.MaxTextureWidth, caps.MaxTextureHeight, caps.MaxAnisotropy, caps.NumSimultaneousRTs, caps.Caps2);
+    }
     force_windowed(pp);
     hr = real_createdevice(d3d, a, t, w, f, pp, out);
     logf_("CreateDevice %08lx, %ux%u, Fenster %d", hr, pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0,
@@ -517,6 +548,9 @@ static void poll_live(void)
 // Netzmodus (LBO_NET=host|join, net.c): Pads 0 und 1 kommen aus dem Lockstep-Austausch des Frames.
 static int g_net;
 static PAD g_net_pad[2];
+static unsigned char g_net_pad_conn[2];
+static int g_test_progshift;            // LBO_TESTPROGSHIFT=n[,Frame] (siehe logic_step_test)
+static long g_progshift_from = 7000;
 
 static DWORD WINAPI hook_getstate(DWORD idx, XSTATE *st)
 {
@@ -524,7 +558,7 @@ static DWORD WINAPI hook_getstate(DWORD idx, XSTATE *st)
     if (g_net) {
         if (idx > 1) return ERROR_DEVICE_NOT_CONNECTED;
         st->Gamepad = g_net_pad[idx];
-        st->dwPacketNumber = (DWORD)g_F;
+        st->dwPacketNumber = (DWORD)g_NF;   // Lockstep-Frame: auf beiden Seiten gleich (g_F ist je PC versetzt)
         return ERROR_SUCCESS;
     }
     if (g_mode == MODE_SCRIPT) {
@@ -598,11 +632,14 @@ static void redirected(const char *path, char *out)
 static int is_save_dir(const char *path);
 static char g_pcconfig[MAX_PATH];   // LBO_PCCONFIG: pcconfig.txt aus dieser Datei lesen (Netz: Einstellungen des Hosts)
 
-static int is_pcconfig(const char *path)
+// path endet mit dem Dateinamen name (ohne Gross-/Kleinschreibung, ganzer Name)
+static int is_named(const char *path, const char *name)
 {
-    size_t n = path ? strlen(path) : 0;
-    return n >= 12 && !_stricmp(path + n - 12, "pcconfig.txt") && (n == 12 || path[n - 13] == '\\' || path[n - 13] == '/');
+    size_t n = path ? strlen(path) : 0, k = strlen(name);
+    return n >= k && !_stricmp(path + n - k, name) && (n == k || path[n - k - 1] == '\\' || path[n - k - 1] == '/');
 }
+
+static int is_pcconfig(const char *path) { return is_named(path, "pcconfig.txt"); }
 
 // Netz: Gleiche Grafikeinstellungen auf beiden Seiten. Test CA (23.10.): Gast mit niedrigen Shader-/Schatten-/
 // Effekt-Stufen, ab Frame 912 nach Levelstart liefen Figuren anders. Beide bauen deshalb netz_pcconfig.txt aus
@@ -758,6 +795,25 @@ static void cfg_load_error(int attempt, DWORD err, const wchar_t *path)
     if (attempt == 1 || attempt % 5 == 0) logf_("Netz-Einstellungen: %s nicht lesbar (Versuch %d, Fehler %lu)", w2u(path, p, sizeof p), attempt, err);
 }
 
+// Eigene Einstellungen ueber Sitzungen hinweg (siehe net_pcconfig): %LOCALAPPDATA%\LegoBatmanOnline\eigene_pcconfig.txt
+static int own_cfg_path_w(wchar_t *out, DWORD n)
+{
+    DWORD k = GetEnvironmentVariableW(L"LOCALAPPDATA", out, n);
+    if (!k || k + 40 >= n) return 0;
+    wcscat_s(out, n, L"\\LegoBatmanOnline\\eigene_pcconfig.txt");
+    return 1;
+}
+
+static int own_cfg_path_a(char *out, DWORD n)
+{
+    DWORD k = GetEnvironmentVariableA("LOCALAPPDATA", out, n);
+    if (!k || k + 40 >= n) return 0;
+    strcat_s(out, n, "\\LegoBatmanOnline");
+    CreateDirectoryA(out, NULL);
+    strcat_s(out, n, "\\eigene_pcconfig.txt");
+    return 1;
+}
+
 static void net_pcconfig(void)
 {
     static char host[B2CFG_MAX], own[B2CFG_MAX];
@@ -784,13 +840,28 @@ static void net_pcconfig(void)
               w2u(hostpath, p1, sizeof p1), why, err);
     }
     // Eigene Einstellungen (Aufloesung, Ton, Steuerung); LBO_OWNCONFIG: Test
+    // Playtest 23.10. 18:04 ("eigene pcconfig.txt nicht lesbar (Fehler 2)"): Die Datei gab es fuer das Spiel wirklich
+    // nicht. Sichtbar war sie nur in der Dateiansicht der Claude-App (MSIX-Paket: Schreibzugriffe nach %APPDATA% landen
+    // dort in ...\Packages\Claude_*\LocalCache\Roaming und sind nur fuer Prozesse im Paket sichtbar). Ausserhalb hat das
+    // Spiel sie nie anlegen koennen, weil die Mod jeden Schreibzugriff auf pcconfig.txt umleitet. Deshalb merkt sich die
+    // Mod im Netz die eigenen Einstellungen in %LOCALAPPDATA%\LegoBatmanOnline\eigene_pcconfig.txt (own_cfg_path,
+    // hook_createfile) und nimmt diese Datei, wenn %APPDATA% keine pcconfig.txt hat.
     if (!GetEnvironmentVariableW(L"LBO_OWNCONFIG", ownpath, MAX_PATH)) {
         if (GetEnvironmentVariableW(L"APPDATA", ownpath, MAX_PATH - 80))
             wcscat_s(ownpath, MAX_PATH, L"\\Warner Bros. Interactive Entertainment\\LEGO Batman 2\\pcconfig.txt");
         else ownpath[0] = 0;
-    }
-    have_own = ownpath[0] && b2cfg_load(ownpath, own, sizeof own, &olen, &err, 5, cfg_load_error);
-    if (!have_own) logf_("Netz-Einstellungen: eigene pcconfig.txt nicht lesbar (Fehler %lu), Aufloesung/Ton/Steuerung vom Standard", err);
+        have_own = ownpath[0] && b2cfg_load(ownpath, own, sizeof own, &olen, &err, 5, NULL);
+        if (!have_own) {
+            wchar_t keep[MAX_PATH];
+            logf_("Netz-Einstellungen: %s %s (Fehler %lu)", w2u(ownpath, p2, sizeof p2),
+                  err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? "nicht vorhanden" : "nicht lesbar", err);
+            if (own_cfg_path_w(keep, MAX_PATH) && b2cfg_load(keep, own, sizeof own, &olen, &err, 3, NULL)) {
+                wcscpy_s(ownpath, MAX_PATH, keep);
+                have_own = 1;
+            }
+        }
+    } else have_own = b2cfg_load(ownpath, own, sizeof own, &olen, &err, 5, cfg_load_error);
+    if (!have_own) logf_("Netz-Einstellungen: keine eigene pcconfig.txt (Fehler %lu), Aufloesung/Ton/Steuerung vom Standard", err);
     snprintf(out, sizeof out, "%s\\netz_pcconfig.txt", g_dir);
     f = fopen(out, "wb");
     if (!f) {
@@ -814,6 +885,26 @@ static HANDLE WINAPI hook_createfile(LPCSTR path, DWORD access, DWORD share, LPS
     if (g_pcconfig[0] && is_pcconfig(path) && !(access & (GENERIC_WRITE | GENERIC_ALL))) {
         logf_("pcconfig.txt gelesen aus %s", g_pcconfig);
         return real_createfile(g_pcconfig, access, share, sa, disp, flags, tmpl);
+    }
+    // Netz: Steuerungs-Zuordnung (Mappings.dat, je Benutzer, nicht abgeglichen) nicht lesen. Das Spiel erzeugt dann wie
+    // ohne Datei seine eingebaute Zuordnung und schreibt sie bei F2 (Playtest 18:04: Host ohne Datei, "Datei: ...
+    // Mappings.dat" schlug fehl, danach "Schreibzugriff umgeleitet ... Mappings.dat"). Beide Seiten haben so dieselbe;
+    // ihr Hash geht in den Vergleich bei F30 (mappings_hash).
+    if (g_net && is_named(path, "mappings.dat") && !(access & (GENERIC_WRITE | GENERIC_ALL))) {
+        static int logged;
+        if (!logged++) logf_("Netz: Mappings.dat nicht gelesen (%s), Spiel nimmt die eingebaute Steuerungs-Zuordnung", path);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    // Netz: eigene Einstellungen (Aufloesung, Ton, Steuerung) dauerhaft merken statt im Sitzungsordner (net_pcconfig).
+    // Nicht bei LBO_MULTI (zwei Instanzen auf einem PC wuerden dieselbe Datei schreiben).
+    if (g_net && !g_multi && !g_allow_save && is_pcconfig(path) && (access & (GENERIC_WRITE | GENERIC_ALL))) {
+        char keep[MAX_PATH];
+        if (own_cfg_path_a(keep, MAX_PATH)) {
+            static int logged;
+            if (!logged++) logf_("Eigene Einstellungen: %s -> %s", path, keep);
+            return real_createfile(keep, access, share, sa, disp, flags, tmpl);
+        }
     }
     // Netzmodus: Auch Lesen der Spielstaende umleiten, damit beide Spiele dieselben (leeren) Plaetze sehen
     if (((access & (GENERIC_WRITE | GENERIC_ALL)) && is_protected(path)) || (g_net && is_save_dir(path))) {
@@ -939,6 +1030,9 @@ static int g_vclock;
 static volatile DWORD g_main_tid;
 static LONGLONG g_vbase, g_vfreq;
 static long g_vframe = -1, g_vcalls;
+// Netz: Versatz der Uhr gegen g_F. g_F ist je PC verschieden weit (Ladezeiten vor der ersten Schranke); an jeder
+// Schranke stellt der Gast g_voff so, dass seine Spielzeit (vclock_frames) der des Hosts entspricht (vclock_rebase).
+static long g_voff;
 
 static BOOL WINAPI hook_qpc(LARGE_INTEGER *out)
 {
@@ -956,14 +1050,22 @@ static BOOL WINAPI hook_qpc(LARGE_INTEGER *out)
         g_vfreq = f.QuadPart;
         fpf = g_vfreq / 60;
         if (game0 && n.QuadPart > game0) {
-            LONGLONG d = ((n.QuadPart - game0) / fpf - g_F) / 3600 * 3600 + 3600;
+            LONGLONG d = ((n.QuadPart - game0) / fpf - (g_F + g_voff)) / 3600 * 3600 + 3600;
             g_vbase = game0 + d * fpf;
-            logf_("Virtuelle Uhr: Spielzeit = (Frame + %I64d) / 60 s", d);
-        } else g_vbase = n.QuadPart - (LONGLONG)g_F * fpf;
+            logf_("Virtuelle Uhr: Spielzeit = (Frame + %I64d) / 60 s, QPF %I64d", d, g_vfreq);
+        } else g_vbase = n.QuadPart - (LONGLONG)(g_F + g_voff) * fpf;
     }
     if (g_vframe != g_F) { g_vframe = g_F; g_vcalls = 0; }
-    out->QuadPart = g_vbase + (LONGLONG)g_F * (g_vfreq / 60) + ++g_vcalls;
+    out->QuadPart = g_vbase + (LONGLONG)(g_F + g_voff) * (g_vfreq / 60) + ++g_vcalls;
     return TRUE;
+}
+
+// Spielzeit der virtuellen Uhr in Frames (Zeit seit dem Startwert 0x11c2d60 des Spiel-Timers), -1 = Uhr noch nicht aktiv
+static LONGLONG vclock_frames(void)
+{
+    LONGLONG game0 = *(volatile LONGLONG *)0x011C2D60, fpf = g_vfreq / 60;
+    if (!g_vclock || !g_vbase || fpf <= 0) return -1;
+    return (g_vbase - game0) / fpf + g_F + g_voff;
 }
 
 static void patch_iat(DWORD slot, void *fn, void **orig)
@@ -1552,11 +1654,22 @@ static void av_hitch_resume(void)
     }
 }
 
+static int g_test_audioshift;           // LBO_TESTAUDIOSHIFT=n,Frame (siehe va_tick)
+static long g_audioshift_from = 5040;
+
 static void va_tick(void)
 {
     static VA_EVENT ev[1024];
     int nev = 0, i, k;
     av_hitch_resume();
+    // LBO_TESTAUDIOSHIFT=n,Frame (Test, auf der Seite, wo gesetzt): n Frames lang steht die virtuelle Wiedergabe. Test
+    // TF3C 24.10.: Die Front-End-Stimmen entstanden beim Host 1 Frame spaeter (F5035 statt F5034, Ton-Streamer in
+    // Echtzeit); die Zwischenszenen folgen der Ton-Position und wechselten danach 1 Frame spaeter (6317/7599 statt
+    // 6316/7598). Der Schalter erzeugt diesen Versatz gezielt.
+    if (g_test_audioshift > 0 && g_F >= g_audioshift_from && g_F < g_audioshift_from + g_test_audioshift) {
+        logf_("Test: Ton-Wiedergabe angehalten (LBO_TESTAUDIOSHIFT, %ld von %d)", g_F - g_audioshift_from + 1, g_test_audioshift);
+        return;
+    }
     va_wait_first_buffers();
     EnterCriticalSection(&g_va_cs);
     for (i = 0; i < 64; i++) {
@@ -1703,15 +1816,178 @@ static void reset_rng(void)
 // Levelstart (erster Frame mit mehr als 2 Figuren). Der Host schickt seine Zustaende, der Gast uebernimmt sie
 // im selben Frame an derselben Stelle des Frame-Endes.
 #define SYNC_EARLY_FRAME 30
-typedef struct { unsigned rng[7]; int poll_countdown; short poll_device; char poll_restart, pad; } SYNCSTATE;
+#define SYNC_NCHAR 16
+typedef struct {
+    unsigned rng[7]; int poll_countdown; short poll_device; char poll_restart, pad;
+    // Zaehler und Uhren des Spiels (an den Schranken vom Host uebernommen, sync_counters)
+    int fc, fc_copy, logic_tick, load_countdown;
+    float game_time, game_time_prev, logic_time;
+    int bg_waitframe, fc_deadline, bg_busy;
+    LONGLONG vclock, qpf;   // virtuelle Uhr in Frames (vclock_frames, -1 = aus), QueryPerformanceFrequency
+    // Diagnose (beide Seiten tauschen sie an jeder Schranke aus, state_compare)
+    int since_init_frames, since_init_ticks, scene_inits, nchars;
+    unsigned char_state, char_pos;
+    unsigned char_hash[SYNC_NCHAR];   // je belegtem Figurenplatz (die ersten 16)
+} SYNCSTATE;
+
+// Seit dem letzten Level-Init (on_scene_init): Frames und Logik-Ticks (Summe von G_LOGIC_TICK je Frame-Ende)
+static long g_since_init_frames = -1, g_since_init_ticks;
+static volatile LONG g_scene_inits;
+
+// Wert sieht nach einem Heap-/DLL-Zeiger aus (je PC verschieden, nicht hashen). Bilder des Spiels (0x400000-0x15fffff,
+// Vtables, Tabellen) sind auf beiden Seiten gleich und bleiben drin, ebenso Gleitkommawerte mit Betrag 4.7e-10..2.1e9
+// (0x30000000-0x4effffff) und negative Werte. Grob, aber nur Diagnose.
+static int ptr_like(unsigned v)
+{
+    return (v >= 0x01600000u && v < 0x30000000u) || (v >= 0x4F000000u && v < 0x80000000u);
+}
+
+// Breiter Figuren-Hash: ganze Figurenstruktur (0x17f0 Byte) je belegtem Platz, ohne zeigerartige Werte
+static void char_state(SYNCSTATE *s)
+{
+    unsigned char *base;
+    int i, n, k, slot = 0;
+    s->char_state = 2166136261u;
+    __try {
+        base = G_CHAR_BASE;
+        n = G_CHAR_COUNT;
+        if (base && n > 0 && n <= 0x40)
+            for (i = 0; i < n; i++) {
+                const unsigned *c = (const unsigned *)(base + i * CHAR_STRIDE);
+                unsigned h = 2166136261u;
+                if (!c[CHAR_USED / 4]) continue;
+                for (k = 0; k < CHAR_STRIDE / 4; k++) {
+                    unsigned v = ptr_like(c[k]) ? 0xFFFFFFFFu : c[k];
+                    h = (h ^ (v & 0xFFFF)) * 16777619u;
+                    h = (h ^ (v >> 16)) * 16777619u;
+                }
+                if (slot < SYNC_NCHAR) s->char_hash[slot] = h;
+                slot++;
+                s->char_state = (s->char_state ^ h) * 16777619u;
+            }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    s->nchars = slot;
+}
+
+static int bg_busy(void)
+{
+    int busy = 0;
+    __try {
+        unsigned char *q = G_BGPROC;
+        busy = (q && *(volatile LONG *)(q + BGPROC_PENDING) > 0) || G_BGPROC_CURRENT != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return busy;
+}
+
+typedef struct { unsigned hash; int n; float p1[3], p2[3]; } CHARSNAP;
+static void char_snapshot(CHARSNAP *cs);
 
 static void sync_capture(SYNCSTATE *s)
 {
     unsigned *crt = crt_rand_ptr();
+    CHARSNAP k;
+    LARGE_INTEGER f;
     memset(s, 0, sizeof *s);
     s->rng[0] = G_RNG_PM_SEED; s->rng[1] = G_RNG_LCG16; s->rng[2] = G_RNG_PM_DEFAULT;
     s->rng[3] = G_RNG_A; s->rng[4] = G_RNG_B; s->rng[5] = G_RNG_C; s->rng[6] = crt ? *crt : 0;
     s->poll_countdown = G_POLL_COUNTDOWN; s->poll_device = G_POLL_DEVICE; s->poll_restart = G_POLL_RESTART;
+    s->fc = G_FRAMECOUNT; s->fc_copy = G_FRAMECOUNT_COPY; s->logic_tick = G_LOGIC_TICK; s->load_countdown = G_LOAD_COUNTDOWN;
+    s->game_time = G_GAME_TIME; s->game_time_prev = G_GAME_TIME_PREV; s->logic_time = G_LOGIC_TIME;
+    __try { s->bg_waitframe = G_BGPROC ? *(volatile int *)(G_BGPROC + BGPROC_WAITFRAME) : 0; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    s->fc_deadline = G_FC_DEADLINE;
+    s->bg_busy = bg_busy();
+    s->vclock = vclock_frames();
+    QueryPerformanceFrequency(&f);
+    s->qpf = f.QuadPart;
+    s->since_init_frames = g_since_init_frames;
+    s->since_init_ticks = g_since_init_ticks;
+    s->scene_inits = g_scene_inits;
+    char_state(s);
+    char_snapshot(&k);
+    s->char_pos = k.hash ^ ((unsigned)k.n * 0x9E3779B1u);
+}
+
+// Gast: Versatz von G_FRAMECOUNT, der noch uebernommen werden muss (NuBgProc war an der Schranke beschaeftigt)
+static int g_fc_pending;
+static int g_sync_counters = 1;   // LBO_SYNCCOUNTERS
+// Standard aus: Das Leeren des Figurenspeichers, an dem sich die Schranke ausrichtet, liegt je nach Ladezeit bis zu
+// 2 Frames versetzt, der Levelanker aber nicht (Test TF2O, 24.10.: Init Host F14099 / Gast F14101, Anker beide F14495).
+// Die Init-Schranke hat den Anker dadurch selbst versetzt. Zaehler, Uhr und Zustandsvergleich am Anker bleiben aktiv.
+static int g_init_barrier = 0;    // LBO_INITBARRIER (Schranke beim Level-Init, siehe on_frame_end)
+static int g_scene_barrier = 1;   // LBO_SCENEBARRIER (Schranke beim Szenenstart, siehe on_frame_end)
+#define SCENE_MAXZERO 30          // hoechstens so viele Frames ohne Figuren davor: Szenenwechsel ohne Ladephase
+
+// G_FRAMECOUNT um d verschieben. Absolute Fristen, die mit ihm verglichen werden, wandern mit: die Wartegrenze des
+// NuBgProc-Workers (0x552c3c: cmp [q+0x804c],[0x11cf0e4]) und der Stempel 0x11a43a0 (~20 Vergleiche mit dem Zaehler).
+static void fc_shift(int d)
+{
+    __try {
+        unsigned char *q = G_BGPROC;
+        if (q && *(volatile int *)(q + BGPROC_WAITFRAME)) *(volatile int *)(q + BGPROC_WAITFRAME) += d;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (G_FC_DEADLINE > 0) G_FC_DEADLINE += d;
+    G_FRAMECOUNT += d;
+    G_FRAMECOUNT_COPY += d;
+}
+
+// Gast, im Frame-Ende an der Schranke: Zaehler und Uhren des Hosts uebernehmen (Playtest 23.10. 18:04: Host betrat das
+// Level 1 Frame frueher, G_FRAMECOUNT und Spielzeit liefen danach um einen Frame versetzt). Der Frame-Zaehler nur, wenn
+// NuBgProc nichts zu tun hat (ein Auftrag koennte sich gerade eine Frist aus ihm berechnen), sonst spaeter (fc_pending).
+static void sync_counters(const SYNCSTATE *s, const SYNCSTATE *mine)
+{
+    int d = s->fc - mine->fc;
+    LONGLONG dv = s->vclock >= 0 && mine->vclock >= 0 ? s->vclock - mine->vclock : 0;
+    if (d) {
+        if (bg_busy()) g_fc_pending = d;
+        else { g_fc_pending = 0; fc_shift(d); }
+    }
+    G_LOGIC_TICK = s->logic_tick;
+    G_LOAD_COUNTDOWN = s->load_countdown;
+    G_GAME_TIME = s->game_time;
+    G_GAME_TIME_PREV = s->game_time_prev;
+    G_LOGIC_TIME = s->logic_time;
+    // Virtuelle Uhr: Spielzeit aus Lockstep-Frame + Zeitbasis des Hosts statt aus dem eigenen absoluten Frame
+    if (dv) g_voff += (long)dv;
+    if (d || dv || s->load_countdown != mine->load_countdown || s->game_time != mine->game_time || s->logic_time != mine->logic_time)
+        logf_("Netz: Zaehler vom Host uebernommen: Frame-Zaehler %d -> %d (%+d%s), Lade-Countdown %d -> %d, Spielzeit %.5f -> %.5f, "
+              "Logik-Zeit %.5f -> %.5f, Uhr %+I64d Frames, NuBgProc-Frist %d, Stempel %d",
+              mine->fc, s->fc, d, g_fc_pending ? ", spaeter: NuBgProc beschaeftigt" : "", mine->load_countdown, s->load_countdown,
+              mine->game_time, s->game_time, mine->logic_time, s->logic_time, dv, mine->bg_waitframe, mine->fc_deadline);
+    if (s->qpf != mine->qpf) logf_("Netz: QueryPerformanceFrequency verschieden (lokal %I64d, Host %I64d)", mine->qpf, s->qpf);
+}
+
+// Beide Seiten: eigenen Zustand an der Schranke mit dem des Partners vergleichen. loud: Levelanker und nach dem Laden
+// (dort muss alles gleich sein); beim Level-Init sind Zaehler-Unterschiede erwartet (werden uebernommen).
+static void state_compare(const char *what, const SYNCSTATE *mine, const SYNCSTATE *peer, int loud)
+{
+    char d[700];
+    int len = 0, i;
+#define SC_ADD(...) do { if (len < (int)sizeof d - 1) len += _snprintf(d + len, sizeof d - 1 - len, __VA_ARGS__); } while (0)
+    d[0] = 0;
+    if (mine->since_init_frames != peer->since_init_frames)
+        SC_ADD(" Frames seit Level-Init %d/%d,", mine->since_init_frames, peer->since_init_frames);
+    if (mine->since_init_ticks != peer->since_init_ticks)
+        SC_ADD(" Logik-Ticks seit Level-Init %d/%d,", mine->since_init_ticks, peer->since_init_ticks);
+    if (mine->fc != peer->fc) SC_ADD(" Frame-Zaehler %d/%d,", mine->fc, peer->fc);
+    if (mine->game_time != peer->game_time) SC_ADD(" Spielzeit %.5f/%.5f,", mine->game_time, peer->game_time);
+    if (mine->logic_time != peer->logic_time) SC_ADD(" Logik-Zeit %.5f/%.5f,", mine->logic_time, peer->logic_time);
+    if (mine->vclock != peer->vclock) SC_ADD(" Uhr %I64d/%I64d,", mine->vclock, peer->vclock);
+    if (mine->load_countdown != peer->load_countdown) SC_ADD(" Lade-Countdown %d/%d,", mine->load_countdown, peer->load_countdown);
+    for (i = 0; i < 7; i++) if (mine->rng[i] != peer->rng[i]) SC_ADD(" rng%d %08x/%08x,", i, mine->rng[i], peer->rng[i]);
+    if (mine->nchars != peer->nchars) SC_ADD(" Figuren %d/%d,", mine->nchars, peer->nchars);
+    if (mine->char_pos != peer->char_pos) SC_ADD(" Positions-Hash %08x/%08x,", mine->char_pos, peer->char_pos);
+    if (mine->char_state != peer->char_state) {
+        SC_ADD(" Figuren-Zustand %08x/%08x (Plaetze:", mine->char_state, peer->char_state);
+        for (i = 0; i < SYNC_NCHAR && i < mine->nchars && i < peer->nchars; i++)
+            if (mine->char_hash[i] != peer->char_hash[i]) SC_ADD(" %d", i);
+        SC_ADD("),");
+    }
+#undef SC_ADD
+    if (len && d[len - 1] == ',') d[--len] = 0;
+    if (!len) logf_("Netz: Zustand an der Schranke %s gleich (Frames/Ticks seit Level-Init %d/%d, Frame-Zaehler %d, Figuren %d, Zustand %08x)",
+                    what, mine->since_init_frames, mine->since_init_ticks, mine->fc, mine->nchars, mine->char_state);
+    else if (loud) logf_("ANKER-ZUSTAND VERSCHIEDEN (%s, lokal/Partner):%s", what, d);
+    else logf_("Netz: Zustand vor der Schranke %s verschieden (lokal/Partner, Gast uebernimmt Host):%s", what, d);
 }
 
 static void sync_apply(const SYNCSTATE *s)
@@ -1744,19 +2020,39 @@ static void net_sync_point(long F, const char *what)
 // Selbstheilung: Zaehler der Reparaturen in diesem Vorfall, Lockstep-Frame der letzten, zuletzt gesehene Abweichung
 static int g_repairs, g_last_repair, g_repair_done, g_seen_desync;
 static long g_test_desync;   // LBO_TESTDESYNC=<Lockstep-Frame> (Test): dort den LCG16 verstellen wie im Playtest
+static int g_test_fcshift;   // LBO_TESTFCSHIFT=n (Test): Frame-Zaehler des Spiels beim Gast vor dem Levelanker verschieben
 static long g_test_meet;     // LBO_TESTMEET=<Lockstep-Frame> (Test): dort eine Schranke wie nach dem Laden
 
-// Schranke mit Zustand vom Host (Levelstart und nach jedem Ladevorgang). Danach zaehlt der Lockstep ab F neu.
-static void net_meet(long F, const char *what)
+// Eingabe-Hash seit der letzten Pruefsumme (beide Lockstep-Pads, wie das Spiel sie sieht), siehe on_frame_end
+static unsigned g_pad_acc = 2166136261u;
+
+// Schranke mit Zustand vom Host (Level-Init, Levelstart und nach jedem Ladevorgang). Danach zaehlt der Lockstep ab F
+// neu (Lockstep-Frame 1 = dieser Frame). MEET_INIT setzt keinen Levelanker (Pruefsummen und "A"-Skriptzeilen erst ab
+// dem Levelstart).
+// MEET_SCENE ist optional (net_barrier_ex): Sieht nur eine Seite den Szenenstart, wird er uebersprungen statt 120 s
+// zu warten. Alle anderen sind feste Schranken wie bisher.
+enum { MEET_INIT, MEET_ANCHOR, MEET_LOADED, MEET_TEST, MEET_SCENE };
+static void net_meet(long F, const char *what, int kind)
 {
-    SYNCSTATE s, mine;
+    SYNCSTATE s, mine, peer;
     int ok, i;
     if (net_partner_lost()) return;
     sync_capture(&mine);
     s = mine;
     g_in_wait = 1;
-    ok = net_barrier((int)F, &s, sizeof s, 120000);
+    ok = net_barrier_ex((int)F, kind == MEET_SCENE ? NET_BAR_OPTIONAL | ((unsigned)MEET_SCENE << 24) : (unsigned)kind << 24,
+                        &s, sizeof s, 120000);
     g_in_wait = 0;
+    if (ok < 0) {
+        logf_("Netz: Schranke %s bei Frame %ld uebersprungen (nur auf einer Seite)", what, F);
+        return;
+    }
+    if (ok) {
+        memset(&peer, 0, sizeof peer);
+        if (net_barrier_peer(&peer, sizeof peer) == (int)sizeof peer)
+            state_compare(what, &mine, &peer, kind != MEET_INIT && kind != MEET_SCENE);
+        else logf_("Netz: Partner schickte an der Schranke keinen Zustand (alte Version?)");
+    }
     if (ok && net_role() == 1) {
         char diff[200] = "";
         int len = 0;
@@ -1764,11 +2060,14 @@ static void net_meet(long F, const char *what)
             if (s.rng[i] != mine.rng[i]) len += snprintf(diff + len, sizeof diff - len, " rng%d %08x->%08x", i, mine.rng[i], s.rng[i]);
         if (len) logf_("Netz: Zustand wich vor der Schranke ab:%s", diff);
         sync_apply(&s);
+        if (g_sync_counters) sync_counters(&s, &mine);
     }
     lcg_reset_streams();
-    g_anchor = F;
+    if (kind != MEET_INIT && kind != MEET_SCENE) g_anchor = F;   // Szenenstart vor dem Levelstart ist kein Anker
+    g_lock_base = F - 1;
     net_set_frame_offset(F - 1);
     g_repairs = g_last_repair = g_repair_done = g_seen_desync = 0;
+    g_pad_acc = 2166136261u;
     logf_("Netz: Schranke %s bei Frame %ld", what, F);
 }
 
@@ -1865,20 +2164,62 @@ static int g_cfg_pending;      // 1 = Werte des Partners kamen bei F30 nicht rec
 static int g_net_gave_up;      // Hinweis gezeigt (nicht synchron / Einstellungen verschieden): keine Reparaturen mehr
 static unsigned g_cfg_mine[4];
 
+// Hash der Steuerungs-Zuordnung, die das Spiel bei F2 geschrieben hat (Netz: umgeleitet nach LBO_DIR, sonst die echte
+// Datei); 0 = nicht gefunden
+static unsigned mappings_hash(DWORD *size)
+{
+    char path[MAX_PATH];
+    unsigned h = 2166136261u;
+    unsigned char buf[4096];
+    size_t n;
+    FILE *f;
+    *size = 0;
+    snprintf(path, sizeof path, "%s\\umgeleitet_Mappings.dat", g_dir);
+    f = fopen(path, "rb");
+    if (!f) {
+        char app[MAX_PATH];
+        if (!GetEnvironmentVariableA("APPDATA", app, sizeof app)) return 0;
+        snprintf(path, sizeof path, "%s\\Warner Bros. Interactive Entertainment\\LEGO Batman 2\\Mappings.dat", app);
+        if (!(f = fopen(path, "rb"))) return 0;
+    }
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+        size_t i;
+        for (i = 0; i < n; i++) h = (h ^ buf[i]) * 16777619u;
+        *size += (DWORD)n;
+    }
+    fclose(f);
+    return h;
+}
+
 static unsigned cfg_runtime_hash(unsigned *hz)
 {
-    unsigned h = 2166136261u;
-    int v[5], i;
+    unsigned h = 2166136261u, mh;
+    DWORD msize;
+    int v[10], i;
     __try {
         v[0] = *(volatile int *)0x01154304;
         v[1] = *(volatile int *)0x01154314;
         v[2] = *(volatile int *)0x01154318;
         v[3] = *(volatile int *)0x01154320;
         v[4] = *(volatile unsigned char *)0x01154325;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { for (i = 0; i < 5; i++) v[i] = -1; }
+        // Grafikkarten-Klasse und was die Hardware-Abwertung 0x641821 ([0x1365544] < 6) daraus setzt; Logik-Leser
+        // ausserhalb des Zeichnens: 0x53b1ba, 0x53e9c0, 0x547369, 0x55f856 (Review 23.10.)
+        v[5] = *(volatile int *)0x01365544;
+        v[6] = *(volatile unsigned char *)0x0102B988;
+        v[7] = *(volatile unsigned short *)0x0115434D;
+        v[8] = *(volatile unsigned char *)0x01154350;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { for (i = 0; i < 9; i++) v[i] = -1; }
+    mh = mappings_hash(&msize);
+    v[9] = (int)mh;
     *hz = (unsigned)v[0];
-    logf_("Einstellungen zur Laufzeit: %d Hz, Shader %d, Schatten %d, Texturen %d, IgnoreVendorPresets %d", v[0], v[1], v[2], v[3], v[4]);
-    for (i = 0; i < 5; i++) h = (h ^ (unsigned)v[i]) * 16777619u;
+    logf_("Einstellungen zur Laufzeit: %d Hz, Shader %d, Schatten %d, Texturen %d, IgnoreVendorPresets %d, GPU-Klasse %d, "
+          "102b988 %d, 115434d %04x, 1154350 %d, Steuerung (Mappings.dat) %08x/%lu Byte", v[0], v[1], v[2], v[3], v[4], v[5], v[6],
+          v[7], v[8], mh, msize);
+    // GPU-Klasse und die daraus abgeleiteten Werte (v[5..8]) nur protokollieren, nicht vergleichen: Verschiedene
+    // Grafikkarten wuerden sonst jede Sitzung mit Hinweis 5 blockieren, und neu einladen hilft dabei nicht.
+    // Ob sie die Logik beeinflussen, zeigen die Logzeilen beider Seiten nach einem Desync.
+    for (i = 0; i < 10; i++)
+        if (i < 5 || i > 8) h = (h ^ (unsigned)v[i]) * 16777619u;
     return h;
 }
 
@@ -1956,6 +2297,12 @@ static void net_exchange(long F)
         g_net_pad[i].bLeftTrigger = both[i].lt; g_net_pad[i].bRightTrigger = both[i].rt;
         g_net_pad[i].sThumbLX = both[i].lx; g_net_pad[i].sThumbLY = both[i].ly;
         g_net_pad[i].sThumbRX = both[i].rx; g_net_pad[i].sThumbRY = both[i].ry;
+        g_net_pad_conn[i] = both[i].connected;
+    }
+    {   // Eingabe-Hash fuer die Pruefsumme (was das Spiel im naechsten Frame liest)
+        const unsigned char *b = (const unsigned char *)g_net_pad;
+        size_t k;
+        for (k = 0; k < sizeof g_net_pad; k++) g_pad_acc = (g_pad_acc ^ b[k]) * 16777619u;
     }
     if (F % 3000 == 0) {
         long stalls, desyncs;
@@ -2033,8 +2380,7 @@ static void notify_devchange(void)
     logf_("Pad-Aenderung gemeldet (WM_DEVICECHANGE)");
 }
 
-// Pruefsumme ueber alle belegten Figurenplaetze (Positionen) und die Positionen von Spieler 1 und 2
-typedef struct { unsigned hash; int n; float p1[3], p2[3]; } CHARSNAP;
+// Pruefsumme ueber alle belegten Figurenplaetze (Positionen) und die Positionen von Spieler 1 und 2 (CHARSNAP oben)
 
 static void char_snapshot(CHARSNAP *cs)
 {
@@ -2477,6 +2823,8 @@ static void __cdecl post_frame_end(void)
 // die Eintraege zwei Durchlaeufe lang nicht aendern und keiner mehr laedt. Waehrend Logik und Zeichnen
 // steht sie. Laeuft die Schleife im Hauptthread (erstes Laden), wird nicht gebremst.
 static int g_loopgate;
+static int g_test_loadshift;            // LBO_TESTLOADSHIFT=n,Frame (siehe post_frame_end_inner)
+static long g_loadshift_from = 5040;
 static HANDLE g_loop_sem;
 static volatile LONG g_loop_at_gate, g_loop_arrivals;
 static long g_loop_iters, g_loop_timeouts, g_loop_windows;
@@ -2695,6 +3043,12 @@ static void __cdecl post_frame_end_inner(void)
     if (g_loopgate) {
         int k;
         LONGLONG t = qpc_now();
+        // LBO_TESTLOADSHIFT=n,Frame (Test, auf der Seite, wo gesetzt): n Frames lang kein Lade-Fenster. Die Streaming-Schleife bleibt an
+        // ihrer Freigabe stehen, das Laden endet n Frames spaeter, wie bei einem langsameren PC.
+        if (g_test_loadshift > 0 && g_net && g_F >= g_loadshift_from && g_F < g_loadshift_from + g_test_loadshift) {
+            logf_("Test: Lade-Fenster ausgelassen (LBO_TESTLOADSHIFT, %ld von %d)", g_F - g_loadshift_from + 1, g_test_loadshift);
+            return;
+        }
         loop_window();
         g_wt[4] += qpc_now() - t;
         // Ein fertig gewordener Auftrag kann die Schleife neu starten: dann noch ein Fenster
@@ -3205,6 +3559,50 @@ __declspec(naked) static void stub_crt_rand(void)
     }
 }
 
+// Level-Init: 0xb26410 (Aufrufer 0xb275a0 <- 0xb286ca/0xb29046) leert den Figurenspeicher und setzt bei 0xb26602
+// "xor eax,eax / mov [0x1394b88],eax" die Figurenzahl auf 0. Der Haken zaehlt nur mit; die Schranke folgt im
+// Frame-Ende (on_frame_end), damit beide Seiten an derselben Stelle des Frames stehen.
+static volatile LONG g_scene_init_other;   // Aufrufe ausserhalb des Hauptthreads (dann waere der Frame zeitabhaengig)
+
+static void __cdecl on_scene_init(void)
+{
+    LONG n = InterlockedIncrement(&g_scene_inits);
+    int in_main = !g_main_tid || GetCurrentThreadId() == g_main_tid;
+    if (!in_main) InterlockedIncrement(&g_scene_init_other);
+    if (n <= 30) logf_("Level-Init: Figurenspeicher geleert (Nr. %ld, %s)", n, in_main ? "Hauptthread" : "ANDERER THREAD");
+}
+
+__declspec(naked) static void stub_scene_init(void)
+{
+    __asm {
+        pushad
+        pushfd
+        call on_scene_init
+        popfd
+        popad
+        xor eax, eax                    // ueberschriebene Befehle bei 0xb26602 (7 Bytes)
+        mov dword ptr ds:[01394B88h], eax
+        push 00B26609h
+        ret
+    }
+}
+static const unsigned char k_scene_init_orig[7] = { 0x33, 0xC0, 0xA3, 0x88, 0x4B, 0x39, 0x01 };
+
+// LBO_TESTPROGSHIFT=n[,Frame] (Test, auf der Seite, wo gesetzt): ab Frame (Standard 7000) n-mal den Logik-Schritt 0x59a5f0 auslassen
+// (Aufruf 0x59a9fa im synchronen Pfad 0x59a990). Alles, was an der Spiellogik haengt (Menues, Intro, Szenenwechsel),
+// laeuft beim Gast danach n Frames spaeter; der Gast betritt das naechste Level spaeter als der Host, wie im
+// Playtest 23.10. 18:04. (Eingaben n Frames zu verzoegern wirkte nicht: die Szenenwechsel blieben im selben Frame.)
+static void __cdecl logic_step_test(void)
+{
+    static int skipped;
+    if (g_F >= g_progshift_from && skipped < g_test_progshift) {
+        skipped++;
+        logf_("Test: Logik-Schritt ausgelassen (%d von %d, LBO_TESTPROGSHIFT)", skipped, g_test_progshift);
+        return;
+    }
+    ((void (__cdecl *)(void))0x0059A5F0)();
+}
+
 static void __cdecl on_frame_end(void)
 {
     CHARSNAP cs;
@@ -3350,11 +3748,68 @@ static void __cdecl on_frame_end(void)
         cfg_check_start();
     }
     if (g_net && g_cfg_pending) cfg_check_poll();
+    // Gast: Frame-Zaehler-Versatz von der letzten Schranke nachholen, sobald NuBgProc ruht (sync_counters)
+    if (g_fc_pending && !bg_busy()) {
+        logf_("Netz: Frame-Zaehler-Versatz %+d nachgeholt (%d -> %d)", g_fc_pending, G_FRAMECOUNT, G_FRAMECOUNT + g_fc_pending);
+        fc_shift(g_fc_pending);
+        g_fc_pending = 0;
+    }
+    // Frames und Logik-Ticks seit dem letzten Level-Init (Diagnose, an den Schranken verglichen)
+    if (g_since_init_frames >= 0) { g_since_init_frames++; g_since_init_ticks += G_LOGIC_TICK; }
+    {
+        // Schranke beim Level-Init (Playtest 23.10. 18:04): Vor dem ersten Levelanker laufen Menues und Intro je nach
+        // Ladezeit leicht versetzt (Host betrat das Level bei F2079, der Gast bei F2080). Bis zum Anker lief der Host
+        // 2 Logik-Frames mehr; alles, was dabei lief, war am Anker verschieden. Beim Level-Init treffen sich deshalb beide
+        // (neue Epoche), der Gast uebernimmt Zufall, Zaehler und Uhr des Hosts; danach laeuft das Laden auf beiden Seiten
+        // im selben Lockstep-Frame los (LOADSYNC/loopgate/iowait machen es frame-genau).
+        // Level-Init = 0xb26410 setzt den Figurenspeicher zurueck (memset 0x5fc00 = 64 x 0x17f0 bei 0xb265f4, Anzahl
+        // 0x1394b88 = 0 bei 0xb26604, Haken stub_scene_init) oder die Figurenzahl faellt von > 0 auf 0.
+        // Nicht 0x59a5f0: Das ist der Logik-Schritt jedes Frames (setzt 0x11cf0ec je Frame auf 0, ruft 0x59a450 1..n mal).
+        // Lokaltest: Beim Levelwechsel faellt erst die Figurenzahl auf 0 (Frame X), 0xb26410 laeuft einen Frame spaeter
+        // (X+1). Eine Schranke genuegt: bei X; die bei X+1 entfaellt (beide Seiten stehen dann schon gleich).
+        static LONG seen;
+        static int prev_chars = -1, zero_run;
+        static long last_init_meet = -10;
+        int chars = G_CHAR_COUNT;
+        LONG inits = g_scene_inits;
+        int scene = inits != seen || (chars == 0 && prev_chars > 0);
+        int anchor_now = g_anchor_mode && g_anchor < 0 && chars > 2;
+        seen = inits;
+        if (scene) {
+            g_since_init_frames = 0;
+            g_since_init_ticks = 0;
+            logf_("Level-Init (Nr. %ld, Figuren %d -> %d, Frame-Zaehler %d, Lockstep-Frame %ld)", inits, prev_chars, chars,
+                  G_FRAMECOUNT, F - g_lock_base);
+            // LBO_INITBARRIER=1 (Standard aus): Test TF2O 24.10.: Die Leerung 0xb26410 liegt mitten im Laden und kam beim
+            // Gast ladezeitbedingt 2 Frames spaeter; die Schranke dort verschob den Anker um 2 Lockstep-Frames.
+            if (g_net && g_init_barrier && F > SYNC_EARLY_FRAME && F - last_init_meet > 1 && !anchor_now) {
+                last_init_meet = F;
+                net_meet(F, "beim Level-Init", MEET_INIT);
+            }
+        }
+        // Szenenstart (LBO_SCENEBARRIER, Standard an): erster Frame, in dem die Figurenzahl nach einem kurzen Szenenwechsel
+        // (1..SCENE_MAXZERO Frames ohne Figuren) wieder steigt. Test TF3C 24.10.: Vor dem Levelanker liefen die
+        // Zwischenszenen beim Gast 1 Frame frueher (Wechsel 6316/7598 statt 6317/7599); Skript-Eingaben trafen dort
+        // verschobene Spielmomente, 1785 Frames nach dem Anker wich Spieler 1 ab. Ein Szenenwechsel ohne Laden dauert
+        // 1 Frame (alle Wechsel im Anker-Skript); eine Ladephase hat hunderte bis tausende Frames ohne Figuren (offene
+        // Welt: 14098), und dort haengt der erste Frame mit Figuren an der Ladezeit (TF2O: 14099/14101) - solche
+        // Szenenstarts zaehlen nicht, dafuer gibt es Levelanker und "nach dem Laden". Ein Wert von 30 liegt weit von
+        // beiden entfernt. Sieht nur eine Seite den Szenenstart, wird die Schranke uebersprungen (net_barrier_ex).
+        if (chars > 0 && prev_chars == 0 && zero_run >= 1) {
+            int counts = zero_run <= SCENE_MAXZERO;
+            logf_("Szenenstart (Figuren 0 -> %d nach %d Frames ohne Figuren%s, Frame-Zaehler %d, Lockstep-Frame %ld)", chars, zero_run,
+                  counts ? "" : ", Ladephase: keine Schranke", G_FRAMECOUNT, F - g_lock_base);
+            if (g_net && g_scene_barrier && counts && F > SYNC_EARLY_FRAME && !anchor_now && F - last_init_meet > 1)
+                net_meet(F, "beim Szenenstart", MEET_SCENE);
+        }
+        zero_run = chars == 0 ? zero_run + 1 : 0;
+        prev_chars = chars;
+    }
     if (g_anchor_mode && g_anchor < 0 && G_CHAR_COUNT > 2) {
         // Schranke am Levelstart: Vorher duerfen die Frames durch Ladezeiten leicht auseinanderliegen.
         // Der Gast uebernimmt den Zustand des Hosts, danach zaehlt der Lockstep ab dem Anker neu.
         g_anchor = F;
-        if (g_net) net_meet(F, "am Levelstart");
+        if (g_net) net_meet(F, "am Levelstart", MEET_ANCHOR);
         else reset_rng();
         logf_("Levelanker bei Frame %ld", F);
     }
@@ -3362,7 +3817,7 @@ static void __cdecl on_frame_end(void)
     // dabei Zufall (Playtest 20.10.2026: nach dem Levelwechsel bei Spiel-Frame 74.300 wich der LCG16 ab, gut
     // 8.000 Frames spaeter alles). Faellt die Figurenzahl auf 0 und ist das Laden danach 30 Frames lang ruhig,
     // treffen sich beide Seiten, und der Gast uebernimmt die Zustaende des Hosts.
-    if (g_net && g_anchor >= 0 && g_test_meet && F - g_anchor + 1 == g_test_meet) { g_test_meet = 0; net_meet(F, "(Test)"); }
+    if (g_net && g_anchor >= 0 && g_test_meet && F - g_anchor + 1 == g_test_meet) { g_test_meet = 0; net_meet(F, "(Test)", MEET_TEST); }
     if (g_net && g_anchor >= 0) {
         static int phase, quiet;
         if (G_CHAR_COUNT == 0) { phase = 1; quiet = 0; }
@@ -3373,12 +3828,13 @@ static void __cdecl on_frame_end(void)
                 busy = loads_in_flight(&st) != 0 || (q && *(LONG *)(q + BGPROC_PENDING) > 0) || G_BGPROC_CURRENT != 0;
             } __except (EXCEPTION_EXECUTE_HANDLER) {}
             quiet = busy ? 0 : quiet + 1;
-            if (quiet >= 30) { phase = 0; quiet = 0; net_meet(F, "nach dem Laden"); }
+            if (quiet >= 30) { phase = 0; quiet = 0; net_meet(F, "nach dem Laden", MEET_LOADED); }
         }
     }
     if (g_net) {
-        // Lockstep-Frame: vor dem Anker absolut, danach ab dem Anker (Epoche 1 in net.c)
-        long NF = g_anchor < 0 ? F : F - g_anchor + 1;
+        // Lockstep-Frame: vor der ersten Schranke absolut, danach ab der letzten Schranke (neue Epoche in net.c)
+        long NF = F - g_lock_base;
+        g_NF = NF;
         {
             LONGLONG tn = qpc_now();
             net_exchange(NF);
@@ -3387,6 +3843,12 @@ static void __cdecl on_frame_end(void)
         if (g_test_desync && g_anchor >= 0 && NF == g_test_desync) {
             if (g_lcg_split) G_RNG_A ^= 0x5555; else G_RNG_LCG16 ^= 0x5555;
             logf_("Test: %s bei Frame %ld verstellt", g_lcg_split ? "rng_a" : "LCG16", NF);
+        }
+        // LBO_TESTFCSHIFT=n (Test, nur Gast): bei Frame 1000 vor dem Levelanker den Frame-Zaehler des Spiels um n
+        // verschieben, wie im Playtest 23.10. 18:04 (Levelanker Host F2814, Gast F2813)
+        if (g_test_fcshift && g_anchor < 0 && F == 1000 && net_role() == 1) {
+            G_FRAMECOUNT += g_test_fcshift;
+            logf_("Test: Frame-Zaehler des Spiels um %d verschoben (jetzt %d)", g_test_fcshift, G_FRAMECOUNT);
         }
         // Selbstheilung: Am angekuendigten Reparatur-Frame schickt der Host seine Zustaende, der Gast uebernimmt sie
         // (beide an derselben Stelle des Frame-Endes). Im Playtest wich nach dem Laden zuerst nur der LCG16 ab.
@@ -3417,8 +3879,15 @@ static void __cdecl on_frame_end(void)
             // halfen nicht): obere 32 Bit = Figuren (Positions-Hash und Anzahl), untere 32 Bit = Zufall. Die
             // Zufallsstroeme je Verbraucher (lcg_streams_hash) bleiben absichtlich draussen: kosmetische
             // Verbraucher (Zeichnen, Musik) sollen keinen Alarm ausloesen.
-            ck = ((unsigned long long)(k.hash ^ ((unsigned)k.n * 0x9E3779B1u)) << 32) |
-                 (unsigned)(G_RNG_LCG16 ^ _rotl(G_RNG_A, 16) ^ _rotl(G_RNG_PM_DEFAULT, 8) ^ crt_rand_state());
+            // Review 23.10.: Ob beide dieselben Eingaben sahen, war unbelegt. Die untersten 8 Bit des oberen Teils sind
+            // deshalb ein Hash beider Pads seit der letzten Pruefsumme (net.c meldet "Eingaben verschieden").
+            {
+                unsigned pa = g_pad_acc;
+                pa = (pa ^ (pa >> 8) ^ (pa >> 16) ^ (pa >> 24)) & 0xFFu;
+                ck = ((unsigned long long)(((k.hash ^ ((unsigned)k.n * 0x9E3779B1u)) & 0xFFFFFF00u) | pa) << 32) |
+                     (unsigned)(G_RNG_LCG16 ^ _rotl(G_RNG_A, 16) ^ _rotl(G_RNG_PM_DEFAULT, 8) ^ crt_rand_state());
+                g_pad_acc = 2166136261u;
+            }
             net_checksum((int)NF, ck);
             {
                 // Abweichung nach der letzten Reparatur: Weicht nur der Zufall ab, plant der Host eine Reparatur
@@ -3430,7 +3899,7 @@ static void __cdecl on_frame_end(void)
                     g_seen_desync = last;
                     if (net_last_desync_parts() & 2) {
                         g_net_gave_up = 1;
-                        logf_("NICHT SYNCHRON: Figuren weichen ab (Frame %d), keine Reparatur - Hinweis an den Spieler", last);
+                        logf_("NICHT SYNCHRON: Figuren (oder Eingaben) weichen ab (Frame %d), keine Reparatur - Hinweis an den Spieler", last);
                         CreateThread(NULL, 0, net_notice, (void *)1, 0, NULL);
                     } else {
                         if (g_last_repair && last - g_last_repair > 600) g_repairs = 0;   // neuer Vorfall
@@ -3458,12 +3927,23 @@ static void __cdecl on_frame_end(void)
             unsigned char *q = G_BGPROC;
             int *cur = (int *)G_BGPROC_CURRENT;
             fprintf(g_csv, "%ld,%d,%.6f,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%d,%d,%08x,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-                    "%d,%d,%d,%d,%d,%d,%ld,%08x,%d,%d,%ld,%lu,%ld,%08lx,%04x,%08x,%ld\n", F, G_FRAMECOUNT,
+                    "%d,%d,%d,%d,%d,%d,%ld,%08x,%d,%d,%ld,%lu,%ld,%08lx,%04x,%08x,%ld", F, G_FRAMECOUNT,
                     G_DT, G_RNG_PM_SEED, g_lcg_split ? lcg_streams_hash() : G_RNG_LCG16, G_RNG_PM_DEFAULT, G_RNG_A, G_RNG_B, G_RNG_C, crt_rand_state(), g_polls, cs.n, cs.hash,
                     cs.p1[0], cs.p1[1], cs.p1[2], cs.p2[0], cs.p2[1], cs.p2[2],
                     *(int *)0x011CF178, *(int *)0x0131356C, *(int *)0x01313574, *(int *)0x0131359C, *(int *)0x013135B0,
                     *(int *)0x01313568, q ? *(LONG *)(q + BGPROC_PENDING) : -1, cur ? cur[2] : 0, ll ? ll[2] : -1, inflight,
                     g_anchor < 0 ? -1L : F - g_anchor, GetTickCount() - g_t0, g_vcalls, *(DWORD *)0x011CF0D8, fpu_cw(), _mm_getcsr(), wait_ms_take());
+            // Eingaben, die das Spiel im naechsten Frame liest (Netz: beide Lockstep-Pads), und Lockstep-Frame
+            fprintf(g_csv, ",%ld", g_NF);
+            {
+                int pi;
+                for (pi = 0; pi < 2; pi++) {
+                    const PAD *pp = &g_net_pad[pi];
+                    fprintf(g_csv, ",%04x,%u,%u,%d,%d,%d,%d,%u", pp->wButtons, pp->bLeftTrigger, pp->bRightTrigger, pp->sThumbLX,
+                            pp->sThumbLY, pp->sThumbRX, pp->sThumbRY, g_net_pad_conn[pi]);
+                }
+            }
+            fprintf(g_csv, ",%d,%.5f,%ld\n", G_LOGIC_TICK, G_GAME_TIME, g_since_init_frames);
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         if (F % 60 == 0) fflush(g_csv);
         if (g_trace && F == g_trace_to + 1) fflush(g_trace);
@@ -3569,10 +4049,10 @@ static DWORD WINAPI installer(void *arg)
     static const unsigned char vdt_orig[6] = { 0xD9, 0x1D, 0xDC, 0xF0, 0x1C, 0x01 };
     int vdt_done = !g_videodt, rng_done = !g_trace_to, rrng_done = !g_render_rng, poll_done = !g_net && !g_nodinput, post_done = !g_loadsync;
     int mutex_done = !g_multi, frame_done = 0, xinput_done = 0, d3d_done = 0, file_done = 0, fmv_done = !g_no_movies;
-    int hz_done = !g_net;
+    int hz_done = !g_net, scene_done = 0, focus_done = !g_net, shift_done = !(g_net && g_test_progshift > 0);
     (void)arg;
     // Eng pollen: Die Importtabelle wird von der Huelle befuellt, der Mutex kurz danach angelegt
-    while ((!mutex_done || !frame_done || !xinput_done || !d3d_done || !file_done || !fmv_done || !vdt_done || !rng_done || !rrng_done || !poll_done || !post_done || !hz_done) && GetTickCount() - start < 120000) {
+    while ((!mutex_done || !frame_done || !xinput_done || !d3d_done || !file_done || !fmv_done || !vdt_done || !rng_done || !rrng_done || !poll_done || !post_done || !hz_done || !scene_done || !focus_done || !shift_done) && GetTickCount() - start < 120000) {
         __try {
             if (!mutex_done && *(void **)IAT_CREATEMUTEXA == mutex_fn) {
                 patch_iat(IAT_CREATEMUTEXA, (void *)hook_createmutex, (void **)&real_createmutex);
@@ -3654,6 +4134,20 @@ static DWORD WINAPI installer(void *arg)
                 hz_done = ONCE(p[0], patch_bytes(0x00634660, k_hz_set_orig, sizeof k_hz_set_orig, k_hz_set_new, sizeof k_hz_set_new)) &
                           ONCE(p[1], patch_bytes(0x0063FEE7, k_hz_mode_orig, sizeof k_hz_mode_orig, k_hz_mode_new, sizeof k_hz_mode_new));
             }
+            if (!scene_done && !memcmp((void *)0x00B26602, k_scene_init_orig, sizeof k_scene_init_orig))
+                scene_done = patch_jmp(0x00B26602, (void *)stub_scene_init, k_scene_init_orig);
+            if (!shift_done) shift_done = patch_call(0x0059A9FA, 0x0059A5F0, (void *)logic_step_test);
+            if (!focus_done) {
+                // Netz: Fensterfokus immer "aktiv". Die Fensterprozedur schreibt G_WINDOW_ACTIVE sofort (WM_ACTIVATE),
+                // Leser im selben Frame auch in der Logik (0x87f3ca); die Mod setzte erst im Frame-Ende wieder 1. Die
+                // beiden Schreiber mit Wert (0x640abc mov [..],ebx; 0x640bc6 mov [..],ecx) werden zu nop, 0x640a98
+                // schreibt ohnehin 1. Danach folgt dort nur xor eax,eax / pop / ret; keine Sprungziele in den Bytes.
+                static int p[2];
+                static const unsigned char w1[6] = { 0x89, 0x1D, 0x18, 0x3E, 0x15, 0x01 }, w2[6] = { 0x89, 0x0D, 0x18, 0x3E, 0x15, 0x01 };
+                static const unsigned char nop6[6] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                focus_done = ONCE(p[0], patch_bytes(0x00640ABC, w1, 6, nop6, 6)) & ONCE(p[1], patch_bytes(0x00640BC6, w2, 6, nop6, 6));
+                if (focus_done) G_WINDOW_ACTIVE = 1;
+            }
             if (!fmv_done) fmv_done = patch_call(FMV_FIND_CALL, FMV_FIND, (void *)no_movie_find);
             if (!vdt_done && !memcmp((void *)VIDEO_DT_STORE, vdt_orig, 6)) {
                 // fstp [0x11cf0dc] -> fstp st(0) + 4 x nop
@@ -3669,8 +4163,9 @@ static DWORD WINAPI installer(void *arg)
         if (mutex_done && file_done) Sleep(1); else SwitchToThread();
     }
     logf_("Haken: Frame-Ende %d, XInput %d, Mutex %d, D3D %d, Dateien %d, Videos %d, Video-dt %d, Zufall %d, Zeichen-Zufall %d, "
-          "Eingabe %d, Nach-Frame %d, 60 Hz %d (nach %lu ms, Rate jetzt %d)", frame_done, xinput_done, mutex_done, d3d_done, file_done,
-          fmv_done, vdt_done, rng_done, rrng_done, poll_done, post_done, hz_done, GetTickCount() - start, *(volatile int *)0x01154304);
+          "Eingabe %d, Nach-Frame %d, 60 Hz %d, Level-Init %d, Fokus %d (nach %lu ms, Rate jetzt %d)", frame_done, xinput_done, mutex_done,
+          d3d_done, file_done, fmv_done, vdt_done, rng_done, rrng_done, poll_done, post_done, hz_done, scene_done, focus_done,
+          GetTickCount() - start, *(volatile int *)0x01154304);
     return 0;
 }
 
@@ -3726,6 +4221,19 @@ static void init(void)
     if (GetEnvironmentVariableA("LBO_AVLOG", buf, sizeof buf)) g_avlog = atoi(buf);
     if (GetEnvironmentVariableA("LBO_AVSYNC", buf, sizeof buf)) g_avsync = atoi(buf);
     if (GetEnvironmentVariableA("LBO_TESTDESYNC", buf, sizeof buf)) g_test_desync = atol(buf);
+    if (GetEnvironmentVariableA("LBO_TESTFCSHIFT", buf, sizeof buf)) g_test_fcshift = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_TESTPROGSHIFT", buf, sizeof buf)) {
+        int all = 0;
+        sscanf(buf, "%d,%ld,%d", &g_test_progshift, &g_progshift_from, &all);
+        // n,Frame,1: der ganze Frame steht (Logik, Ton-Wiedergabe und Lade-Fenster), wie ein Frame, den ein langsamerer PC
+        // spaeter erreicht
+        if (all) { g_test_audioshift = g_test_loadshift = g_test_progshift; g_audioshift_from = g_loadshift_from = g_progshift_from; }
+    }
+    if (GetEnvironmentVariableA("LBO_INITBARRIER", buf, sizeof buf)) g_init_barrier = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_SCENEBARRIER", buf, sizeof buf)) g_scene_barrier = atoi(buf);
+    if (GetEnvironmentVariableA("LBO_TESTLOADSHIFT", buf, sizeof buf)) sscanf(buf, "%d,%ld", &g_test_loadshift, &g_loadshift_from);
+    if (GetEnvironmentVariableA("LBO_TESTAUDIOSHIFT", buf, sizeof buf)) sscanf(buf, "%d,%ld", &g_test_audioshift, &g_audioshift_from);
+    if (GetEnvironmentVariableA("LBO_SYNCCOUNTERS", buf, sizeof buf)) g_sync_counters = atoi(buf);
     if (GetEnvironmentVariableA("LBO_TESTMEET", buf, sizeof buf)) g_test_meet = atol(buf);
     if (GetEnvironmentVariableA("LBO_LOADPROBE", buf, sizeof buf)) g_loadprobe = atoi(buf);
     GetEnvironmentVariableA("LBO_PCCONFIG", g_pcconfig, sizeof g_pcconfig);
@@ -3768,6 +4276,13 @@ static void init(void)
         v[3] = g_cfg_bad ? CFG_FLAG_BAD : 0;
         net_set_cfg(v);
     }
+    if (g_net) {
+        net_set_ck_pads(1);
+        logf_("Netz: Schranke beim Level-Init %d, beim Szenenstart %d, Zaehler-Abgleich %d%s%s%s", g_init_barrier, g_scene_barrier,
+              g_sync_counters, g_test_progshift > 0 ? ", Test: Logik-Schritt wird ausgelassen (LBO_TESTPROGSHIFT)" : "",
+              g_test_loadshift > 0 ? ", Test: Laden wird verzoegert (LBO_TESTLOADSHIFT)" : "",
+              g_test_audioshift > 0 ? ", Test: Ton wird angehalten (LBO_TESTAUDIOSHIFT)" : "");
+    }
     if (g_net) net_set_partner_timeout(30000);
     if (g_net) net_set_wait_callback(av_hitch);
     if (g_net) net_set_notice_callback(net_notice_cb);   // danach alleine weiter statt endlos einfrieren
@@ -3793,7 +4308,9 @@ static void init(void)
     }
     logf_("Spielstand-Schutz %s", g_allow_save ? "AUS (LBO_ALLOWSAVE)" : "aktiv");
     g_csv = open_out("frames.csv", "w");
-    if (g_csv) fprintf(g_csv, "F,game_frame,dt,rng_pm_seed,rng_lcg16,rng_pm_default,rng_a,rng_b,rng_c,crt_rand,polls,chars,char_hash,p1x,p1y,p1z,p2x,p2y,p2z,vid,fmv_a,fmv_b,fmv_c,fmv_d,fmv_frame,bg_pend,bg_job,ll_n,ll_loading,rel,ms,qpc,rawdt,fpucw,mxcsr,wait_ms\n");
+    if (g_csv) fprintf(g_csv, "F,game_frame,dt,rng_pm_seed,rng_lcg16,rng_pm_default,rng_a,rng_b,rng_c,crt_rand,polls,chars,char_hash,p1x,p1y,p1z,p2x,p2y,p2z,vid,fmv_a,fmv_b,fmv_c,fmv_d,fmv_frame,bg_pend,bg_job,ll_n,ll_loading,rel,ms,qpc,rawdt,fpucw,mxcsr,wait_ms,"
+                       "nf,pad0_btn,pad0_lt,pad0_rt,pad0_lx,pad0_ly,pad0_rx,pad0_ry,pad0_con,"
+                       "pad1_btn,pad1_lt,pad1_rt,pad1_lx,pad1_ly,pad1_rx,pad1_ry,pad1_con,logic_ticks,game_time,since_init\n");
     logf_("Modus %d, festes dt %d, fps %d, max Frames %d, Screenshot alle %d, Mehrfach %d", g_mode, g_fixed_dt,
           g_fps_cap, g_max_frames, g_shot_every, g_multi);
     logf_("NuBgProc synchron %d, ohne Videos %d, Zufalls-Reset bei Frame %d, Lade-Sync %d, Video-dt fest %d, virtuelle Uhr %d", g_bgsync,

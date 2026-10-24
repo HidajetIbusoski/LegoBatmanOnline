@@ -63,6 +63,7 @@ typedef struct {
     unsigned type;          // 2 = Zustandsabgleich (obere 16 Bit: Epoche), 3/4 = Schranke
     int frame;
     int len;
+    unsigned id;            // Schranke: Kennung (net_barrier_ex), Bit 31 = vom Absender uebersprungen
     unsigned char data[256];
 } SYNCPACKET;
 #pragma pack(pop)
@@ -285,6 +286,15 @@ int net_init(void (*logger)(const char *fmt, ...))
         return 0;
     }
     ioctlsocket(g_sock, FIONBIO, &nb);
+    {
+        // Ohne das meldet recv nach jedem Senden an einen noch geschlossenen Port (Partner startet spaeter) einmal
+        // WSAECONNRESET; receive() las dann pro Aufruf nur einen Fehler statt der wartenden Pakete. Dauerte der Start
+        // bis Frame 1 laenger als die Partner-Zeitgrenze (Lokaltest 23.10. unter Last: 33 s), galt der Partner sofort
+        // als verloren.
+        BOOL off = FALSE;
+        DWORD got = 0;
+        WSAIoctl(g_sock, _WSAIOW(IOC_VENDOR, 12) /* SIO_UDP_CONNRESET */, &off, sizeof off, NULL, 0, &got, NULL, NULL);
+    }
     memset(&g_peer, 0, sizeof g_peer);
     g_peer.sin_family = AF_INET;
     g_peer.sin_port = htons((u_short)peer_port);
@@ -381,24 +391,68 @@ static void reset_streams(const NETPAD *neutral)
 // durch Ladezeiten etwas auseinanderliefen. Der Host gibt seinen Zustand mit (data), der Gast bekommt ihn.
 // Wer zuerst ankommt, verlaengert seine Eingaben mit neutralen Pads, damit der Partner bis zur Schranke
 // weiterlaufen kann. Danach beginnt eine neue Epoche mit Frame 1 (Vorbelegung mit der Startverzoegerung).
+// Kennung (id): Feste Schranken (NET_BAR_OPTIONAL nicht gesetzt) passen immer zueinander, wie bisher. Eine optionale
+// Schranke (LEGO Batman 2: Szenenstart) passt nur zur selben Kennung. Sieht nur eine Seite sie (der Partner steht an
+// einer anderen Schranke, meldet sie als uebersprungen oder laeuft mehr als 60 Frames ohne Schranke weiter), wird sie
+// uebersprungen: Rueckgabe -1, keine neue Epoche, der Lockstep laeuft weiter (die Eingaben bis dahin sind auf beiden
+// Seiten dieselben, auch die neutralen, die wir beim Warten vorausgeschickt haben). Unser Paket geht danach als
+// "uebersprungen" (NET_BAR_SKIPPED) noch eine Weile hinaus, damit ein Partner an derselben Schranke nicht ewig wartet.
+static int bar_match(unsigned mine, unsigned peer)
+{
+    if ((mine | peer) & NET_BAR_OPTIONAL) return mine == peer;
+    return 1;
+}
+
 int net_barrier(int F, void *data, int len, int timeout_ms)
+{
+    return net_barrier_ex(F, 0, data, len, timeout_ms);
+}
+
+int net_barrier_ex(int F, unsigned id, void *data, int len, int timeout_ms)
 {
     DWORD start = GetTickCount(), last_send = 0, last_log = start;
     NETPAD neutral;
+    int optional = (id & NET_BAR_OPTIONAL) != 0, mismatch_logged = 0;
     if (len > 256) len = 256;
     memset(&neutral, 0, sizeof neutral);
     neutral.connected = 1;
     memset(&g_bar_out, 0, sizeof g_bar_out);
     g_bar_out.magic = MAGIC;
-    g_bar_out.type = g_role == 0 ? 3 : 4;
+    // Epoche im Typ: Das Schranken-Paket der vorigen Schranke sendet der Partner noch 600-mal nach. Ohne Epoche haette
+    // es eine neue Schranke kurz danach (Level-Init, dann Levelanker ~25 Frames spaeter) sofort "passiert".
+    g_bar_out.type = (g_role == 0 ? 3 : 4) | ((unsigned)g_epoch << 16);
     g_bar_out.frame = F;
-    g_bar_out.len = g_role == 0 ? len : 0;
-    if (g_role == 0) memcpy(g_bar_out.data, data, len);
+    g_bar_out.id = id;
+    // Beide Seiten schicken ihren Zustand (der Gast nur zur Diagnose, net_barrier_peer); uebernommen wird der des Hosts
+    g_bar_out.len = len;
+    memcpy(g_bar_out.data, data, len);
     g_bar_resend = 1 << 30;
     g_bar_seen = 0;   // Pakete von vor unserer Ankunft zaehlen nicht, der Partner sendet weiter
-    g_log("Netz: an der Schranke (Frame %d), warte auf Partner", F);
-    while (!g_bar_seen) {
+    g_log("Netz: an der Schranke (Frame %d, Kennung %08x), warte auf Partner", F, id);
+    for (;;) {
         DWORD now = GetTickCount();
+        const char *skip = NULL;
+        if (g_bar_seen) {
+            unsigned pid = g_bar_in.id;
+            if (!(pid & NET_BAR_SKIPPED) && bar_match(id, pid)) break;
+            if (optional && (!(pid & NET_BAR_SKIPPED) || (pid & ~NET_BAR_SKIPPED) == id))
+                skip = pid & NET_BAR_SKIPPED ? "Partner hat sie uebersprungen" : "Partner steht an einer anderen Schranke";
+            else if (!mismatch_logged) {
+                mismatch_logged = 1;
+                g_log("Netz: Partner meldet Schranke %08x (hier %08x), warte weiter", pid, id);
+            }
+            g_bar_seen = 0;   // auf das naechste Paket des Partners warten
+        }
+        // Partner laeuft ohne diese Schranke weiter (er hat unsere neutralen Eingaben und braucht uns nicht)
+        if (!skip && optional && g_remote_upto > g_cur_frame + g_delay + 60) skip = "Partner lief 60 Frames ohne Schranke weiter";
+        if (!skip && optional && now - start > 30000) skip = "Partner kam in 30 s nicht an";
+        if (skip) {
+            g_bar_out.id |= NET_BAR_SKIPPED;
+            g_bar_resend = 600;
+            g_log("SCHRANKE NUR AUF EINER SEITE: %08x bei Frame %d uebersprungen (%s, Partner %08x, Partner-Frame %d)", id, F, skip,
+                  g_bar_in.id, g_bar_in.frame);
+            return -1;
+        }
         if (now - start > (DWORD)timeout_ms) { g_log("Netz: Partner kam nicht an der Schranke an"); return 0; }
         if (g_partner_timeout_ms && now - g_last_rx > (DWORD)g_partner_timeout_ms) {
             g_log("Netz: an der Schranke seit %lu ms kein Paket vom Partner", now - g_last_rx);
@@ -427,6 +481,14 @@ int net_barrier(int F, void *data, int len, int timeout_ms)
     g_sync_in_frame = 0;
     g_log("Netz: Schranke passiert nach %lu ms (Partner-Frame %d), Epoche %d", GetTickCount() - start, g_bar_in.frame, g_epoch);
     return 1;
+}
+
+int net_barrier_peer(void *data, int len)
+{
+    int n = g_bar_in.len < 0 ? 0 : g_bar_in.len > 256 ? 256 : g_bar_in.len;
+    if (n > len) n = len;
+    memcpy(data, g_bar_in.data, n);
+    return n;
 }
 
 void net_send_sync(int F, const void *data, int len)
@@ -466,6 +528,9 @@ int net_wait_sync(int F, void *data, int len, int timeout_ms)
     return g_sync_in.frame;
 }
 
+static int g_ck_pads;   // LEGO Batman 2: Pruefsumme enthaelt einen Eingabe-Hash (net_set_ck_pads)
+void net_set_ck_pads(int on) { g_ck_pads = on; }
+
 static void compare_checksum(int f)
 {
     if (g_my_ck_frame[f % RING] == f && g_peer_ck_frame[f % RING] == f && g_my_ck[f % RING] != g_peer_ck[f % RING]) {
@@ -475,8 +540,12 @@ static void compare_checksum(int f)
         if (f > g_last_desync) { g_last_desync = f; g_last_desync_parts = parts; }
         // Die ersten 30 einzeln, danach jede 100. (nach dem Hinweis kam sonst alle 20 Frames eine Zeile)
         if (g_desyncs <= 30 || g_desyncs % 100 == 0)
-            g_log("DESYNC bei Frame %d (Spiel-Frame %ld): lokal %016llx, Partner %016llx (verschieden: %s)", f, f + g_frame_offset,
-              g_my_ck[f % RING], g_peer_ck[f % RING], parts == 3 ? "beide Teile" : parts == 2 ? "oberer Teil" : "unterer Teil");
+            // LEGO Batman 2: Die untersten 8 Bit des oberen Teils sind ein Hash der Eingaben (beide Pads) seit der letzten
+            // Pruefsumme, die oberen 24 Bit der Figuren-Hash
+            g_log("DESYNC bei Frame %d (Spiel-Frame %ld): lokal %016llx, Partner %016llx (verschieden: %s)%s%s", f, f + g_frame_offset,
+              g_my_ck[f % RING], g_peer_ck[f % RING], parts == 3 ? "beide Teile" : parts == 2 ? "oberer Teil" : "unterer Teil",
+              g_ck_pads && ((unsigned)(d >> 32) & 0xFFu) ? " - Eingaben verschieden" : "",
+              g_ck_pads && (unsigned)(d >> 40) ? " - Figuren verschieden" : "");
     }
 }
 
@@ -486,8 +555,15 @@ static void receive(void)
     int n, i, f;
     DWORD call = now_ms(), gap = g_last_recv_call ? call - g_last_recv_call : 1000;
     g_last_recv_call = call;
-    while ((n = recv(g_sock, (char *)&u, sizeof u, 0)) > 0) {
+    for (;;) {
         unsigned kind;
+        n = recv(g_sock, (char *)&u, sizeof u, 0);
+        if (n <= 0) {
+            // Fehlermeldung eines einzelnen Datagramms (z. B. ICMP "Port nicht erreichbar"): weiterlesen
+            int e = n < 0 ? WSAGetLastError() : 0;
+            if (e == WSAECONNRESET || e == WSAEMSGSIZE) continue;
+            break;
+        }
         if (n < 8 || u.u[0] != MAGIC) continue;
         g_last_rx = GetTickCount();
         kind = u.u[1] & 0xFFFF;
@@ -500,8 +576,8 @@ static void receive(void)
         }
         if ((kind == 3 || kind == 4) && n == (int)sizeof(SYNCPACKET)) {
             // Schranke: Typ 3 kommt vom Host (fuer den Gast), Typ 4 vom Gast (fuer den Host)
-            if ((kind == 3 && g_role == 1) || (kind == 4 && g_role == 0)) {
-                if (!g_bar_seen || u.s.frame != g_bar_in.frame) g_bar_in = u.s;
+            if (((kind == 3 && g_role == 1) || (kind == 4 && g_role == 0)) && (int)(u.s.type >> 16) == g_epoch) {
+                if (!g_bar_seen || u.s.frame != g_bar_in.frame || u.s.id != g_bar_in.id) g_bar_in = u.s;
                 if (g_bar_out.magic && g_bar_resend > 600) g_bar_seen = 1;   // nur, solange wir an der Schranke stehen
             }
             continue;

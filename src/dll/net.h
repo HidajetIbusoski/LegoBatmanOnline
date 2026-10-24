@@ -15,6 +15,7 @@ int net_init(void (*logger)(const char *fmt, ...));  // 1 = Netzmodus aktiv (LBO
 int net_role(void);                                  // 0 = Host/Pad 0, 1 = Client/Pad 1
 void net_frame(int F, const NETPAD *local_now, NETPAD out[2]);  // blockiert bis beide Eingaben fuer F da sind
 void net_checksum(int F, unsigned long long ck);
+void net_set_ck_pads(int on);   // LEGO Batman 2: Bits 32-39 der Pruefsumme sind ein Eingabe-Hash (DESYNC-Log nennt ihn)
 void net_stats(long *stalls, long *desyncs);
 void net_report(void);   // Rundlaufzeit, Verlust, Verzoegerung und Wartezeit seit dem letzten Bericht ins Log
 // Zustandsabgleich (LEGO Batman 2): Der Host schickt fuer Frame F einen Datenblock (hoechstens 256 Byte),
@@ -23,6 +24,13 @@ void net_send_sync(int F, const void *data, int len);
 int net_wait_sync(int F, void *data, int len, int timeout_ms);
 // Schranke mit Zustand vom Host; danach zaehlen beide Seiten die Frames neu ab 1 (siehe net.c)
 int net_barrier(int F, void *data, int len, int timeout_ms);
+// Wie net_barrier, mit Kennung. NET_BAR_OPTIONAL: Schranke, die nur zur selben Kennung passt und uebersprungen wird
+// (Rueckgabe -1, keine neue Epoche), wenn der Partner sie nicht sieht. Siehe net.c.
+#define NET_BAR_OPTIONAL 0x40000000u
+#define NET_BAR_SKIPPED  0x80000000u
+int net_barrier_ex(int F, unsigned id, void *data, int len, int timeout_ms);
+// Nach net_barrier: Zustand, den der Partner an dieser Schranke geschickt hat (Diagnose); Rueckgabe Laenge
+int net_barrier_peer(void *data, int len);
 // Partner weg (LEGO Batman 2): Kommt laenger als ms kein Paket (auch kein Lebenszeichen, das ein eigener
 // Thread jede halbe Sekunde schickt), gilt er als verloren. Ab dann liefert net_frame fuer ihn neutrale
 // Eingaben, wartet nicht mehr und sendet selbst nichts mehr. 0 = nie aufgeben (Standard, Batman 1).
